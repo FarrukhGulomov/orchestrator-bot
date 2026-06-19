@@ -1,1 +1,241 @@
-# orchestrator-bot
+# Master Orchestrator — Telegram-бот (мульти-агентный роутер)
+
+Telegram-бот для IT product development команд. Перехватывает сообщения,
+классифицирует их по типу (**IDEA / BUG / REFINEMENT / TASK**), определяет
+нужного **агента** (PM, BA, System Analyst, QA, Backend, Frontend, DevOps,
+SOC, Tech Lead), выбирает оптимальную **модель** и — для actionable-типов —
+**реализует** запрос: пишет готовый код/артефакт и (опционально) заводит
+GitHub Issue или черновой PR.
+
+Реализует архитектуру системных промптов «AI Agent Orchestrator &
+Multi-Model Router» и «Senior AI Developer — Telegram Multi-Agent
+Orchestrator».
+
+---
+
+## Как это работает
+
+```
+Telegram message
+   │
+   ▼
+[access control]  ── chat не в allow-list → игнор
+   │
+   ▼
+[router.classify]  ── один быстрый вызов → {agent, request_type, complexity, title}
+   │
+   ├── route A (анализ/доки)  → Gemini
+   └── route B (код/инфра)    → Groq/Llama  (large при complexity=high, small при low)
+   │
+   ▼
+[персона агента + addendum типа запроса] ── для IDEA/TASK/BUG/REFINEMENT
+   │                                          модель обязана РЕАЛИЗОВАТЬ,
+   │                                          а не просто обсудить
+   ▼
+[бот добавляет метаданные-заголовок] → отправка в Telegram
+   │
+   ▼ (если настроен GitHub)
+[GitHub Issue] ── actionable-типы заводятся как тикет
+   │
+   └── (если GITHUB_AUTO_PR=true и есть код с file-маркерами)
+       → отдельная ветка + draft Pull Request с реализацией
+```
+
+Маршрутизация двухступенчатая: один лёгкий классификатор за один вызов решает
+**кто** отвечает (агент), **что это за запрос** (тип) и **насколько он
+сложный** (выбор размера модели на Route B) — это нужно сделать *до* того, как
+вызывать дорогую модель-исполнитель.
+
+### Input Classification Matrix
+
+| Тип | CLASSIFICATION | GitHub-тикет | Поведение агента |
+|---|---|---|---|
+| Идея / предложение | `IDEA` | ✅ Issue | Структурированный proposal: проблема → решение → scope → риски → next step |
+| Задача / фича | `TASK` | ✅ Issue (+ draft PR) | Реальный готовый код / готовый артефакт, не описание |
+| Баг | `BUG` | ✅ Issue (+ draft PR) | Root cause → реальный фикс → регрессионные риски |
+| Доработка / рефакторинг | `REFINEMENT` | ✅ Issue (+ draft PR) | Готовая улучшенная версия + обоснование |
+| Обычный вопрос | `QUESTION` | ❌ нет | Обычный ответ, без тикета |
+
+**Про `QUESTION`:** в канонической матрице всего 4 корзины (IDEA/BUG/
+REFINEMENT/TASK) — всё должно классифицироваться в одну из них. Это
+осознанное расширение: без него любое «привет» или общий вопрос в группе
+форсированно попадало бы в одну из 4 категорий и (при включённом GitHub)
+превращалось бы в мусорный тикет. `QUESTION` тикет не создаёт. Если нужно
+строгое поведение по 4 корзинам — уберите ветку `question` в
+`request_types.py` и `router.py`.
+
+### Распределение агентов по моделям
+
+| Route | Модель (по умолчанию) | Агенты |
+|-------|----------------------|--------|
+| A | `gemini-3.5-flash` | PM, BA, System Analyst, QA |
+| B | `llama-3.3-70b-versatile` / `llama-3.1-8b-instant` | Backend, Frontend, DevOps, SOC, Tech Lead |
+
+---
+
+## ⚠️ Важно про модели (актуально на июнь 2026)
+
+Модели из исходных промптов у провайдеров уже выведены/выводятся — поменялись
+только строковые ID, архитектура та же. Все ID вынесены в `config.py` и
+переопределяются через `.env`.
+
+- **Gemini 1.5 Flash отключён** (запросы возвращают 404). По умолчанию стоит
+  актуальная GA-модель линейки Flash.
+- **Groq: `llama-3.1-8b-instant` и `llama-3.3-70b-versatile` депрекейтнуты
+  17.06.2026.** Пока в окне депрекейта вызываются. Миграция: `openai/gpt-oss-120b`
+  (large) и `openai/gpt-oss-20b` (small) — меняется одной строкой в `.env`.
+
+Перед продом сверьтесь с актуальными списками моделей:
+- Groq: https://console.groq.com/docs/models
+- Gemini: https://ai.google.dev/gemini-api/docs/models
+
+---
+
+## Установка
+
+```bash
+cd orchestrator-bot
+python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+cp .env.example .env
+# заполните BOT_TOKEN, GEMINI_API_KEY, GROQ_API_KEY в .env
+python bot.py
+```
+
+### Где взять ключи
+- `BOT_TOKEN` — у @BotFather в Telegram.
+- `GEMINI_API_KEY` — Google AI Studio.
+- `GROQ_API_KEY` — Groq Cloud Console.
+- `GITHUB_TOKEN` *(опционально)* — GitHub → Settings → Developer settings →
+  Personal access tokens, scope `repo`. **Только в `.env` на сервере, никогда
+  в чат.**
+
+---
+
+## Настройка доступа
+
+- `ALLOWED_CHAT_IDS` — список разрешённых чатов через запятую. Пусто = все
+  чаты. Узнать id чата: команда `/id`.
+- `REQUIRE_MENTION_IN_GROUPS=true` — в группах бот отвечает только на
+  @упоминание или reply на его сообщение (в личке отвечает всегда).
+
+Чтобы бот видел все сообщения в группах, отключите Privacy Mode у @BotFather
+(`/setprivacy` → Disable) либо используйте упоминания.
+
+---
+
+## Команды
+
+- `/start`, `/help` — справка и chat_id
+- `/idea <текст>` — форсировать тип IDEA
+- `/task <текст>` — форсировать тип TASK
+- `/bug <текст>` — форсировать тип BUG
+- `/improve <текст>` — форсировать тип REFINEMENT
+- без команды — тип определяется классификатором автоматически (включая
+  `QUESTION` для обычных вопросов)
+- `/reset` — очистить контекст диалога
+- `/id` — показать chat_id
+
+---
+
+## Формат ответа
+
+По умолчанию (`METADATA_FORMAT=x_metadata`) — структурированный блок,
+который **бот добавляет сам** (модель его не пишет — так его нельзя
+подделать или удалить через ввод пользователя):
+
+```
+**[X_ORCHESTRATOR_METADATA]**
+- **CLASSIFICATION:** BUG
+- **ASSIGNED_AGENT:** Backend Developer
+- **ROUTED_MODEL:** Llama 3.3 70B
+
+---
+### 🛠️ Backend Developer Response & Implementation
+
+<готовый фикс с кодом>
+```
+
+Старый компактный формат доступен через `METADATA_FORMAT=simple`:
+
+```
+[ACTIVE_AGENT]: Backend Developer
+[ROUTED_MODEL]: Llama 3.3 70B
+[REQUEST_TYPE]: 🐞 Bug
+
+<готовый фикс с кодом>
+```
+
+---
+
+## GitHub-интеграция (опционально)
+
+Если заданы `GITHUB_TOKEN` и `GITHUB_REPO` (`owner/repo`) — каждый
+actionable-запрос (IDEA/TASK/BUG/REFINEMENT) автоматически заводится как
+**GitHub Issue** с лейблами по типу и агенту. Ссылка на issue добавляется в
+конец ответа в Telegram.
+
+Если дополнительно включить `GITHUB_AUTO_PR=true` — для код-агентов
+(Backend/Frontend/DevOps/SOC/Tech Lead), когда ответ содержит код с
+file-маркером, бот сам:
+1. создаёт новую ветку от `GITHUB_DEFAULT_BRANCH`,
+2. коммитит файлы,
+3. открывает **draft Pull Request** с пометкой "review before merging".
+
+Маркер файла — первая строка внутри блока кода, формат `# file: path/to/file.ext`
+(или `// file:` для JS/TS и т.д.) — агенты проинструктированы добавлять его
+сами для каждого готового файла.
+
+**⚠️ AUTO_PR по умолчанию выключен.** AI-сгенерированный код всегда нужно
+ревьюить перед мерджем — поэтому PR всегда открывается как draft, бот никогда
+сам не мерджит.
+
+---
+
+## Структура проекта
+
+```
+orchestrator-bot/
+├── bot.py                 # точка входа, хендлеры aiogram, команды, отправка ответа
+├── router.py               # классификатор: agent + request_type + complexity + title
+├── agents.py                # реестр агентов: персоны, route, модель
+├── request_types.py          # IDEA/TASK/BUG/REFINEMENT/QUESTION: лейблы, addenda, GH-лейблы
+├── github_integration.py      # опциональные GitHub Issue + draft PR
+├── llm_clients.py             # обёртки над Gemini (google-genai) и Groq
+├── history.py                  # история диалога по chat_id (in-memory)
+├── config.py                    # настройки, ID моделей, METADATA_FORMAT
+├── requirements.txt
+└── .env.example
+```
+
+---
+
+## Что заменить для прода
+
+- **История** (`history.py`) — сейчас in-memory (теряется при рестарте).
+  Замените на Redis/БД за тем же интерфейсом `get_history/append/reset`.
+- **Запуск** — сейчас long polling. Для нагрузки рассмотрите webhook.
+- **Модели** — сверьте ID с актуальными списками провайдеров (см. выше).
+- **GitHub-лейблы** — `idea`/`task` не существуют в репозитории по умолчанию;
+  создайте их в Settings → Labels, иначе бот тихо откатится на issue без
+  лейблов (см. `github_integration._create_issue_sync`, обработка 422).
+- **Rate limiting / квоты** — добавьте ограничение на пользователя при
+  публичном доступе.
+
+---
+
+## Заметки по дизайну
+
+- **Метаданные добавляются детерминированно в коде**, а не моделью — это
+  закрывает «routing leakage»: ввод пользователя не может подделать
+  `CLASSIFICATION`/`ROUTED_MODEL` или убрать заголовок.
+- **Сложность → размер модели** (route B): `high` → 70B, `low` → 8B.
+- **File-marker конвенция** — единственный способ безопасно понять, какой
+  код в ответе модели предназначен для какого файла, не парся произвольный
+  markdown эвристиками.
+- **PR — всегда draft** — это сознательное ограничение: бот предлагает
+  реализацию, решение о мердже остаётся за человеком.
+- **QUESTION — расширение, не из исходной спеки** — обосновано выше; легко
+  убрать, если нужна строгая 4-корзинная классификация.
+- **Роутер не валит бот**: при сбое классификации — фолбэк на Tech Lead /
+  QUESTION, GitHub-тикет в этом случае не создаётся.
