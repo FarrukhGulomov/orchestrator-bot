@@ -6,17 +6,25 @@ Flow per message:
   2. In groups, optionally require an @mention or a reply to the bot.
   3. Router classifies -> (agent, request_type, complexity, title, model).
   4. The agent persona + request-type addendum answers with the chosen model,
-     using chat history. For actionable types (task/bug/improvement/idea) the
-     agent is instructed to DELIVER the implementation, not just discuss it.
-  5. The bot deterministically prepends the [ACTIVE_AGENT]/[ROUTED_MODEL]/
-     [REQUEST_TYPE] header so the backend can always parse it (the model never
-     writes it itself).
+     using that agent's own scoped chat history. For actionable types
+     (task/bug/improvement/idea) the agent is instructed to DELIVER the
+     implementation, not just discuss it.
+  5. The bot deterministically prepends the metadata header so the backend
+     can always parse it (the model never writes it itself).
   6. If GitHub integration is configured, actionable requests are filed as a
      GitHub Issue; if the agent is on the code route and produced file-marked
      code blocks and GITHUB_AUTO_PR=true, a draft PR is also opened.
 
 Explicit commands /idea /task /bug /improve force the request type instead of
 relying on the classifier (agent + model are still auto-routed).
+
+/kickoff <text> fans the SAME request out to a fixed cross-functional team
+(PM, Product Designer, Backend, QA) in parallel and returns all four answers
+in one message — for when the user wants the whole team to respond together,
+not a single department. This exists because every agent is otherwise scoped
+to its own role: without it, asking one agent to "prepare this with your
+team" had nowhere to go except telling the user to go find people — even
+though the rest of the team already lives in this same bot.
 
 Run:  python bot.py
 """
@@ -33,10 +41,11 @@ from aiogram.types import Message
 
 import github_integration
 import history
+from agents import Agent, get_agent
 from config import settings
 from llm_clients import gemini_generate, groq_generate
-from request_types import get_request_type
-from router import Route, classify
+from request_types import REQUEST_TYPES, get_request_type
+from router import Route, classify, model_for
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,6 +56,9 @@ logger = logging.getLogger("orchestrator")
 dp = Dispatcher()
 
 TELEGRAM_LIMIT = 4096
+
+# Default cross-functional team for /kickoff: vision + design + core build + quality.
+KICKOFF_ROLES = ["pm", "product_designer", "backend", "qa"]
 
 
 # --------------------------------------------------------------------------
@@ -236,6 +248,123 @@ async def _process(message: Message, bot: Bot, user_text: str | None, forced_typ
 
 
 # --------------------------------------------------------------------------
+# /kickoff — whole team responds together
+# --------------------------------------------------------------------------
+async def _kickoff_agent_call(agent_key: str, user_text: str) -> dict:
+    """Run one team member's reply for /kickoff. Never raises — returns an
+    error note in 'body' instead, so one failing teammate doesn't blank out
+    the others."""
+    agent: Agent = get_agent(agent_key)
+    # Force an actual deliverable (not discussion) from every teammate, same
+    # as the TASK request type does for normal single-agent routing.
+    system_prompt = agent.system + "\n" + REQUEST_TYPES["task"].addendum
+    model, label = model_for(agent, "high")
+    try:
+        if agent.route == "A":
+            body = await asyncio.wait_for(
+                gemini_generate(model, system_prompt, [{"role": "user", "content": user_text}]),
+                timeout=settings.request_timeout,
+            )
+        else:
+            body = await asyncio.wait_for(
+                groq_generate(
+                    model,
+                    system_prompt,
+                    [{"role": "user", "content": user_text}],
+                    temperature=0.3,
+                ),
+                timeout=settings.request_timeout,
+            )
+        return {"agent": agent, "model_label": label, "body": body or "(пустой ответ)", "ok": True}
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Kickoff sub-call failed for agent=%s", agent_key)
+        return {
+            "agent": agent,
+            "model_label": label,
+            "body": f"⚠️ Не удалось получить ответ от этой роли: {exc}",
+            "ok": False,
+        }
+
+
+def _kickoff_header(results: list[dict]) -> str:
+    agent_names = ", ".join(r["agent"].display_name for r in results)
+    model_labels = ", ".join(sorted({r["model_label"] for r in results}))
+    if settings.metadata_format == "simple":
+        return (
+            f"[ACTIVE_AGENTS]: {agent_names}\n"
+            f"[ROUTED_MODELS]: {model_labels}\n"
+            "[REQUEST_TYPE]: 🧩 Team Kickoff\n\n"
+        )
+    return (
+        "**[X_ORCHESTRATOR_METADATA]**\n"
+        "- **CLASSIFICATION:** TEAM KICKOFF\n"
+        f"- **ASSIGNED_AGENTS:** {agent_names}\n"
+        f"- **ROUTED_MODELS:** {model_labels}\n\n"
+        "---\n"
+        "### 🧩 Team Kickoff Response\n\n"
+    )
+
+
+@dp.message(Command("kickoff"))
+async def cmd_kickoff(message: Message, bot: Bot, command: CommandObject) -> None:
+    chat_id = message.chat.id
+    if not _is_allowed(chat_id):
+        return
+
+    user_text = (command.args or "").strip()
+    if not user_text:
+        await message.answer(
+            "Butun jamoani jalb qilish uchun g'oyani yozing, masalan:\n"
+            "/kickoff Ota-onalar va o'quv markazlarini bog'lovchi platforma"
+        )
+        return
+
+    await bot.send_chat_action(chat_id, ChatAction.TYPING)
+
+    results = await asyncio.gather(
+        *[_kickoff_agent_call(key, user_text) for key in KICKOFF_ROLES]
+    )
+
+    parts = [_kickoff_header(results)]
+    for r in results:
+        parts.append(f"#### 🛠️ {r['agent'].display_name}\n\n{r['body']}\n\n---\n")
+        history.append(chat_id, r["agent"].key, "user", user_text)
+        history.append(chat_id, r["agent"].key, "assistant", r["body"])
+
+    # Anchor follow-ups (e.g. "ok continue") back to PM by default after a kickoff.
+    history.set_last_route(chat_id, "pm", "idea")
+
+    footer = ""
+    if settings.github_enabled:
+        labels = ["idea"] + [r["agent"].key for r in results]
+        title = user_text[:70] or "Team kickoff"
+        issue_body = f"**Original request:**\n{user_text}\n\n---\n\n" + "\n\n".join(
+            f"## {r['agent'].display_name}\n\n{r['body']}" for r in results
+        )
+        issue_url = await github_integration.create_issue(title, issue_body, labels)
+
+        pr_url = None
+        backend_result = next(
+            (r for r in results if r["agent"].key == "backend" and r["ok"]), None
+        )
+        if backend_result:
+            files = github_integration.extract_files(backend_result["body"])
+            if files:
+                pr_url = await github_integration.create_implementation_pr(
+                    title, issue_body, files, labels
+                )
+
+        lines = []
+        if issue_url:
+            lines.append(f"📋 Issue: {issue_url}")
+        if pr_url:
+            lines.append(f"🔀 Draft PR: {pr_url}")
+        footer = ("\n\n" + "\n".join(lines)) if lines else ""
+
+    await _send_long(message, "".join(parts) + footer)
+
+
+# --------------------------------------------------------------------------
 # Command handlers
 # --------------------------------------------------------------------------
 @dp.message(Command("start", "help"))
@@ -245,13 +374,15 @@ async def cmd_start(message: Message) -> None:
     await message.answer(
         "Master Orchestrator онлайн.\n"
         "Напишите задачу на UZ / RU / EN — я выберу подходящего агента "
-        "(PM, BA, System Analyst, QA, Backend, Frontend, DevOps, SOC, Tech Lead) "
-        "и оптимальную модель, а также определю тип запроса.\n\n"
+        "(PM, BA, System Analyst, QA, Product Designer, Backend, Frontend, "
+        "DevOps, SOC, Tech Lead) и оптимальную модель, а также определю тип "
+        "запроса.\n\n"
         "Тип запроса можно задать явно:\n"
         "/idea <текст> — идея / предложение\n"
         "/task <текст> — задача на реализацию\n"
         "/bug <текст> — баг, нужен фикс\n"
         "/improve <текст> — доработка / рефакторинг\n"
+        "/kickoff <текст> — вся команда сразу (PM + Designer + Backend + QA)\n"
         "Без команды — отвечу как на обычный вопрос, без тикета.\n\n"
         "/reset — очистить контекст диалога\n"
         f"chat_id: `{message.chat.id}`",

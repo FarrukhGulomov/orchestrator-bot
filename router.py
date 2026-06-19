@@ -94,7 +94,7 @@ class Route:
     title: str
 
 
-def _model_for(agent: Agent, complexity: str) -> tuple[str, str]:
+def model_for(agent: Agent, complexity: str) -> tuple[str, str]:
     if agent.route == "A":
         return settings.analysis_model, settings.analysis_model_label
     # route B
@@ -159,7 +159,7 @@ async def classify(
         )
 
     agent = get_agent(agent_key)
-    model, label = _model_for(agent, complexity)
+    model, label = model_for(agent, complexity)
     return Route(
         agent=agent,
         model=model,

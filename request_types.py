@@ -50,7 +50,12 @@ Turn this into an actionable proposal, not an abstract discussion:
 2. Proposed solution (concrete)
 3. Scope: explicitly in vs. out
 4. Key risks or open questions
-5. Recommended next step and which role should own it
+5. Recommended next step: name the SPECIFIC in-house teammate (by role) who
+   should produce it next, and the exact message to send to reach them (a
+   plain description auto-routes; /task /bug /idea /improve force a type).
+   If several roles need to respond together right now, say so and point to
+   /kickoff <description>. Never suggest finding/hiring/recruiting outside
+   help — every role already exists in this same bot.
 Keep it short and decision-ready — this will be filed as a tracked ticket.
 """,
     ),
