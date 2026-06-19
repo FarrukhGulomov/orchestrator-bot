@@ -66,6 +66,37 @@ async def gemini_generate(model: str, system: str, messages: list[dict]) -> str:
     return await asyncio.to_thread(_gemini_sync, model, system, messages)
 
 
+def _gemini_describe_file_sync(data: bytes, mime_type: str, instruction: str) -> str:
+    """One-off multimodal call: an image/PDF/etc. + an instruction, no chat
+    history. Used by file_processing.py to turn uploaded files into text that
+    then flows through the normal agent pipeline."""
+    from google.genai import types
+
+    client = _get_gemini()
+    contents = [
+        types.Content(
+            role="user",
+            parts=[
+                types.Part.from_bytes(data=data, mime_type=mime_type),
+                types.Part.from_text(text=instruction),
+            ],
+        )
+    ]
+    resp = client.models.generate_content(
+        model=settings.analysis_model,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            temperature=0.2,
+            max_output_tokens=4096,
+        ),
+    )
+    return (resp.text or "").strip()
+
+
+async def gemini_describe_file(data: bytes, mime_type: str, instruction: str) -> str:
+    return await asyncio.to_thread(_gemini_describe_file_sync, data, mime_type, instruction)
+
+
 # --- Groq / Llama (ROUTE B + router) --------------------------------------
 def _groq_sync(
     model: str, system: str, messages: list[dict], temperature: float, json_mode: bool
@@ -94,3 +125,19 @@ async def groq_generate(
     return await asyncio.to_thread(
         _groq_sync, model, system, messages, temperature, json_mode
     )
+
+
+def _groq_transcribe_sync(data: bytes, filename: str) -> str:
+    client = _get_groq()
+    resp = client.audio.transcriptions.create(
+        model=settings.whisper_model,
+        file=(filename, data),
+        response_format="text",
+    )
+    # response_format="text" -> SDK returns a plain string; other formats
+    # return an object with a .text attribute. Handle both defensively.
+    return resp if isinstance(resp, str) else getattr(resp, "text", str(resp))
+
+
+async def groq_transcribe(data: bytes, filename: str) -> str:
+    return await asyncio.to_thread(_groq_transcribe_sync, data, filename)

@@ -43,6 +43,7 @@ import github_integration
 import history
 from agents import Agent, get_agent
 from config import settings
+from file_processing import SUPPORTED_SUMMARY, extract
 from llm_clients import gemini_generate, groq_generate
 from request_types import REQUEST_TYPES, get_request_type
 from router import Route, classify, model_for
@@ -365,6 +366,98 @@ async def cmd_kickoff(message: Message, bot: Bot, command: CommandObject) -> Non
 
 
 # --------------------------------------------------------------------------
+# File understanding — photo / document / voice / audio all funnel here
+# --------------------------------------------------------------------------
+async def _handle_file(
+    message: Message,
+    bot: Bot,
+    file_id: str,
+    filename: str | None,
+    mime_type: str | None,
+    file_size: int | None,
+    caption: str | None,
+) -> None:
+    chat_id = message.chat.id
+    if not _is_allowed(chat_id):
+        return
+
+    max_bytes = settings.max_file_size_mb * 1024 * 1024
+    if file_size and file_size > max_bytes:
+        await message.answer(
+            f"⚠️ Fayl juda katta ({file_size // (1024*1024)} MB). "
+            f"Maksimal hajm: {settings.max_file_size_mb} MB."
+        )
+        return
+
+    status = await message.answer("📎 Faylni o'qiyapman...")
+    try:
+        buf = await bot.download(file_id)
+        data = buf.read() if hasattr(buf, "read") else bytes(buf)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("File download failed")
+        await status.edit_text(f"⚠️ Faylni yuklab olishda xatolik: {exc}")
+        return
+
+    extracted, kind_or_error = await extract(filename, mime_type, data)
+    if extracted is None:
+        # kind_or_error is actually the user-facing error/explanation message here.
+        await status.edit_text(kind_or_error)
+        return
+
+    label = filename or kind_or_error
+    if caption and caption.strip():
+        combined = f"{caption.strip()}\n\n--- Biriktirilgan fayl: {label} ---\n{extracted}"
+    else:
+        combined = (
+            f"Foydalanuvchi izohsiz quyidagi faylni yubordi: {label}.\n"
+            "Ushbu fayl tarkibini o'z roli nuqtai nazaridan tahlil qiling va "
+            "eng foydali xulosa yoki keyingi qadamni taklif qiling.\n\n"
+            f"--- Fayl tarkibi ---\n{extracted}"
+        )
+
+    try:
+        await status.delete()
+    except TelegramBadRequest:
+        pass
+
+    await _process(message, bot, combined, forced_type=None)
+
+
+@dp.message(F.photo)
+async def handle_photo(message: Message, bot: Bot) -> None:
+    photo = message.photo[-1]  # largest size
+    await _handle_file(
+        message, bot, photo.file_id, "photo.jpg", "image/jpeg", photo.file_size, message.caption
+    )
+
+
+@dp.message(F.document)
+async def handle_document(message: Message, bot: Bot) -> None:
+    doc = message.document
+    await _handle_file(
+        message, bot, doc.file_id, doc.file_name, doc.mime_type, doc.file_size, message.caption
+    )
+
+
+@dp.message(F.voice)
+async def handle_voice(message: Message, bot: Bot) -> None:
+    voice = message.voice
+    await _handle_file(
+        message, bot, voice.file_id, "voice.ogg", voice.mime_type or "audio/ogg",
+        voice.file_size, message.caption,
+    )
+
+
+@dp.message(F.audio)
+async def handle_audio(message: Message, bot: Bot) -> None:
+    audio = message.audio
+    await _handle_file(
+        message, bot, audio.file_id, audio.file_name or "audio.mp3",
+        audio.mime_type or "audio/mpeg", audio.file_size, message.caption,
+    )
+
+
+# --------------------------------------------------------------------------
 # Command handlers
 # --------------------------------------------------------------------------
 @dp.message(Command("start", "help"))
@@ -377,6 +470,8 @@ async def cmd_start(message: Message) -> None:
         "(PM, BA, System Analyst, QA, Product Designer, Backend, Frontend, "
         "DevOps, SOC, Tech Lead) и оптимальную модель, а также определю тип "
         "запроса.\n\n"
+        "Можно присылать файлы — прочитаю и обработаю как обычное сообщение: "
+        f"{SUPPORTED_SUMMARY}.\n\n"
         "Тип запроса можно задать явно:\n"
         "/idea <текст> — идея / предложение\n"
         "/task <текст> — задача на реализацию\n"

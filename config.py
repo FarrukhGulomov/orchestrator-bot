@@ -82,6 +82,17 @@ class Settings:
         default_factory=lambda: os.getenv("ROUTER_MODEL", "llama-3.1-8b-instant")
     )
 
+    # Audio transcription (voice notes / mp3 / wav / etc.) via Groq Whisper.
+    whisper_model: str = field(
+        default_factory=lambda: os.getenv("WHISPER_MODEL", "whisper-large-v3-turbo")
+    )
+
+    # Reject inbound files larger than this (Telegram Bot API download limit
+    # is ~20MB regardless; this just fails fast with a clear message).
+    max_file_size_mb: int = field(
+        default_factory=lambda: int(os.getenv("MAX_FILE_SIZE_MB", "20"))
+    )
+
     # --- Behaviour ---------------------------------------------------------
     # How many (user, assistant) turns of history to keep per chat.
     history_turns: int = field(
