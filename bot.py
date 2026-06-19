@@ -186,7 +186,12 @@ async def _process(message: Message, bot: Bot, user_text: str | None, forced_typ
 
     await bot.send_chat_action(chat_id, ChatAction.TYPING)
 
-    route = await classify(user_text)
+    last = history.get_last_route(chat_id)
+    route = await classify(
+        user_text,
+        last_agent=last[0] if last else None,
+        last_type=last[1] if last else None,
+    )
     if forced_type:
         route.request_type = get_request_type(forced_type)
 
@@ -203,7 +208,9 @@ async def _process(message: Message, bot: Bot, user_text: str | None, forced_typ
     if route.request_type.addendum:
         system_prompt = system_prompt + "\n" + route.request_type.addendum
 
-    msgs = history.get_history(chat_id) + [{"role": "user", "content": user_text}]
+    msgs = history.get_history(chat_id, route.agent.key) + [
+        {"role": "user", "content": user_text}
+    ]
 
     try:
         body = await asyncio.wait_for(
@@ -220,8 +227,9 @@ async def _process(message: Message, bot: Bot, user_text: str | None, forced_typ
     if not body:
         body = "(пустой ответ от модели)"
 
-    history.append(chat_id, "user", user_text)
-    history.append(chat_id, "assistant", body)
+    history.append(chat_id, route.agent.key, "user", user_text)
+    history.append(chat_id, route.agent.key, "assistant", body)
+    history.set_last_route(chat_id, route.agent.key, route.request_type.key)
 
     footer = await _maybe_create_tickets(route, user_text, body)
     await _send_long(message, _header(route) + body + footer)

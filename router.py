@@ -15,6 +15,14 @@ The model is then derived deterministically:
 Stage 2 (handled in bot.py): the chosen agent's persona, combined with the
 request-type addendum, answers with the proper model — and, for actionable
 types, the result can be filed as a GitHub issue/PR (see github_integration.py).
+
+STICKY ROUTING: callers may pass the (agent, request_type) of the previous
+turn in this chat. Short, content-free follow-ups ("ok", "continue", "ha
+zur", "davom et") have nothing for the classifier to actually classify, and
+guessing fresh on them was a real source of misrouting (e.g. a continuation
+of a Product Manager conversation getting reclassified as SOC/BUG). The
+hint nudges the classifier to keep the same agent/type for such messages,
+and is also used as the fallback if the classifier call itself fails.
 """
 
 import json
@@ -42,15 +50,16 @@ message (it may be in Uzbek, Russian, English, or a mix, with IT slang) and
 decide three things.
 
 1) WHICH SPECIALIST AGENT should handle it:
-- pm              : product requirements, prioritisation, roadmap, backlog, business value
-- ba              : functional requirements, user stories, use cases, business processes
-- system_analyst : system architecture, integrations, data flow, big documentation
-- qa             : test scenarios, bug report structure, quality metrics
-- backend        : server logic, DB schemas, APIs, code optimisation, refactoring
-- frontend       : UI/UX implementation, web/mobile components, state management
-- devops         : CI/CD, Dockerfiles, Kubernetes, cloud/server infrastructure
-- soc            : code vulnerability review, encryption logic, security audits
-- tech_lead      : technical strategy, architecture validation, code review, coordination
+- pm                : product requirements, prioritisation, roadmap, backlog, business value
+- ba                : functional requirements, user stories, use cases, business processes
+- system_analyst   : system architecture, integrations, data flow, big documentation
+- qa               : test scenarios, bug report structure, quality metrics
+- product_designer : UX/UI design — user research, personas, journey maps, wireframes, design system
+- backend          : server logic, DB schemas, APIs, code optimisation, refactoring
+- frontend         : UI/UX implementation, web/mobile components, state management
+- devops           : CI/CD, Dockerfiles, Kubernetes, cloud/server infrastructure
+- soc              : code vulnerability review, encryption logic, security audits
+- tech_lead        : technical strategy, architecture validation, code review, coordination
 
 2) WHAT KIND OF REQUEST this is (the Input Classification Matrix):
 - idea        : IDEA — a conceptual suggestion, high-level thought, or new feature proposal
@@ -94,16 +103,34 @@ def _model_for(agent: Agent, complexity: str) -> tuple[str, str]:
     return settings.code_model_large, settings.code_model_large_label
 
 
-async def classify(user_text: str) -> Route:
+async def classify(
+    user_text: str,
+    last_agent: str | None = None,
+    last_type: str | None = None,
+) -> Route:
     """Pick agent + request type + model for a message. Always returns a valid Route."""
-    agent_key = DEFAULT_AGENT_KEY
-    type_key = DEFAULT_REQUEST_TYPE_KEY
+    agent_key = last_agent if last_agent in AGENTS else DEFAULT_AGENT_KEY
+    type_key = last_type if last_type in REQUEST_TYPES else DEFAULT_REQUEST_TYPE_KEY
     complexity = "high"
     title = (user_text.strip()[:70] or "Untitled")
+
+    context_hint = ""
+    if last_agent in AGENTS:
+        context_hint = (
+            "\nCONVERSATION CONTEXT: the previous message in this thread was "
+            f"handled by agent '{last_agent}' with request_type "
+            f"'{type_key}'. If the CURRENT message is a short follow-up with "
+            "no new concrete content of its own (e.g. 'continue', 'ok', "
+            "'yes', 'davom et', 'zo'r', 'ha zur'), KEEP that same agent and "
+            "request_type instead of guessing a new one. If the current "
+            "message clearly introduces a new or different request, classify "
+            "it fresh instead.\n"
+        )
+
     try:
         raw = await groq_generate(
             model=settings.router_model,
-            system=_ROUTER_SYSTEM,
+            system=_ROUTER_SYSTEM + context_hint,
             messages=[{"role": "user", "content": user_text[:4000]}],
             temperature=0.0,
             json_mode=True,
@@ -124,7 +151,12 @@ async def classify(user_text: str) -> Route:
         if raw_title:
             title = raw_title[:120]
     except Exception as exc:  # noqa: BLE001 - router must never crash the bot
-        logger.warning("Router classification failed, using default. %s", exc)
+        # Fall back to the previous turn's agent/type when we have one — far
+        # safer than a hardcoded default for a follow-up message.
+        logger.warning(
+            "Router classification failed, using fallback agent=%s type=%s. %s",
+            agent_key, type_key, exc,
+        )
 
     agent = get_agent(agent_key)
     model, label = _model_for(agent, complexity)

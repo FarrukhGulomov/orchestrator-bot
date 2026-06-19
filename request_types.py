@@ -68,9 +68,9 @@ Actually deliver this now — do not just describe what you would do.
   fenced code block must be a marker comment with nothing else on it:
       # file: relative/path/to/file.ext   (use correct comment syntax for the language)
   After the code, briefly note setup/migration steps and tests if relevant.
-- Non-code roles (PM/BA/System Analyst/QA): produce the finished artifact
-  itself (the actual user stories / test plan / spec section), not a
-  description of what you would write.
+- Non-code roles (PM/BA/System Analyst/QA/Product Designer): produce the
+  finished artifact itself (the actual user stories / test plan / wireframe
+  description / spec section), not a description of what you would write.
 This will be filed as a tracked ticket — make it self-contained.
 """,
     ),
@@ -104,8 +104,8 @@ Deliver the improved version now, not a discussion of options.
 - Code roles: complete updated code using the file-marker convention (first
   line of each fenced block: `# file: path/to/file.ext`). Briefly explain the
   rationale and any migration/compatibility notes.
-- Non-code roles: the improved artifact itself (updated spec, updated test
-  plan, etc.).
+- Non-code roles (incl. Product Designer): the improved artifact itself
+  (updated spec, updated test plan, updated flow/wireframe description, etc.).
 This will be filed as a tracked ticket.
 """,
     ),
