@@ -71,6 +71,7 @@ import document_generation as docgen
 import github_integration
 import history
 import memory
+import redis_client
 from agents import Agent, TEAM_MEMORY_HEADER, get_agent
 from config import settings
 from file_processing import SUPPORTED_SUMMARY, extract, transcribe_audio
@@ -123,14 +124,14 @@ def _strip_mention(text: str, bot_username: str) -> str:
     return text.strip()
 
 
-def _build_system_prompt(chat_id: int, agent: Agent, addendum: str = "") -> str:
+async def _build_system_prompt(chat_id: int, agent: Agent, addendum: str = "") -> str:
     """Agent persona + project memory (if any) + request-type addendum.
 
     Centralised so every entry point (single-agent, collaborative synthesis,
     /kickoff, voice mode) gets the same memory-aware prompt instead of each
     building it ad hoc.
     """
-    facts = memory.get_memory(chat_id)
+    facts = await memory.get_memory(chat_id)
     memory_block = (
         TEAM_MEMORY_HEADER + "\n".join(f"- {f}" for f in facts) + "\n\n" if facts else ""
     )
@@ -274,9 +275,9 @@ async def _send_document_deliverable(message: Message, route: Route, user_text: 
     )
     await message.answer_document(BufferedInputFile(pdf_bytes, filename=f"{slug}.pdf"))
 
-    history.append(chat_id, route.agent.key, "user", user_text)
-    history.append(chat_id, route.agent.key, "assistant", f"[Hujjat tayyorlandi: {title}]")
-    history.set_last_route(chat_id, route.agent.key, route.request_type.key)
+    await history.append(chat_id, route.agent.key, "user", user_text)
+    await history.append(chat_id, route.agent.key, "assistant", f"[Hujjat tayyorlandi: {title}]")
+    await history.set_last_route(chat_id, route.agent.key, route.request_type.key)
 
 
 _CAPABILITY_OVERVIEW_SYSTEM = """
@@ -351,7 +352,7 @@ async def _process(
 
     await bot.send_chat_action(chat_id, ChatAction.TYPING)
 
-    last = history.get_last_route(chat_id)
+    last = await history.get_last_route(chat_id)
     route = await classify(
         user_text,
         last_agent=last[0] if last else None,
@@ -389,9 +390,9 @@ async def _process(
         # Request needs more than one perspective — gather the team
         # automatically instead of making the user ask for each role.
         body = await _run_collaborative_answer(route, user_text, chat_id)
-        history.append(chat_id, route.agent.key, "user", user_text)
-        history.append(chat_id, route.agent.key, "assistant", body)
-        history.set_last_route(chat_id, route.agent.key, route.request_type.key)
+        await history.append(chat_id, route.agent.key, "user", user_text)
+        await history.append(chat_id, route.agent.key, "assistant", body)
+        await history.set_last_route(chat_id, route.agent.key, route.request_type.key)
 
         footer = await _maybe_create_tickets(route, user_text, body)
         await _send_long(message, _header(route) + body + footer)
@@ -399,9 +400,9 @@ async def _process(
             asyncio.create_task(_maybe_extract_memory(chat_id, user_text, body))
         return
 
-    system_prompt = _build_system_prompt(chat_id, route.agent, route.request_type.addendum)
+    system_prompt = await _build_system_prompt(chat_id, route.agent, route.request_type.addendum)
 
-    msgs = history.get_history(chat_id, route.agent.key) + [
+    msgs = await history.get_history(chat_id, route.agent.key) + [
         {"role": "user", "content": user_text}
     ]
 
@@ -420,9 +421,9 @@ async def _process(
     if not body:
         body = "(пустой ответ от модели)"
 
-    history.append(chat_id, route.agent.key, "user", user_text)
-    history.append(chat_id, route.agent.key, "assistant", body)
-    history.set_last_route(chat_id, route.agent.key, route.request_type.key)
+    await history.append(chat_id, route.agent.key, "user", user_text)
+    await history.append(chat_id, route.agent.key, "assistant", body)
+    await history.set_last_route(chat_id, route.agent.key, route.request_type.key)
 
     footer = await _maybe_create_tickets(route, user_text, body)
     await _send_long(message, _header(route) + body + footer)
@@ -440,7 +441,7 @@ async def _kickoff_agent_call(agent_key: str, user_text: str, chat_id: int) -> d
     agent: Agent = get_agent(agent_key)
     # Force an actual deliverable (not discussion) from every teammate, same
     # as the TASK request type does for normal single-agent routing.
-    system_prompt = _build_system_prompt(chat_id, agent, REQUEST_TYPES["task"].addendum)
+    system_prompt = await _build_system_prompt(chat_id, agent, REQUEST_TYPES["task"].addendum)
     model, label = model_for(agent, "high")
     try:
         if agent.route == "A":
@@ -500,8 +501,8 @@ async def _run_collaborative_answer(route: Route, user_text: str, chat_id: int) 
 
     for r in results:
         if r["ok"]:
-            history.append(chat_id, r["agent"].key, "user", user_text)
-            history.append(chat_id, r["agent"].key, "assistant", r["body"])
+            await history.append(chat_id, r["agent"].key, "user", user_text)
+            await history.append(chat_id, r["agent"].key, "assistant", r["body"])
 
     ok_results = [r for r in results if r["ok"]]
     if not ok_results:
@@ -558,7 +559,7 @@ async def _maybe_extract_memory(chat_id: int, user_text: str, body: str) -> None
         )
         fact = (raw or "").strip()
         if fact and fact.upper() != "NONE" and len(fact) < 300:
-            memory.add_memory(chat_id, fact)
+            await memory.add_memory(chat_id, fact)
     except Exception:  # noqa: BLE001
         logger.exception("Memory extraction failed (non-fatal)")
 
@@ -610,11 +611,11 @@ async def cmd_kickoff(message: Message, bot: Bot, command: CommandObject) -> Non
     parts = [_kickoff_header(results)]
     for r in results:
         parts.append(f"#### 🛠️ {r['agent'].display_name}\n\n{r['body']}\n\n---\n")
-        history.append(chat_id, r["agent"].key, "user", user_text)
-        history.append(chat_id, r["agent"].key, "assistant", r["body"])
+        await history.append(chat_id, r["agent"].key, "user", user_text)
+        await history.append(chat_id, r["agent"].key, "assistant", r["body"])
 
     # Anchor follow-ups (e.g. "ok continue") back to PM by default after a kickoff.
-    history.set_last_route(chat_id, "pm", "idea")
+    await history.set_last_route(chat_id, "pm", "idea")
 
     footer = ""
     if settings.github_enabled:
@@ -747,7 +748,7 @@ async def _handle_voice_note(
         await status.edit_text("⚠️ Ovozli xabarda matn aniqlanmadi, qaytadan urinib ko'ring.")
         return
 
-    last = history.get_last_route(chat_id)
+    last = await history.get_last_route(chat_id)
     route = await classify(
         user_text,
         last_agent=last[0] if last else None,
@@ -758,8 +759,8 @@ async def _handle_voice_note(
     # a voice note is a quick spoken exchange, not a planning session).
     # Document-deliverable / capability-overview / GitHub-ticket paths are
     # intentionally not wired in either.
-    system_prompt = _build_system_prompt(chat_id, route.agent, _VOICE_MODE_ADDENDUM)
-    msgs = history.get_history(chat_id, route.agent.key) + [
+    system_prompt = await _build_system_prompt(chat_id, route.agent, _VOICE_MODE_ADDENDUM)
+    msgs = await history.get_history(chat_id, route.agent.key) + [
         {"role": "user", "content": user_text}
     ]
 
@@ -784,9 +785,9 @@ async def _handle_voice_note(
             await status.delete()
         except TelegramBadRequest:
             pass
-        history.append(chat_id, route.agent.key, "user", user_text)
-        history.append(chat_id, route.agent.key, "assistant", body)
-        history.set_last_route(chat_id, route.agent.key, route.request_type.key)
+        await history.append(chat_id, route.agent.key, "user", user_text)
+        await history.append(chat_id, route.agent.key, "assistant", body)
+        await history.set_last_route(chat_id, route.agent.key, route.request_type.key)
         await _send_long(message, body)
         return
 
@@ -803,9 +804,9 @@ async def _handle_voice_note(
             await status.delete()
         except TelegramBadRequest:
             pass
-        history.append(chat_id, route.agent.key, "user", user_text)
-        history.append(chat_id, route.agent.key, "assistant", body)
-        history.set_last_route(chat_id, route.agent.key, route.request_type.key)
+        await history.append(chat_id, route.agent.key, "user", user_text)
+        await history.append(chat_id, route.agent.key, "assistant", body)
+        await history.set_last_route(chat_id, route.agent.key, route.request_type.key)
         await _send_long(message, body)
         return
 
@@ -814,9 +815,9 @@ async def _handle_voice_note(
     except TelegramBadRequest:
         pass
 
-    history.append(chat_id, route.agent.key, "user", user_text)
-    history.append(chat_id, route.agent.key, "assistant", body)
-    history.set_last_route(chat_id, route.agent.key, route.request_type.key)
+    await history.append(chat_id, route.agent.key, "user", user_text)
+    await history.append(chat_id, route.agent.key, "assistant", body)
+    await history.set_last_route(chat_id, route.agent.key, route.request_type.key)
 
     caption_text = body if len(body) <= 1000 else body[:1000] + "…"
     await message.answer_audio(
@@ -955,7 +956,7 @@ async def cmd_start(message: Message) -> None:
 async def cmd_reset(message: Message) -> None:
     if not _is_allowed(message.chat.id):
         return
-    history.reset(message.chat.id)
+    await history.reset(message.chat.id)
     await message.answer("Контекст очищен. ✅")
 
 
@@ -967,7 +968,7 @@ async def cmd_remember(message: Message, command: CommandObject) -> None:
     if not fact:
         await message.answer("Eslab qolish kerak bo'lgan faktni yozing:\n/remember Loyiha nomi: EduConnect")
         return
-    memory.add_memory(message.chat.id, fact)
+    await memory.add_memory(message.chat.id, fact)
     await message.answer("Yodda saqlandi. ✅ (`/memory` — ro'yxatni ko'rish)", parse_mode="Markdown")
 
 
@@ -975,7 +976,7 @@ async def cmd_remember(message: Message, command: CommandObject) -> None:
 async def cmd_memory(message: Message) -> None:
     if not _is_allowed(message.chat.id):
         return
-    facts = memory.get_memory(message.chat.id)
+    facts = await memory.get_memory(message.chat.id)
     if not facts:
         await message.answer("Hozircha hech narsa yodda saqlanmagan.")
         return
@@ -987,7 +988,7 @@ async def cmd_memory(message: Message) -> None:
 async def cmd_forget(message: Message) -> None:
     if not _is_allowed(message.chat.id):
         return
-    n = memory.clear_memory(message.chat.id)
+    n = await memory.clear_memory(message.chat.id)
     await message.answer(f"O'chirildi: {n} ta fakt. ✅")
 
 
@@ -1048,6 +1049,21 @@ async def main() -> None:
     problems = settings.validate()
     for p in problems:
         logger.warning("CONFIG: %s", p)
+
+    if settings.redis_enabled:
+        if redis_client.get_client() is not None:
+            logger.info("Persistent storage ENABLED via Redis — history and memory survive restarts.")
+        else:
+            logger.warning(
+                "REDIS_URL is set but the client failed to initialise — "
+                "falling back to in-memory storage (lost on restart). Check the URL/credentials."
+            )
+    else:
+        logger.info(
+            "Persistent storage DISABLED (no REDIS_URL) — history and memory are in-memory "
+            "only and will be lost on every restart/redeploy. Add Railway's Redis database "
+            "and set REDIS_URL to persist across deploys."
+        )
 
     if settings.github_enabled:
         logger.info(

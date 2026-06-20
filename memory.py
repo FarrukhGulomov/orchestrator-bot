@@ -16,37 +16,81 @@ grounded in THIS team's actual project over time, without the user needing
 to repeat context every message. That's real, measurable improvement in
 answer quality; it just isn't "the model learned new weights".
 
-In-memory only (lost on restart), same caveat as history.py — swap the
-dict-based store for Redis/a database behind the same function signatures
-for production persistence.
+Backed by Redis when REDIS_URL is configured (recommended for Railway —
+without it, this is wiped on every redeploy). Falls back to an in-memory
+dict with identical behaviour when Redis isn't configured or a call fails.
+Unlike history.py, facts have NO TTL in Redis — they're meant to be durable
+until explicitly cleared with /forget, not to expire from inactivity.
 """
 
-from collections import defaultdict
+import logging
+
+import redis_client
+
+logger = logging.getLogger(__name__)
 
 MAX_FACTS = 40
 
-_store: dict[int, list[str]] = defaultdict(list)
+# --- In-memory fallback --------------------------------------------------
+_store: dict[int, list[str]] = {}
 
 
-def get_memory(chat_id: int) -> list[str]:
-    return list(_store[chat_id])
+def _mem_key(chat_id: int) -> str:
+    return f"mem:{chat_id}"
 
 
-def add_memory(chat_id: int, fact: str) -> bool:
+async def get_memory(chat_id: int) -> list[str]:
+    client = redis_client.get_client()
+    if client is None:
+        return list(_store.get(chat_id, []))
+    try:
+        return await client.lrange(_mem_key(chat_id), 0, -1)
+    except Exception:  # noqa: BLE001
+        logger.exception("Redis get_memory failed, returning empty for this call")
+        return []
+
+
+async def add_memory(chat_id: int, fact: str) -> bool:
     """Add a fact if it's non-empty and not a near-duplicate. Returns True if added."""
     fact = (fact or "").strip()
     if not fact:
         return False
-    facts = _store[chat_id]
-    if fact in facts:
+
+    client = redis_client.get_client()
+    if client is None:
+        facts = _store.setdefault(chat_id, [])
+        if fact in facts:
+            return False
+        facts.append(fact)
+        if len(facts) > MAX_FACTS:
+            del facts[0 : len(facts) - MAX_FACTS]
+        return True
+
+    try:
+        existing = await client.lrange(_mem_key(chat_id), 0, -1)
+        if fact in existing:
+            return False
+        async with client.pipeline(transaction=True) as pipe:
+            pipe.rpush(_mem_key(chat_id), fact)
+            pipe.ltrim(_mem_key(chat_id), -MAX_FACTS, -1)
+            await pipe.execute()
+        return True
+    except Exception:  # noqa: BLE001
+        logger.exception("Redis add_memory failed")
         return False
-    facts.append(fact)
-    if len(facts) > MAX_FACTS:
-        del facts[0 : len(facts) - MAX_FACTS]  # drop oldest, keep most recent
-    return True
 
 
-def clear_memory(chat_id: int) -> int:
+async def clear_memory(chat_id: int) -> int:
     """Clear all stored facts for this chat. Returns how many were removed."""
-    facts = _store.pop(chat_id, [])
-    return len(facts)
+    client = redis_client.get_client()
+    if client is None:
+        facts = _store.pop(chat_id, [])
+        return len(facts)
+    try:
+        n = await client.llen(_mem_key(chat_id))
+        if n:
+            await client.delete(_mem_key(chat_id))
+        return n
+    except Exception:  # noqa: BLE001
+        logger.exception("Redis clear_memory failed")
+        return 0

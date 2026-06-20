@@ -177,6 +177,24 @@ class Settings:
         }
     )
 
+    # --- Persistent storage (Redis) -----------------------------------------
+    # Without this, conversation history and project memory live only in this
+    # process's RAM and are wiped on every restart/redeploy (Railway does
+    # this on every git push). Add Railway's Redis database to your project
+    # and set REDIS_URL=${{Redis.REDIS_URL}} on the bot service to persist
+    # both across deploys. Empty = in-memory fallback (current behaviour).
+    redis_url: str = field(default_factory=lambda: os.getenv("REDIS_URL", ""))
+    # How long inactive chat HISTORY is kept before Redis expires it
+    # (default 30 days). Project MEMORY facts have no TTL — they're meant to
+    # be durable until explicitly /forget'ten.
+    redis_history_ttl_seconds: int = field(
+        default_factory=lambda: int(os.getenv("REDIS_HISTORY_TTL_SECONDS", str(60 * 60 * 24 * 30)))
+    )
+
+    @property
+    def redis_enabled(self) -> bool:
+        return bool(self.redis_url)
+
     @property
     def github_enabled(self) -> bool:
         return bool(self.github_token and self.github_repo)
