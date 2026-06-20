@@ -174,13 +174,18 @@ async def groq_transcribe(data: bytes, filename: str) -> str:
     return await asyncio.to_thread(_groq_transcribe_sync, data, filename)
 
 
-def _gemini_tts_sync(text: str) -> bytes:
+def _gemini_tts_sync(text: str, language_code: str) -> bytes:
     """Generate speech via Gemini's native TTS and wrap the raw PCM the API
     returns into a standard playable WAV container (pure Python, no ffmpeg
     dependency). Telegram's native 'voice note' bubble technically wants
     OGG/OPUS, but that requires ffmpeg which isn't guaranteed to be present
     on every deployment target — WAV via send_audio is the reliable choice
-    and still plays as real speech."""
+    and still plays as real speech.
+
+    language_code is passed EXPLICITLY (e.g. 'uz-UZ', 'ru-RU', 'en-US')
+    rather than relying on Gemini's language auto-detection — auto-detect
+    was observed picking the wrong language entirely (Kazakh) for Uzbek
+    text, since Uzbek isn't a confirmed-GA language for this model."""
     import wave
     import io
     from google.genai import types
@@ -196,7 +201,8 @@ def _gemini_tts_sync(text: str) -> bytes:
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(
                         voice_name=settings.tts_voice,
                     )
-                )
+                ),
+                language_code=language_code,
             ),
         ),
     )
@@ -211,5 +217,5 @@ def _gemini_tts_sync(text: str) -> bytes:
     return buf.getvalue()
 
 
-async def gemini_text_to_speech(text: str) -> bytes:
-    return await asyncio.to_thread(_gemini_tts_sync, text)
+async def gemini_text_to_speech(text: str, language_code: str) -> bytes:
+    return await asyncio.to_thread(_gemini_tts_sync, text, language_code)

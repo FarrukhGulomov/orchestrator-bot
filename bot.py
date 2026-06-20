@@ -518,7 +518,47 @@ conventions. If the request genuinely needs code or a long structured
 deliverable, say briefly that you've prepared it and they'll see the full
 details in writing — do not try to read code or a table aloud. Keep the
 whole answer well under what would take ~45 seconds to say out loud.
+
+LANGUAGE: reply in ONLY Uzbek, Russian, or English — whichever best matches
+what the user actually spoke. Never use any other language for this reply,
+even if the transcript looks like it might be in a different language; pick
+whichever of these three is the closest match.
 """
+
+# Voice replies are restricted to exactly these three languages, end to end:
+# the agent is instructed (above) to only ever answer in one of them, and the
+# TTS call is given an EXPLICIT language_code from this same fixed set rather
+# than left to Gemini's auto-detection — auto-detect was observed picking the
+# wrong language entirely (Kazakh) for Uzbek text.
+_VOICE_LANGUAGE_CODES = {"uz": "uz-UZ", "ru": "ru-RU", "en": "en-US"}
+_DEFAULT_VOICE_LANGUAGE = "uz"  # team's primary language; safe fallback on ambiguity
+
+_LANGUAGE_DETECT_SYSTEM = """
+Identify the dominant language of the given text. Respond with ONLY one of
+these three codes, nothing else, no punctuation: uz, ru, en.
+uz = Uzbek, ru = Russian, en = English.
+The text may contain mixed IT/business loanwords in English even when the
+dominant language is Uzbek or Russian — judge by the dominant language, not
+individual loanwords. If genuinely ambiguous or it looks like some other
+language entirely, pick whichever of uz/ru/en is the closest match — never
+answer with anything other than one of these three codes.
+"""
+
+
+async def _detect_voice_language(text: str) -> str:
+    try:
+        raw = await groq_generate(
+            settings.router_model,
+            _LANGUAGE_DETECT_SYSTEM,
+            [{"role": "user", "content": text[:1000]}],
+            temperature=0.0,
+        )
+        code = raw.strip().lower()[:2]
+        if code in _VOICE_LANGUAGE_CODES:
+            return code
+    except Exception:  # noqa: BLE001
+        logger.exception("Voice language detection failed, using default")
+    return _DEFAULT_VOICE_LANGUAGE
 
 
 async def _handle_voice_note(
@@ -590,8 +630,10 @@ async def _handle_voice_note(
     body = (body or "").strip() or "Kechirasiz, javob topa olmadim."
 
     try:
+        lang_code = await _detect_voice_language(body)
         audio_bytes = await asyncio.wait_for(
-            gemini_text_to_speech(body), timeout=settings.request_timeout
+            gemini_text_to_speech(body, _VOICE_LANGUAGE_CODES[lang_code]),
+            timeout=settings.request_timeout,
         )
     except Exception:  # noqa: BLE001
         # TTS failing (e.g. unsupported language) must not lose the answer —
