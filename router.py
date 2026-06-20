@@ -74,6 +74,14 @@ decide three things.
 - "low"  : short, simple, quick question or trivial snippet
 - "high" : non-trivial reasoning, architecture, multi-step code, refactor, audit
 
+4) DOES THIS NEED A FORMATTED DOCUMENT instead of a chat reply?
+Set wants_document=true when the user is asking for something that should be
+delivered as a polished, shareable file rather than a chat message — e.g. a
+commercial proposal / cost-and-resource estimate ("tijorat taklifi", "smeta",
+"byudjet", "narx taklifi"), a formal report, or anything where they
+explicitly ask for "Word", "PDF", "hujjat", "fayl qilib ber", "tayyor
+hujjat". Otherwise false — default to a normal chat answer.
+
 Also write a short TITLE (max ~70 characters) summarising the request, in the
 SAME language as the user's message.
 
@@ -81,6 +89,7 @@ Respond with ONLY a JSON object, no prose:
 {{"agent": "<one of: {", ".join(_AGENT_KEYS)}>",
   "request_type": "<one of: {", ".join(_TYPE_KEYS)}>",
   "complexity": "low"|"high",
+  "wants_document": true|false,
   "title": "<short title>"}}
 """
 
@@ -92,6 +101,7 @@ class Route:
     model_label: str
     request_type: RequestType
     title: str
+    wants_document: bool = False
 
 
 def model_for(agent: Agent, complexity: str) -> tuple[str, str]:
@@ -112,6 +122,7 @@ async def classify(
     agent_key = last_agent if last_agent in AGENTS else DEFAULT_AGENT_KEY
     type_key = last_type if last_type in REQUEST_TYPES else DEFAULT_REQUEST_TYPE_KEY
     complexity = "high"
+    wants_document = False
     title = (user_text.strip()[:70] or "Untitled")
 
     context_hint = ""
@@ -146,6 +157,7 @@ async def classify(
             type_key = type_candidate
 
         complexity = "low" if str(data.get("complexity")).lower() == "low" else "high"
+        wants_document = bool(data.get("wants_document", False))
 
         raw_title = str(data.get("title", "")).strip()
         if raw_title:
@@ -166,4 +178,5 @@ async def classify(
         model_label=label,
         request_type=get_request_type(type_key),
         title=title,
+        wants_document=wants_document,
     )

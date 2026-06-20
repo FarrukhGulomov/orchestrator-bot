@@ -97,6 +97,37 @@ async def gemini_describe_file(data: bytes, mime_type: str, instruction: str) ->
     return await asyncio.to_thread(_gemini_describe_file_sync, data, mime_type, instruction)
 
 
+def _gemini_json_sync(model: str, system: str, messages: list[dict]) -> str:
+    """Like _gemini_sync, but forces strict JSON output via the API's
+    response_mime_type — used for structured document content generation,
+    not regular chat."""
+    from google.genai import types
+
+    client = _get_gemini()
+    contents = []
+    for m in messages:
+        role = "model" if m["role"] == "assistant" else "user"
+        contents.append(
+            types.Content(role=role, parts=[types.Part.from_text(text=m["content"])])
+        )
+
+    resp = client.models.generate_content(
+        model=model,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            system_instruction=system,
+            temperature=0.4,
+            max_output_tokens=4096,
+            response_mime_type="application/json",
+        ),
+    )
+    return (resp.text or "").strip()
+
+
+async def gemini_generate_json(model: str, system: str, messages: list[dict]) -> str:
+    return await asyncio.to_thread(_gemini_json_sync, model, system, messages)
+
+
 # --- Groq / Llama (ROUTE B + router) --------------------------------------
 def _groq_sync(
     model: str, system: str, messages: list[dict], temperature: float, json_mode: bool

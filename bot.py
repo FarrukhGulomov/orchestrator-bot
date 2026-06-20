@@ -26,19 +26,26 @@ to its own role: without it, asking one agent to "prepare this with your
 team" had nowhere to go except telling the user to go find people — even
 though the rest of the team already lives in this same bot.
 
+/proposal <text> (also auto-detected by the classifier as wants_document) —
+for requests that should be delivered as a polished Word + PDF file instead
+of a chat reply (e.g. a commercial proposal / cost estimate), since pasting
+that as raw chat text defeats the point of a shareable deliverable.
+
 Run:  python bot.py
 """
 
 import asyncio
 import logging
+import re
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatAction
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject
-from aiogram.types import Message
+from aiogram.types import BufferedInputFile, Message
 
+import document_generation as docgen
 import github_integration
 import history
 from agents import Agent, get_agent
@@ -94,6 +101,11 @@ def _strip_mention(text: str, bot_username: str) -> str:
 
 
 def _header(route: Route) -> str:
+    # Casual, non-actionable chat gets a tiny tag instead of the full
+    # ticket-style block — the heavy header is reserved for requests that
+    # actually become tracked work, so everyday Q&A doesn't feel bureaucratic.
+    if route.request_type.key == "question":
+        return f"_{route.agent.display_name} · {route.model_label}_\n\n"
     if settings.metadata_format == "simple":
         return (
             f"[ACTIVE_AGENT]: {route.agent.display_name}\n"
@@ -181,10 +193,57 @@ def _split(text: str, limit: int) -> list[str]:
     return parts
 
 
+async def _send_document_deliverable(message: Message, route: Route, user_text: str) -> None:
+    """Generate a polished Word + PDF document instead of a chat reply, for
+    requests that should be a shareable file (commercial proposal, cost
+    estimate, formal report). Skips ticket-filing/GitHub by design — this is
+    a deliverable handed directly to the user, not a tracked work item."""
+    chat_id = message.chat.id
+    status = await message.answer("📄 Hujjatni tayyorlayapman...")
+
+    try:
+        content = await asyncio.wait_for(
+            docgen.generate_proposal_content(route.agent, user_text),
+            timeout=settings.request_timeout,
+        )
+        docx_bytes = docgen.render_docx(content)
+        pdf_bytes = docgen.render_pdf(content)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Document generation failed")
+        await status.edit_text(f"⚠️ Hujjatni tayyorlashda xatolik: {exc}")
+        return
+
+    try:
+        await status.delete()
+    except TelegramBadRequest:
+        pass
+
+    title = content.get("title") or "Taklif"
+    slug = re.sub(r"[^a-zA-Z0-9]+", "_", title)[:50].strip("_") or "Taklif"
+    caption = f"📄 {title}"
+    if content.get("intro"):
+        caption += "\n\n" + content["intro"][:900]
+
+    await message.answer_document(
+        BufferedInputFile(docx_bytes, filename=f"{slug}.docx"), caption=caption
+    )
+    await message.answer_document(BufferedInputFile(pdf_bytes, filename=f"{slug}.pdf"))
+
+    history.append(chat_id, route.agent.key, "user", user_text)
+    history.append(chat_id, route.agent.key, "assistant", f"[Hujjat tayyorlandi: {title}]")
+    history.set_last_route(chat_id, route.agent.key, route.request_type.key)
+
+
 # --------------------------------------------------------------------------
 # Core pipeline (shared by free-text messages and /idea /task /bug /improve)
 # --------------------------------------------------------------------------
-async def _process(message: Message, bot: Bot, user_text: str | None, forced_type: str | None) -> None:
+async def _process(
+    message: Message,
+    bot: Bot,
+    user_text: str | None,
+    forced_type: str | None,
+    forced_document: bool | None = None,
+) -> None:
     chat_id = message.chat.id
     if not _is_allowed(chat_id):
         return
@@ -207,6 +266,16 @@ async def _process(message: Message, bot: Bot, user_text: str | None, forced_typ
     )
     if forced_type:
         route.request_type = get_request_type(forced_type)
+    if forced_document:
+        route.wants_document = True
+
+    if route.wants_document:
+        logger.info(
+            "chat=%s -> agent=%s DOCUMENT deliverable (Word+PDF)",
+            chat_id, route.agent.key,
+        )
+        await _send_document_deliverable(message, route, user_text)
+        return
 
     logger.info(
         "chat=%s -> agent=%s route=%s model=%s type=%s",
@@ -478,6 +547,8 @@ async def cmd_start(message: Message) -> None:
         "/bug <текст> — баг, нужен фикс\n"
         "/improve <текст> — доработка / рефакторинг\n"
         "/kickoff <текст> — вся команда сразу (PM + Designer + Backend + QA)\n"
+        "/proposal <текст> — готовый документ (Word+PDF), например коммерческое "
+        "предложение или смета ресурсов\n"
         "Без команды — отвечу как на обычный вопрос, без тикета.\n\n"
         "/reset — очистить контекст диалога\n"
         f"chat_id: `{message.chat.id}`",
@@ -516,6 +587,11 @@ async def cmd_bug(message: Message, bot: Bot, command: CommandObject) -> None:
 @dp.message(Command("improve"))
 async def cmd_improve(message: Message, bot: Bot, command: CommandObject) -> None:
     await _process(message, bot, command.args, forced_type="improvement")
+
+
+@dp.message(Command("proposal"))
+async def cmd_proposal(message: Message, bot: Bot, command: CommandObject) -> None:
+    await _process(message, bot, command.args, forced_type=None, forced_document=True)
 
 
 # --------------------------------------------------------------------------
