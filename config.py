@@ -87,6 +87,14 @@ class Settings:
         default_factory=lambda: os.getenv("WHISPER_MODEL", "whisper-large-v3-turbo")
     )
 
+    # Max tokens for a single agent reply. Was hardcoded at 2048 in
+    # llm_clients.py, which silently truncated longer TASK/BUG/REFINEMENT
+    # deliverables (e.g. a full design spec cut off mid-sentence) — bumped to
+    # a much safer default and made configurable.
+    max_output_tokens: int = field(
+        default_factory=lambda: int(os.getenv("MAX_OUTPUT_TOKENS", "8192"))
+    )
+
     # Reject inbound files larger than this (Telegram Bot API download limit
     # is ~20MB regardless; this just fails fast with a clear message).
     max_file_size_mb: int = field(
