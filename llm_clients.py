@@ -56,7 +56,7 @@ def _gemini_sync(model: str, system: str, messages: list[dict]) -> str:
         config=types.GenerateContentConfig(
             system_instruction=system,
             temperature=0.4,
-            max_output_tokens=2048,
+            max_output_tokens=settings.max_output_tokens,
         ),
     )
     return (resp.text or "").strip()
@@ -138,7 +138,7 @@ def _groq_sync(
         "model": model,
         "messages": full,
         "temperature": temperature,
-        "max_tokens": 2048,
+        "max_tokens": settings.max_output_tokens,
     }
     if json_mode:
         kwargs["response_format"] = {"type": "json_object"}
@@ -172,3 +172,44 @@ def _groq_transcribe_sync(data: bytes, filename: str) -> str:
 
 async def groq_transcribe(data: bytes, filename: str) -> str:
     return await asyncio.to_thread(_groq_transcribe_sync, data, filename)
+
+
+def _gemini_tts_sync(text: str) -> bytes:
+    """Generate speech via Gemini's native TTS and wrap the raw PCM the API
+    returns into a standard playable WAV container (pure Python, no ffmpeg
+    dependency). Telegram's native 'voice note' bubble technically wants
+    OGG/OPUS, but that requires ffmpeg which isn't guaranteed to be present
+    on every deployment target — WAV via send_audio is the reliable choice
+    and still plays as real speech."""
+    import wave
+    import io
+    from google.genai import types
+
+    client = _get_gemini()
+    resp = client.models.generate_content(
+        model=settings.tts_model,
+        contents=text,
+        config=types.GenerateContentConfig(
+            response_modalities=["AUDIO"],
+            speech_config=types.SpeechConfig(
+                voice_config=types.VoiceConfig(
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                        voice_name=settings.tts_voice,
+                    )
+                )
+            ),
+        ),
+    )
+    pcm = resp.candidates[0].content.parts[0].inline_data.data
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(24000)
+        wf.writeframes(pcm)
+    return buf.getvalue()
+
+
+async def gemini_text_to_speech(text: str) -> bytes:
+    return await asyncio.to_thread(_gemini_tts_sync, text)

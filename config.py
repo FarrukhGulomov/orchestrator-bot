@@ -139,6 +139,27 @@ class Settings:
     metadata_format: str = field(
         default_factory=lambda: os.getenv("METADATA_FORMAT", "x_metadata").strip().lower()
     )
+    # If False (default now), no metadata header is shown to the user at all —
+    # routing info still goes to logs, but chat replies read like they came
+    # from a person, not a visibly multi-agent system. Set true to restore
+    # the visible header (useful while testing/debugging routing).
+    show_metadata_header: bool = field(
+        default_factory=lambda: os.getenv("SHOW_METADATA_HEADER", "false").lower() == "true"
+    )
+
+    # --- Voice replies (voice note in -> voice note out) --------------------
+    # Uses Gemini's native speech-generation models. Coverage is solid for
+    # English/Russian and many others; Uzbek is NOT explicitly confirmed in
+    # Google's published language list as of this writing — test it for your
+    # team's actual usage and disable if quality is poor.
+    voice_replies_enabled: bool = field(
+        default_factory=lambda: os.getenv("VOICE_REPLIES_ENABLED", "true").lower() == "true"
+    )
+    tts_model: str = field(
+        default_factory=lambda: os.getenv("TTS_MODEL", "gemini-3.1-flash-tts-preview")
+    )
+    # One of Gemini's prebuilt voice names (e.g. Kore, Puck, Charon, Fenrir...).
+    tts_voice: str = field(default_factory=lambda: os.getenv("TTS_VOICE", "Kore"))
 
     @property
     def github_enabled(self) -> bool:

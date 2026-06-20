@@ -82,6 +82,15 @@ commercial proposal / cost-and-resource estimate ("tijorat taklifi", "smeta",
 explicitly ask for "Word", "PDF", "hujjat", "fayl qilib ber", "tayyor
 hujjat". Otherwise false — default to a normal chat answer.
 
+5) IS THIS A META-QUESTION ABOUT WHAT THE ASSISTANT/TEAM ITSELF CAN DO?
+Set is_capability_question=true ONLY when the user is asking about the
+ASSISTANT'S OWN capabilities as a whole — e.g. "nima qila olasan", "sen
+qanday vazifalarni bajara olasan", "what can you do", "kimsan", "qaysi
+sohalarda yordam berasan", "sizning jamoangiz nima qiladi". This must NOT be
+routed to a single narrow specialist — it needs a short overview of the
+WHOLE team. Do not set this for real domain questions (e.g. "API qanday
+ishlaydi" is a real question, not a capability question). Default false.
+
 Also write a short TITLE (max ~70 characters) summarising the request, in the
 SAME language as the user's message.
 
@@ -90,6 +99,7 @@ Respond with ONLY a JSON object, no prose:
   "request_type": "<one of: {", ".join(_TYPE_KEYS)}>",
   "complexity": "low"|"high",
   "wants_document": true|false,
+  "is_capability_question": true|false,
   "title": "<short title>"}}
 """
 
@@ -102,6 +112,7 @@ class Route:
     request_type: RequestType
     title: str
     wants_document: bool = False
+    is_capability_question: bool = False
 
 
 def model_for(agent: Agent, complexity: str) -> tuple[str, str]:
@@ -123,6 +134,7 @@ async def classify(
     type_key = last_type if last_type in REQUEST_TYPES else DEFAULT_REQUEST_TYPE_KEY
     complexity = "high"
     wants_document = False
+    is_capability_question = False
     title = (user_text.strip()[:70] or "Untitled")
 
     context_hint = ""
@@ -158,6 +170,7 @@ async def classify(
 
         complexity = "low" if str(data.get("complexity")).lower() == "low" else "high"
         wants_document = bool(data.get("wants_document", False))
+        is_capability_question = bool(data.get("is_capability_question", False))
 
         raw_title = str(data.get("title", "")).strip()
         if raw_title:
@@ -179,4 +192,5 @@ async def classify(
         request_type=get_request_type(type_key),
         title=title,
         wants_document=wants_document,
+        is_capability_question=is_capability_question,
     )

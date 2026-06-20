@@ -31,6 +31,14 @@ for requests that should be delivered as a polished Word + PDF file instead
 of a chat reply (e.g. a commercial proposal / cost estimate), since pasting
 that as raw chat text defeats the point of a shareable deliverable.
 
+VOICE NOTE IN -> VOICE NOTE OUT: a Telegram voice note is transcribed, routed
+and answered exactly like text, but the reply is generated in a short,
+spoken-conversation style and sent back as an audio reply (Gemini TTS),
+because reading a bulleted report aloud doesn't feel human. Coverage is
+strong for English/Russian; Uzbek is not explicitly confirmed in Google's
+published language list — test it for your team's real usage
+(VOICE_REPLIES_ENABLED=false disables this and falls back to a text reply).
+
 Run:  python bot.py
 """
 
@@ -50,8 +58,8 @@ import github_integration
 import history
 from agents import Agent, get_agent
 from config import settings
-from file_processing import SUPPORTED_SUMMARY, extract
-from llm_clients import gemini_generate, groq_generate
+from file_processing import SUPPORTED_SUMMARY, extract, transcribe_audio
+from llm_clients import gemini_generate, gemini_text_to_speech, groq_generate
 from request_types import REQUEST_TYPES, get_request_type
 from router import Route, classify, model_for
 
@@ -101,6 +109,11 @@ def _strip_mention(text: str, bot_username: str) -> str:
 
 
 def _header(route: Route) -> str:
+    # Hidden by default (settings.show_metadata_header=False): replies should
+    # read like they came from a person on the team, not visibly from a
+    # multi-agent AI system. Routing info still goes to logs either way.
+    if not settings.show_metadata_header:
+        return ""
     # Casual, non-actionable chat gets a tiny tag instead of the full
     # ticket-style block — the heavy header is reserved for requests that
     # actually become tracked work, so everyday Q&A doesn't feel bureaucratic.
@@ -234,6 +247,54 @@ async def _send_document_deliverable(message: Message, route: Route, user_text: 
     history.set_last_route(chat_id, route.agent.key, route.request_type.key)
 
 
+_CAPABILITY_OVERVIEW_SYSTEM = """
+You are answering on behalf of the WHOLE in-house AI team in this Telegram
+bot — not a single specialist. The user is asking what you/the team can do.
+Give a SHORT, warm, human-sounding answer, not a bureaucratic role list.
+Briefly mention the team covers product/business work (requirements,
+roadmap, user stories, test plans, UX/UI design) AND engineering work
+(backend, frontend, infrastructure, security, code review) — then 1-2
+sentences on how to use it: just describe what's needed and it routes to
+the right person automatically, /kickoff pulls in the whole team at once,
+/proposal returns a ready Word/PDF document. Keep it under ~80 words, plain
+conversational prose, no headers, no bullet list, no markdown decoration.
+Match the dominant language of the user's message (Uzbek/Russian/English;
+keep IT/product terms in English as usual).
+"""
+
+_CAPABILITY_FALLBACK_UZ = (
+    "Jamoam mahsulot va texnik ishlarning deyarli barchasini qamrab oladi: "
+    "talablar va backlog, user story va test rejalari, UX/UI dizayn, backend/"
+    "frontend kod, infratuzilma va xavfsizlik. Shunchaki nima kerakligini "
+    "yozing — kerakli odamga avtomatik yo'naltiraman, yoki /kickoff bilan "
+    "butun jamoani bir vaqtda jalb qiling."
+)
+
+
+async def _send_capability_overview(message: Message, bot: Bot, route: Route, user_text: str) -> None:
+    """Meta-questions ('what can you do') must NOT be answered by a single
+    narrow specialist — that's the bug this fixes. Short, whole-team answer,
+    no header (consistent with hide-metadata default)."""
+    chat_id = message.chat.id
+    await bot.send_chat_action(chat_id, ChatAction.TYPING)
+    try:
+        body = await asyncio.wait_for(
+            groq_generate(
+                settings.router_model,
+                _CAPABILITY_OVERVIEW_SYSTEM,
+                [{"role": "user", "content": user_text}],
+                temperature=0.5,
+            ),
+            timeout=settings.request_timeout,
+        )
+        body = body.strip() or _CAPABILITY_FALLBACK_UZ
+    except Exception:  # noqa: BLE001
+        logger.exception("Capability overview generation failed, using fallback")
+        body = _CAPABILITY_FALLBACK_UZ
+
+    await _send_long(message, body)
+
+
 # --------------------------------------------------------------------------
 # Core pipeline (shared by free-text messages and /idea /task /bug /improve)
 # --------------------------------------------------------------------------
@@ -268,6 +329,11 @@ async def _process(
         route.request_type = get_request_type(forced_type)
     if forced_document:
         route.wants_document = True
+
+    if route.is_capability_question and not forced_type and not forced_document:
+        logger.info("chat=%s -> capability overview (whole team)", chat_id)
+        await _send_capability_overview(message, bot, route, user_text)
+        return
 
     if route.wants_document:
         logger.info(
@@ -357,6 +423,11 @@ async def _kickoff_agent_call(agent_key: str, user_text: str) -> dict:
 
 
 def _kickoff_header(results: list[dict]) -> str:
+    # Per-role section markers ("#### 🛠️ {name}") stay regardless — without
+    # them a combined multi-answer message is unreadable, and that's the
+    # whole point of /kickoff. Only the routing-metadata block is gated.
+    if not settings.show_metadata_header:
+        return ""
     agent_names = ", ".join(r["agent"].display_name for r in results)
     model_labels = ", ".join(sorted({r["model_label"] for r in results}))
     if settings.metadata_format == "simple":
@@ -432,6 +503,123 @@ async def cmd_kickoff(message: Message, bot: Bot, command: CommandObject) -> Non
         footer = ("\n\n" + "\n".join(lines)) if lines else ""
 
     await _send_long(message, "".join(parts) + footer)
+
+
+# --------------------------------------------------------------------------
+# Voice notes — transcribe, route, answer in spoken style, reply with audio
+# --------------------------------------------------------------------------
+_VOICE_MODE_ADDENDUM = """
+VOICE REPLY MODE.
+This answer will be converted to speech and sent back as a spoken audio
+reply — the user is talking to you, not reading a document. Answer the way
+you'd actually talk: short, natural sentences, conversational. NO headers,
+NO bullet lists, NO markdown formatting, NO code blocks, NO file-marker
+conventions. If the request genuinely needs code or a long structured
+deliverable, say briefly that you've prepared it and they'll see the full
+details in writing — do not try to read code or a table aloud. Keep the
+whole answer well under what would take ~45 seconds to say out loud.
+"""
+
+
+async def _handle_voice_note(
+    message: Message,
+    bot: Bot,
+    file_id: str,
+    mime_type: str | None,
+    file_size: int | None,
+    caption: str | None,
+) -> None:
+    chat_id = message.chat.id
+    if not _is_allowed(chat_id):
+        return
+
+    if not settings.voice_replies_enabled:
+        # Feature off -> behave like any other inbound file (transcribe,
+        # answer as normal text).
+        await _handle_file(message, bot, file_id, "voice.ogg", mime_type, file_size, caption)
+        return
+
+    max_bytes = settings.max_file_size_mb * 1024 * 1024
+    if file_size and file_size > max_bytes:
+        await message.answer(
+            f"⚠️ Ovozli xabar juda katta ({file_size // (1024*1024)} MB). "
+            f"Maksimal hajm: {settings.max_file_size_mb} MB."
+        )
+        return
+
+    status = await message.answer("🎙 Eshityapman...")
+    try:
+        buf = await bot.download(file_id)
+        data = buf.read() if hasattr(buf, "read") else bytes(buf)
+        transcript = await transcribe_audio(data, "voice.ogg")
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Voice transcription failed")
+        await status.edit_text(f"⚠️ Ovozli xabarni tushunishda xatolik: {exc}")
+        return
+
+    user_text = f"{caption.strip()}\n\n{transcript}" if caption and caption.strip() else transcript
+    user_text = (user_text or "").strip()
+    if not user_text:
+        await status.edit_text("⚠️ Ovozli xabarda matn aniqlanmadi, qaytadan urinib ko'ring.")
+        return
+
+    last = history.get_last_route(chat_id)
+    route = await classify(
+        user_text,
+        last_agent=last[0] if last else None,
+        last_type=last[1] if last else None,
+    )
+    # Voice mode keeps things simple by design: always a short spoken answer
+    # from the routed agent. Document-deliverable / capability-overview /
+    # GitHub-ticket paths are intentionally not wired in here — a voice note
+    # is a quick spoken exchange, not where you'd want a generated Word file.
+    system_prompt = route.agent.system + "\n" + _VOICE_MODE_ADDENDUM
+    msgs = history.get_history(chat_id, route.agent.key) + [
+        {"role": "user", "content": user_text}
+    ]
+
+    await bot.send_chat_action(chat_id, ChatAction.RECORD_VOICE)
+    try:
+        body = await asyncio.wait_for(
+            _answer_with_agent(route, system_prompt, msgs), timeout=settings.request_timeout
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Voice-mode generation failed")
+        await status.edit_text(f"⚠️ Javob tayyorlashda xatolik: {exc}")
+        return
+    body = (body or "").strip() or "Kechirasiz, javob topa olmadim."
+
+    try:
+        audio_bytes = await asyncio.wait_for(
+            gemini_text_to_speech(body), timeout=settings.request_timeout
+        )
+    except Exception:  # noqa: BLE001
+        # TTS failing (e.g. unsupported language) must not lose the answer —
+        # fall back to a normal text reply instead.
+        logger.exception("TTS failed, falling back to text reply")
+        try:
+            await status.delete()
+        except TelegramBadRequest:
+            pass
+        history.append(chat_id, route.agent.key, "user", user_text)
+        history.append(chat_id, route.agent.key, "assistant", body)
+        history.set_last_route(chat_id, route.agent.key, route.request_type.key)
+        await _send_long(message, body)
+        return
+
+    try:
+        await status.delete()
+    except TelegramBadRequest:
+        pass
+
+    history.append(chat_id, route.agent.key, "user", user_text)
+    history.append(chat_id, route.agent.key, "assistant", body)
+    history.set_last_route(chat_id, route.agent.key, route.request_type.key)
+
+    caption_text = body if len(body) <= 1000 else body[:1000] + "…"
+    await message.answer_audio(
+        BufferedInputFile(audio_bytes, filename="javob.wav"), caption=caption_text
+    )
 
 
 # --------------------------------------------------------------------------
@@ -511,8 +699,8 @@ async def handle_document(message: Message, bot: Bot) -> None:
 @dp.message(F.voice)
 async def handle_voice(message: Message, bot: Bot) -> None:
     voice = message.voice
-    await _handle_file(
-        message, bot, voice.file_id, "voice.ogg", voice.mime_type or "audio/ogg",
+    await _handle_voice_note(
+        message, bot, voice.file_id, voice.mime_type or "audio/ogg",
         voice.file_size, message.caption,
     )
 
@@ -541,6 +729,7 @@ async def cmd_start(message: Message) -> None:
         "запроса.\n\n"
         "Можно присылать файлы — прочитаю и обработаю как обычное сообщение: "
         f"{SUPPORTED_SUMMARY}.\n\n"
+        "Голосовое сообщение — отвечу тоже голосом, коротко и по-человечески.\n\n"
         "Тип запроса можно задать явно:\n"
         "/idea <текст> — идея / предложение\n"
         "/task <текст> — задача на реализацию\n"
