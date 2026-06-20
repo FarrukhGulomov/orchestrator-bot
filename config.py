@@ -161,6 +161,22 @@ class Settings:
     # One of Gemini's prebuilt voice names (e.g. Kore, Puck, Charon, Fenrir...).
     tts_voice: str = field(default_factory=lambda: os.getenv("TTS_VOICE", "Kore"))
 
+    # Languages where Gemini TTS has been confirmed (by real testing, twice)
+    # to produce the WRONG language entirely (Uzbek -> Kazakh) even with an
+    # explicit language_code — the model most likely was never trained on
+    # real audio for these languages, so no parameter can fix it. For any
+    # language code in this set, voice replies skip TTS entirely and send
+    # text instead, rather than risk sending audio in the wrong language.
+    # Comma-separated uz/ru/en codes. Remove 'uz' here only if you've
+    # verified pronunciation is actually correct for your use case.
+    tts_unsupported_languages: set[str] = field(
+        default_factory=lambda: {
+            s.strip().lower()
+            for s in os.getenv("TTS_UNSUPPORTED_LANGUAGES", "uz").split(",")
+            if s.strip()
+        }
+    )
+
     @property
     def github_enabled(self) -> bool:
         return bool(self.github_token and self.github_repo)

@@ -33,11 +33,12 @@ that as raw chat text defeats the point of a shareable deliverable.
 
 VOICE NOTE IN -> VOICE NOTE OUT: a Telegram voice note is transcribed, routed
 and answered exactly like text, but the reply is generated in a short,
-spoken-conversation style and sent back as an audio reply (Gemini TTS),
-because reading a bulleted report aloud doesn't feel human. Coverage is
-strong for English/Russian; Uzbek is not explicitly confirmed in Google's
-published language list — test it for your team's real usage
-(VOICE_REPLIES_ENABLED=false disables this and falls back to a text reply).
+spoken-conversation style. For Russian/English the reply is sent back as
+audio (Gemini TTS). For Uzbek, Gemini TTS has been confirmed by real testing
+to produce the WRONG language (Kazakh) even with an explicit language hint —
+most likely the model was never trained on real Uzbek speech — so for
+Uzbek the reply is sent as TEXT instead of risking wrong-language audio.
+See TTS_UNSUPPORTED_LANGUAGES in config.py to adjust this if that changes.
 
 Run:  python bot.py
 """
@@ -527,9 +528,12 @@ whichever of these three is the closest match.
 
 # Voice replies are restricted to exactly these three languages, end to end:
 # the agent is instructed (above) to only ever answer in one of them, and the
-# TTS call is given an EXPLICIT language_code from this same fixed set rather
-# than left to Gemini's auto-detection — auto-detect was observed picking the
-# wrong language entirely (Kazakh) for Uzbek text.
+# TTS call is given an EXPLICIT language_code from this same fixed set.
+# NOTE: even with an explicit language_code, Gemini TTS has been confirmed
+# (by real testing) to still produce the wrong language for Uzbek (Kazakh
+# audio) — most likely the underlying model was simply never trained on real
+# Uzbek speech, so no parameter fixes it. See tts_unsupported_languages in
+# config.py: languages in that set skip TTS entirely and get a text reply.
 _VOICE_LANGUAGE_CODES = {"uz": "uz-UZ", "ru": "ru-RU", "en": "en-US"}
 _DEFAULT_VOICE_LANGUAGE = "uz"  # team's primary language; safe fallback on ambiguity
 
@@ -628,9 +632,24 @@ async def _handle_voice_note(
         await status.edit_text(f"⚠️ Javob tayyorlashda xatolik: {exc}")
         return
     body = (body or "").strip() or "Kechirasiz, javob topa olmadim."
+    lang_code = await _detect_voice_language(body)
+
+    if lang_code in settings.tts_unsupported_languages:
+        # Known-bad combination (Uzbek -> Gemini TTS produces Kazakh audio,
+        # confirmed by real testing, even with an explicit language_code).
+        # Sending wrong-language audio is worse than just sending text — so
+        # for these languages, skip the TTS attempt entirely.
+        try:
+            await status.delete()
+        except TelegramBadRequest:
+            pass
+        history.append(chat_id, route.agent.key, "user", user_text)
+        history.append(chat_id, route.agent.key, "assistant", body)
+        history.set_last_route(chat_id, route.agent.key, route.request_type.key)
+        await _send_long(message, body)
+        return
 
     try:
-        lang_code = await _detect_voice_language(body)
         audio_bytes = await asyncio.wait_for(
             gemini_text_to_speech(body, _VOICE_LANGUAGE_CODES[lang_code]),
             timeout=settings.request_timeout,
