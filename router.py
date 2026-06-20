@@ -27,7 +27,7 @@ and is also used as the fallback if the classifier call itself fails.
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from agents import AGENTS, DEFAULT_AGENT_KEY, Agent, get_agent
 from config import settings
@@ -91,6 +91,18 @@ routed to a single narrow specialist — it needs a short overview of the
 WHOLE team. Do not set this for real domain questions (e.g. "API qanday
 ishlaydi" is a real question, not a capability question). Default false.
 
+6) DOES THIS NEED INPUT FROM MULTIPLE ROLES to be properly answered?
+Most requests are single-domain — leave collaborators as an EMPTY list, this
+should be the common case. Only add collaborators when the request clearly
+spans multiple distinct disciplines and a complete answer genuinely needs
+more than one perspective at once — e.g. planning/launching a new feature or
+product (needs pm + relevant engineering roles), a security-sensitive
+architecture decision (needs the engineering role + soc), a UX-affecting
+backend change (needs backend + product_designer). List 0-3 collaborator
+agent keys (from the list in section 1), NEVER including the primary agent
+itself. The user should not have to ask for each role separately — if the
+request needs a team, gather the team yourself.
+
 Also write a short TITLE (max ~70 characters) summarising the request, in the
 SAME language as the user's message.
 
@@ -100,6 +112,7 @@ Respond with ONLY a JSON object, no prose:
   "complexity": "low"|"high",
   "wants_document": true|false,
   "is_capability_question": true|false,
+  "collaborators": ["<0-3 agent keys, excluding the primary agent>"],
   "title": "<short title>"}}
 """
 
@@ -113,6 +126,7 @@ class Route:
     title: str
     wants_document: bool = False
     is_capability_question: bool = False
+    collaborators: list[str] = field(default_factory=list)
 
 
 def model_for(agent: Agent, complexity: str) -> tuple[str, str]:
@@ -135,6 +149,7 @@ async def classify(
     complexity = "high"
     wants_document = False
     is_capability_question = False
+    collaborators: list[str] = []
     title = (user_text.strip()[:70] or "Untitled")
 
     context_hint = ""
@@ -172,6 +187,17 @@ async def classify(
         wants_document = bool(data.get("wants_document", False))
         is_capability_question = bool(data.get("is_capability_question", False))
 
+        raw_collabs = data.get("collaborators", [])
+        if isinstance(raw_collabs, list):
+            seen: list[str] = []
+            for c in raw_collabs:
+                ck = str(c).strip().lower()
+                if ck in AGENTS and ck != agent_key and ck not in seen:
+                    seen.append(ck)
+                if len(seen) >= 3:
+                    break
+            collaborators = seen
+
         raw_title = str(data.get("title", "")).strip()
         if raw_title:
             title = raw_title[:120]
@@ -193,4 +219,5 @@ async def classify(
         title=title,
         wants_document=wants_document,
         is_capability_question=is_capability_question,
+        collaborators=collaborators,
     )

@@ -18,13 +18,26 @@ Flow per message:
 Explicit commands /idea /task /bug /improve force the request type instead of
 relying on the classifier (agent + model are still auto-routed).
 
-/kickoff <text> fans the SAME request out to a fixed cross-functional team
-(PM, Product Designer, Backend, QA) in parallel and returns all four answers
-in one message — for when the user wants the whole team to respond together,
-not a single department. This exists because every agent is otherwise scoped
-to its own role: without it, asking one agent to "prepare this with your
-team" had nowhere to go except telling the user to go find people — even
-though the rest of the team already lives in this same bot.
+/kickoff <text> fans the SAME request out to a FIXED cross-functional team
+(PM, Product Designer, Backend, QA) and returns all four raw answers
+side-by-side — an explicit "show me everyone's individual take" tool.
+
+AUTOMATIC MULTI-AGENT COLLABORATION: separately from /kickoff, the router
+itself decides per-message whether a request genuinely needs more than one
+specialist (e.g. planning a feature needs PM + engineering input). When it
+does, the bot automatically consults the relevant DYNAMIC set of roles in
+parallel and SYNTHESIZES their input into one cohesive answer — the user
+never has to ask for each role separately or know any commands exist. Most
+messages are still single-domain and use the fast single-agent path; this
+only engages when the classifier flags it.
+
+PROJECT MEMORY ("self-learning", honestly described): durable facts about
+the project (name, tech-stack decisions, budget figures, established
+constraints) are auto-extracted from consequential exchanges and injected
+into every agent's prompt going forward — see memory.py for what this
+actually is and, importantly, what it is NOT (no model weights are ever
+retrained; this is prompt-injected context, lost on restart unless you wire
+in persistent storage).
 
 /proposal <text> (also auto-detected by the classifier as wants_document) —
 for requests that should be delivered as a polished Word + PDF file instead
@@ -57,7 +70,8 @@ from aiogram.types import BufferedInputFile, Message
 import document_generation as docgen
 import github_integration
 import history
-from agents import Agent, get_agent
+import memory
+from agents import Agent, TEAM_MEMORY_HEADER, get_agent
 from config import settings
 from file_processing import SUPPORTED_SUMMARY, extract, transcribe_audio
 from llm_clients import gemini_generate, gemini_text_to_speech, groq_generate
@@ -107,6 +121,23 @@ def _strip_mention(text: str, bot_username: str) -> str:
     if bot_username:
         text = text.replace(f"@{bot_username}", "").replace(f"@{bot_username.lower()}", "")
     return text.strip()
+
+
+def _build_system_prompt(chat_id: int, agent: Agent, addendum: str = "") -> str:
+    """Agent persona + project memory (if any) + request-type addendum.
+
+    Centralised so every entry point (single-agent, collaborative synthesis,
+    /kickoff, voice mode) gets the same memory-aware prompt instead of each
+    building it ad hoc.
+    """
+    facts = memory.get_memory(chat_id)
+    memory_block = (
+        TEAM_MEMORY_HEADER + "\n".join(f"- {f}" for f in facts) + "\n\n" if facts else ""
+    )
+    parts = [memory_block + agent.system]
+    if addendum:
+        parts.append(addendum)
+    return "\n".join(parts)
 
 
 def _header(route: Route) -> str:
@@ -345,17 +376,30 @@ async def _process(
         return
 
     logger.info(
-        "chat=%s -> agent=%s route=%s model=%s type=%s",
+        "chat=%s -> agent=%s route=%s model=%s type=%s collaborators=%s",
         chat_id,
         route.agent.key,
         route.agent.route,
         route.model,
         route.request_type.key,
+        route.collaborators,
     )
 
-    system_prompt = route.agent.system
-    if route.request_type.addendum:
-        system_prompt = system_prompt + "\n" + route.request_type.addendum
+    if route.collaborators:
+        # Request needs more than one perspective — gather the team
+        # automatically instead of making the user ask for each role.
+        body = await _run_collaborative_answer(route, user_text, chat_id)
+        history.append(chat_id, route.agent.key, "user", user_text)
+        history.append(chat_id, route.agent.key, "assistant", body)
+        history.set_last_route(chat_id, route.agent.key, route.request_type.key)
+
+        footer = await _maybe_create_tickets(route, user_text, body)
+        await _send_long(message, _header(route) + body + footer)
+        if route.request_type.creates_ticket:
+            asyncio.create_task(_maybe_extract_memory(chat_id, user_text, body))
+        return
+
+    system_prompt = _build_system_prompt(chat_id, route.agent, route.request_type.addendum)
 
     msgs = history.get_history(chat_id, route.agent.key) + [
         {"role": "user", "content": user_text}
@@ -382,19 +426,21 @@ async def _process(
 
     footer = await _maybe_create_tickets(route, user_text, body)
     await _send_long(message, _header(route) + body + footer)
+    if route.request_type.creates_ticket:
+        asyncio.create_task(_maybe_extract_memory(chat_id, user_text, body))
 
 
 # --------------------------------------------------------------------------
 # /kickoff — whole team responds together
 # --------------------------------------------------------------------------
-async def _kickoff_agent_call(agent_key: str, user_text: str) -> dict:
-    """Run one team member's reply for /kickoff. Never raises — returns an
-    error note in 'body' instead, so one failing teammate doesn't blank out
-    the others."""
+async def _kickoff_agent_call(agent_key: str, user_text: str, chat_id: int) -> dict:
+    """Run one team member's reply (used by both /kickoff and automatic
+    multi-agent collaboration). Never raises — returns an error note in
+    'body' instead, so one failing teammate doesn't blank out the others."""
     agent: Agent = get_agent(agent_key)
     # Force an actual deliverable (not discussion) from every teammate, same
     # as the TASK request type does for normal single-agent routing.
-    system_prompt = agent.system + "\n" + REQUEST_TYPES["task"].addendum
+    system_prompt = _build_system_prompt(chat_id, agent, REQUEST_TYPES["task"].addendum)
     model, label = model_for(agent, "high")
     try:
         if agent.route == "A":
@@ -421,6 +467,100 @@ async def _kickoff_agent_call(agent_key: str, user_text: str) -> dict:
             "body": f"⚠️ Не удалось получить ответ от этой роли: {exc}",
             "ok": False,
         }
+
+
+_SYNTHESIS_SYSTEM = """
+You are the lead voice presenting the team's COMBINED answer to the user, in
+this Telegram-based AI product team for a fintech company. You are given the
+original request and several specialists' individual input below. Merge
+them into ONE cohesive, complete answer — NOT a sequence of separately
+labelled sections, not a meeting transcript. Resolve overlaps, drop
+redundancy, keep the most useful concrete specifics from each specialist
+(real numbers, real next steps, real code where given), and present it as
+if one excellent, senior, friendly product lead is speaking on behalf of
+the whole team. Match the dominant language of the ORIGINAL request (Uzbek/
+Russian/English; keep IT/product terms in English as usual). Same human-tone
+rules as always apply: length matches the substance, no boilerplate openers,
+no excessive markdown decoration — but use structure (headings/bullets)
+where the combined content genuinely needs it (e.g. a real multi-phase
+plan). This may become a tracked ticket, so make it self-contained.
+"""
+
+
+async def _run_collaborative_answer(route: Route, user_text: str, chat_id: int) -> str:
+    """Automatic multi-agent collaboration: fan out to the primary agent +
+    its collaborators in parallel, then synthesize ONE combined answer.
+    Each contributor's own exchange is still saved to ITS OWN history scope
+    (same isolation as /kickoff), so their individual context keeps growing
+    even though the user only ever sees the synthesized result."""
+    roles = [route.agent.key] + [k for k in route.collaborators if k != route.agent.key]
+    roles = list(dict.fromkeys(roles))[:4]  # dedupe, cap total team size at 4
+
+    results = await asyncio.gather(*[_kickoff_agent_call(key, user_text, chat_id) for key in roles])
+
+    for r in results:
+        if r["ok"]:
+            history.append(chat_id, r["agent"].key, "user", user_text)
+            history.append(chat_id, r["agent"].key, "assistant", r["body"])
+
+    ok_results = [r for r in results if r["ok"]]
+    if not ok_results:
+        return "Kechirasiz, jamoadan javob ololmadim, birozdan keyin qaytadan urinib ko'ring."
+
+    contributions = "\n\n".join(
+        f"--- {r['agent'].display_name}'s input ---\n{r['body']}" for r in ok_results
+    )
+    synthesis_input = f"ORIGINAL REQUEST:\n{user_text}\n\n{contributions}"
+
+    try:
+        body = await asyncio.wait_for(
+            gemini_generate(
+                settings.analysis_model,
+                _SYNTHESIS_SYSTEM,
+                [{"role": "user", "content": synthesis_input}],
+            ),
+            timeout=settings.request_timeout,
+        )
+        body = (body or "").strip()
+    except Exception:  # noqa: BLE001
+        logger.exception("Synthesis failed, falling back to primary agent's raw answer")
+        body = ""
+
+    if not body:
+        primary = next((r for r in ok_results if r["agent"].key == route.agent.key), ok_results[0])
+        body = primary["body"]
+
+    return body
+
+
+_MEMORY_EXTRACT_SYSTEM = """
+Given this exchange between a user and an AI product team, is there ONE
+durable fact worth remembering for future conversations about this same
+project — e.g. the project's name, a confirmed tech-stack choice, a
+budget/timeline figure, an established naming convention, a firm decision
+or constraint? Do NOT record vague chit-chat, opinions, or anything not
+clearly decided/stated as fact.
+If yes: respond with ONLY that one fact, under 150 characters, in the same
+language as the exchange.
+If there is no durable fact: respond with exactly NONE.
+"""
+
+
+async def _maybe_extract_memory(chat_id: int, user_text: str, body: str) -> None:
+    """Runs in the background after a response is already sent — never
+    blocks or risks the user-facing reply."""
+    try:
+        raw = await groq_generate(
+            settings.router_model,
+            _MEMORY_EXTRACT_SYSTEM,
+            [{"role": "user", "content": f"REQUEST:\n{user_text}\n\nANSWER:\n{body[:2000]}"}],
+            temperature=0.0,
+        )
+        fact = (raw or "").strip()
+        if fact and fact.upper() != "NONE" and len(fact) < 300:
+            memory.add_memory(chat_id, fact)
+    except Exception:  # noqa: BLE001
+        logger.exception("Memory extraction failed (non-fatal)")
 
 
 def _kickoff_header(results: list[dict]) -> str:
@@ -464,7 +604,7 @@ async def cmd_kickoff(message: Message, bot: Bot, command: CommandObject) -> Non
     await bot.send_chat_action(chat_id, ChatAction.TYPING)
 
     results = await asyncio.gather(
-        *[_kickoff_agent_call(key, user_text) for key in KICKOFF_ROLES]
+        *[_kickoff_agent_call(key, user_text, chat_id) for key in KICKOFF_ROLES]
     )
 
     parts = [_kickoff_header(results)]
@@ -614,10 +754,11 @@ async def _handle_voice_note(
         last_type=last[1] if last else None,
     )
     # Voice mode keeps things simple by design: always a short spoken answer
-    # from the routed agent. Document-deliverable / capability-overview /
-    # GitHub-ticket paths are intentionally not wired in here — a voice note
-    # is a quick spoken exchange, not where you'd want a generated Word file.
-    system_prompt = route.agent.system + "\n" + _VOICE_MODE_ADDENDUM
+    # from the routed agent (no automatic multi-agent collaboration here —
+    # a voice note is a quick spoken exchange, not a planning session).
+    # Document-deliverable / capability-overview / GitHub-ticket paths are
+    # intentionally not wired in either.
+    system_prompt = _build_system_prompt(chat_id, route.agent, _VOICE_MODE_ADDENDUM)
     msgs = history.get_history(chat_id, route.agent.key) + [
         {"role": "user", "content": user_text}
     ]
@@ -786,8 +927,9 @@ async def cmd_start(message: Message) -> None:
         "Master Orchestrator онлайн.\n"
         "Напишите задачу на UZ / RU / EN — я выберу подходящего агента "
         "(PM, BA, System Analyst, QA, Product Designer, Backend, Frontend, "
-        "DevOps, SOC, Tech Lead) и оптимальную модель, а также определю тип "
-        "запроса.\n\n"
+        "DevOps, SOC, Tech Lead) и оптимальную модель. Если запрос требует "
+        "нескольких ролей сразу — сам соберу нужных и пришлю один общий "
+        "ответ, без отдельных команд для каждой роли.\n\n"
         "Можно присылать файлы — прочитаю и обработаю как обычное сообщение: "
         f"{SUPPORTED_SUMMARY}.\n\n"
         "Голосовое сообщение — отвечу тоже голосом, коротко и по-человечески.\n\n"
@@ -796,10 +938,13 @@ async def cmd_start(message: Message) -> None:
         "/task <текст> — задача на реализацию\n"
         "/bug <текст> — баг, нужен фикс\n"
         "/improve <текст> — доработка / рефакторинг\n"
-        "/kickoff <текст> — вся команда сразу (PM + Designer + Backend + QA)\n"
+        "/kickoff <текст> — все 4 ключевые роли сразу, каждая отдельно\n"
         "/proposal <текст> — готовый документ (Word+PDF), например коммерческое "
         "предложение или смета ресурсов\n"
         "Без команды — отвечу как на обычный вопрос, без тикета.\n\n"
+        "/remember <факт> — запомнить факт о проекте\n"
+        "/memory — показать, что запомнено\n"
+        "/forget — забыть всё\n"
         "/reset — очистить контекст диалога\n"
         f"chat_id: `{message.chat.id}`",
         parse_mode="Markdown",
@@ -812,6 +957,38 @@ async def cmd_reset(message: Message) -> None:
         return
     history.reset(message.chat.id)
     await message.answer("Контекст очищен. ✅")
+
+
+@dp.message(Command("remember"))
+async def cmd_remember(message: Message, command: CommandObject) -> None:
+    if not _is_allowed(message.chat.id):
+        return
+    fact = (command.args or "").strip()
+    if not fact:
+        await message.answer("Eslab qolish kerak bo'lgan faktni yozing:\n/remember Loyiha nomi: EduConnect")
+        return
+    memory.add_memory(message.chat.id, fact)
+    await message.answer("Yodda saqlandi. ✅ (`/memory` — ro'yxatni ko'rish)", parse_mode="Markdown")
+
+
+@dp.message(Command("memory"))
+async def cmd_memory(message: Message) -> None:
+    if not _is_allowed(message.chat.id):
+        return
+    facts = memory.get_memory(message.chat.id)
+    if not facts:
+        await message.answer("Hozircha hech narsa yodda saqlanmagan.")
+        return
+    lines = "\n".join(f"{i+1}. {f}" for i, f in enumerate(facts))
+    await _send_long(message, f"📌 Loyiha haqida saqlangan faktlar:\n\n{lines}")
+
+
+@dp.message(Command("forget"))
+async def cmd_forget(message: Message) -> None:
+    if not _is_allowed(message.chat.id):
+        return
+    n = memory.clear_memory(message.chat.id)
+    await message.answer(f"O'chirildi: {n} ta fakt. ✅")
 
 
 @dp.message(Command("id"))
