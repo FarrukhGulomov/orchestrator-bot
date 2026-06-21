@@ -36,8 +36,24 @@ the project (name, tech-stack decisions, budget figures, established
 constraints) are auto-extracted from consequential exchanges and injected
 into every agent's prompt going forward — see memory.py for what this
 actually is and, importantly, what it is NOT (no model weights are ever
-retrained; this is prompt-injected context, lost on restart unless you wire
-in persistent storage).
+retrained; this is prompt-injected context, persisted via Redis when
+configured, see history.py/memory.py/redis_client.py).
+
+REAL DEVOPS ACCESS (read-only by design):
+/logs — fetches the latest deployment status + recent runtime logs from this
+bot's own Railway service (railway_integration.py) and has DevOps/SOC/Tech
+Lead actually analyze them for real errors, not guess from a description.
+/readfile <path> — pulls a file's CURRENT content from the configured GitHub
+repo (github_integration.py) into the conversation, so REFINEMENT/BUG
+requests are based on what's actually there, not generated blind. Combined
+with the existing GITHUB_AUTO_PR flow, this is the "pull" half of
+push/pull — "push" already existed via draft PR creation.
+Deliberately NOT implemented: a chat command that directly triggers a
+Railway redeploy or runs arbitrary commands on the server. The safe path is
+already in place — a change becomes a draft PR, a human reviews and merges
+it, Railway auto-deploys from the GitHub-linked service. A command that
+skips that review step is a real risk for a production fintech system; see
+railway_integration.py's docstring for the full reasoning.
 
 /proposal <text> (also auto-detected by the classifier as wants_document) —
 for requests that should be delivered as a polished Word + PDF file instead
@@ -71,6 +87,7 @@ import document_generation as docgen
 import github_integration
 import history
 import memory
+import railway_integration
 import redis_client
 from agents import Agent, TEAM_MEMORY_HEADER, get_agent
 from config import settings
@@ -946,6 +963,10 @@ async def cmd_start(message: Message) -> None:
         "/remember <факт> — запомнить факт о проекте\n"
         "/memory — показать, что запомнено\n"
         "/forget — забыть всё\n"
+        "/logs — реальные логи и статус деплоя сервера (Railway), DevOps "
+        "проанализирует ошибки\n"
+        "/readfile <путь> — подтянуть текущий код файла из GitHub перед "
+        "доработкой\n"
         "/reset — очистить контекст диалога\n"
         f"chat_id: `{message.chat.id}`",
         parse_mode="Markdown",
@@ -1020,6 +1041,121 @@ async def cmd_improve(message: Message, bot: Bot, command: CommandObject) -> Non
 @dp.message(Command("proposal"))
 async def cmd_proposal(message: Message, bot: Bot, command: CommandObject) -> None:
     await _process(message, bot, command.args, forced_type=None, forced_document=True)
+
+
+@dp.message(Command("logs"))
+async def cmd_logs(message: Message, bot: Bot) -> None:
+    """Real bug-hunting on the live server: fetch the latest Railway
+    deployment status + runtime logs and have DevOps actually analyze them,
+    instead of answering a 'check the logs' question from guesswork."""
+    chat_id = message.chat.id
+    if not _is_allowed(chat_id):
+        return
+    if not settings.railway_enabled:
+        await message.answer(
+            "Railway integratsiyasi sozlanmagan.\n"
+            "RAILWAY_API_TOKEN qo'shing (Railway → Account Settings → Tokens). "
+            "Project/Environment/Service ID odatda avtomatik mavjud bo'ladi "
+            "(Railway o'zi shu botning konteyneriga joylaydi)."
+        )
+        return
+
+    status_msg = await message.answer("📜 Server loglarini olyapman...")
+    deployment = await railway_integration.get_latest_deployment()
+    if not deployment:
+        await status_msg.edit_text(
+            "⚠️ Railway'dan ma'lumot olib bo'lmadi — token yoki "
+            "Project/Environment/Service ID noto'g'ri bo'lishi mumkin."
+        )
+        return
+
+    logs = await railway_integration.get_recent_logs(limit=300)
+    if logs is None:
+        await status_msg.edit_text("⚠️ Loglarni olib bo'lmadi.")
+        return
+    if not logs:
+        try:
+            await status_msg.edit_text(f"Deployment status: {deployment.get('status')}. Loglar hozircha bo'sh.")
+        except TelegramBadRequest:
+            pass
+        return
+
+    log_text = "\n".join(
+        f"[{entry.get('severity', '')}] {entry.get('message', '')}" for entry in logs
+    )[:12000]
+
+    agent = get_agent("devops")
+    system_prompt = await _build_system_prompt(
+        chat_id,
+        agent,
+        "VAZIFA: quyidagi production server loglarini diqqat bilan tahlil "
+        "qiling. Xatolar (error/exception/crash/traceback) bormi? Bo'lsa, "
+        "har birining ehtimoliy sababini va aniq tuzatish yo'lini ko'rsating. "
+        "Agar muhim xato yo'q bo'lsa, shuni qisqa tasdiqlang.",
+    )
+    model, _label = model_for(agent, "high")
+    try:
+        analysis = await asyncio.wait_for(
+            groq_generate(
+                model,
+                system_prompt,
+                [
+                    {
+                        "role": "user",
+                        "content": f"Deployment status: {deployment.get('status')}\n\nLoglar:\n{log_text}",
+                    }
+                ],
+                temperature=0.3,
+            ),
+            timeout=settings.request_timeout,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Log analysis failed")
+        await status_msg.edit_text(f"⚠️ Loglarni tahlil qilishda xatolik: {exc}")
+        return
+
+    try:
+        await status_msg.delete()
+    except TelegramBadRequest:
+        pass
+
+    header = "" if not settings.show_metadata_header else "🛠️ DevOps Engineer — Server Log Analysis\n\n"
+    await _send_long(message, f"{header}Status: {deployment.get('status')}\n\n{analysis}")
+
+
+@dp.message(Command("readfile"))
+async def cmd_readfile(message: Message, bot: Bot, command: CommandObject) -> None:
+    """The 'pull' half of push/pull: brings a file's CURRENT content from the
+    configured GitHub repo into the conversation, so a follow-up refinement/
+    bug-fix request is grounded in what's actually there."""
+    chat_id = message.chat.id
+    if not _is_allowed(chat_id):
+        return
+    path = (command.args or "").strip()
+    if not path:
+        await message.answer("Fayl yo'lini ko'rsating, masalan:\n/readfile bot.py")
+        return
+    if not settings.github_enabled:
+        await message.answer("GitHub integratsiyasi sozlanmagan (GITHUB_TOKEN / GITHUB_REPO).")
+        return
+
+    status_msg = await message.answer(f"📂 {path} o'qiyapman...")
+    content = await github_integration.get_file_content(path)
+    if content is None:
+        await status_msg.edit_text(f"⚠️ Fayl topilmadi yoki o'qib bo'lmadi: {path}")
+        return
+    try:
+        await status_msg.delete()
+    except TelegramBadRequest:
+        pass
+
+    combined = (
+        f"GitHub repodagi `{path}` faylining HOZIRGI holati (quyidagi kodga "
+        "asoslanib javob bering; agar refactor/fix so'ralsa, shu faylning "
+        "to'liq yangilangan versiyasini bering, file-marker konvensiyasi "
+        "bilan):\n\n```\n" + content[:12000] + "\n```"
+    )
+    await _process(message, bot, combined, forced_type=None)
 
 
 # --------------------------------------------------------------------------

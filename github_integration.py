@@ -194,3 +194,35 @@ async def create_implementation_pr(
     except Exception:
         logger.exception("GitHub PR creation raised")
         return None
+
+
+# --- Reading existing files (the "pull" half of push/pull) -------------------
+# Real refinement needs to see what's actually there first — generating a
+# "fix" blind, without reading the current file, isn't refinement, it's a
+# guess. /readfile in bot.py uses this to pull a file's current content into
+# the conversation before asking an agent to change it.
+def _get_file_content_sync(path: str, ref: str | None = None) -> str | None:
+    url = f"{API}/repos/{settings.github_repo}/contents/{path}"
+    params = {"ref": ref} if ref else {}
+    resp = requests.get(url, headers=_headers(), params=params, timeout=_TIMEOUT)
+    if resp.status_code != 200:
+        logger.warning("GitHub get_file_content failed for '%s': %s", path, resp.status_code)
+        return None
+    data = resp.json()
+    if data.get("encoding") == "base64" and "content" in data:
+        try:
+            return base64.b64decode(data["content"]).decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to decode content for '%s'", path)
+            return None
+    return None
+
+
+async def get_file_content(path: str, ref: str | None = None) -> str | None:
+    if not settings.github_enabled:
+        return None
+    try:
+        return await asyncio.to_thread(_get_file_content_sync, path, ref)
+    except Exception:  # noqa: BLE001
+        logger.exception("GitHub get_file_content raised")
+        return None

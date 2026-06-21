@@ -195,6 +195,32 @@ class Settings:
     def redis_enabled(self) -> bool:
         return bool(self.redis_url)
 
+    # --- Railway integration (optional, read-only) --------------------------
+    # Lets the DevOps/SOC/Tech Lead agents read REAL deployment status and
+    # logs from this bot's own Railway service via Railway's public GraphQL
+    # API — see railway_integration.py. Deliberately read-only: no
+    # deploy-trigger or service-mutation capability is exposed (see that
+    # module's docstring for why).
+    # Only RAILWAY_API_TOKEN needs to be set manually (Railway -> Account
+    # Settings -> Tokens). Project/Environment/Service ID are normally
+    # auto-injected by Railway into every deployed service's own environment
+    # — since this bot runs ON Railway, it already knows its own IDs for free.
+    railway_api_token: str = field(default_factory=lambda: os.getenv("RAILWAY_API_TOKEN", ""))
+    railway_project_id: str = field(default_factory=lambda: os.getenv("RAILWAY_PROJECT_ID", ""))
+    railway_environment_id: str = field(
+        default_factory=lambda: os.getenv("RAILWAY_ENVIRONMENT_ID", "")
+    )
+    railway_service_id: str = field(default_factory=lambda: os.getenv("RAILWAY_SERVICE_ID", ""))
+
+    @property
+    def railway_enabled(self) -> bool:
+        return bool(
+            self.railway_api_token
+            and self.railway_project_id
+            and self.railway_environment_id
+            and self.railway_service_id
+        )
+
     @property
     def github_enabled(self) -> bool:
         return bool(self.github_token and self.github_repo)
