@@ -174,7 +174,51 @@ async def groq_transcribe(data: bytes, filename: str) -> str:
     return await asyncio.to_thread(_groq_transcribe_sync, data, filename)
 
 
-def _gemini_tts_sync(text: str, language_code: str) -> bytes:
+# --- GLM-5.2 via Z.AI (ROUTE C — complex coding / large-context reasoning) -
+# OpenAI-compatible API — uses the official openai Python package with a
+# custom base_url. No new heavy dependency, just openai>=1.0 (already added).
+# Falls back gracefully (raises, caught upstream) when GLM_API_KEY isn't set.
+
+_glm_client = None
+
+
+def _get_glm():
+    global _glm_client
+    if _glm_client is None:
+        from openai import OpenAI
+
+        _glm_client = OpenAI(
+            api_key=settings.glm_api_key,
+            base_url=settings.glm_base_url,
+        )
+    return _glm_client
+
+
+def _glm_sync(
+    model: str, system: str, messages: list[dict], temperature: float
+) -> str:
+    client = _get_glm()
+    full = [{"role": "system", "content": system}] + messages
+    resp = client.chat.completions.create(
+        model=model,
+        messages=full,
+        temperature=temperature,
+        max_tokens=settings.max_output_tokens,
+    )
+    return (resp.choices[0].message.content or "").strip()
+
+
+async def glm_generate(
+    model: str,
+    system: str,
+    messages: list[dict],
+    temperature: float = 0.3,
+) -> str:
+    """Generate a response via GLM-5.2 (Z.AI). Runs synchronously in a thread
+    to avoid blocking the aiogram event loop (same pattern as Gemini/Groq)."""
+    return await asyncio.to_thread(_glm_sync, model, system, messages, temperature)
+
+
     """Generate speech via Gemini's native TTS and wrap the raw PCM the API
     returns into a standard playable WAV container (pure Python, no ffmpeg
     dependency). Telegram's native 'voice note' bubble technically wants

@@ -53,31 +53,62 @@ class Settings:
     )
 
     # --- Models ------------------------------------------------------------
-    # ROUTE A — high-context analysis / documentation (the "Gemini" route).
+    # ROUTE A — high-context analysis / documentation (Gemini).
     analysis_model: str = field(
         default_factory=lambda: os.getenv("ANALYSIS_MODEL", "gemini-3.5-flash")
     )
-    # Pretty label that goes into the [ROUTED_MODEL] metadata header.
     analysis_model_label: str = field(
         default_factory=lambda: os.getenv("ANALYSIS_MODEL_LABEL", "Gemini 3.5 Flash")
     )
 
-    # ROUTE B — fast technical reasoning / code (the "Llama via Groq" route).
-    code_model_large: str = field(
-        default_factory=lambda: os.getenv("CODE_MODEL_LARGE", "llama-3.3-70b-versatile")
+    # ROUTE B — fast, simple code tasks (Groq / Llama 8B — low latency).
+    # Used for low-complexity technical requests that don't need a full
+    # reasoning pass, quick edits, short scripts.
+    code_model_fast: str = field(
+        default_factory=lambda: os.getenv("CODE_MODEL_FAST", "llama-3.1-8b-instant")
     )
-    code_model_large_label: str = field(
-        default_factory=lambda: os.getenv("CODE_MODEL_LARGE_LABEL", "Llama 3.3 70B")
-    )
-    code_model_small: str = field(
-        default_factory=lambda: os.getenv("CODE_MODEL_SMALL", "llama-3.1-8b-instant")
-    )
-    code_model_small_label: str = field(
-        default_factory=lambda: os.getenv("CODE_MODEL_SMALL_LABEL", "Llama 3.1 8B")
+    code_model_fast_label: str = field(
+        default_factory=lambda: os.getenv("CODE_MODEL_FAST_LABEL", "Llama 3.1 8B (Groq)")
     )
 
+    # ROUTE C — complex coding, architecture, refactoring, security audits
+    # (GLM-5.2 via Z.AI).  200K context makes it ideal for reasoning over
+    # entire codebases and multi-file refactors.
+    glm_api_key: str = field(default_factory=lambda: os.getenv("GLM_API_KEY", ""))
+    glm_base_url: str = field(
+        default_factory=lambda: os.getenv("GLM_BASE_URL", "https://api.z.ai/api/paas/v4/")
+    )
+    glm_model: str = field(
+        default_factory=lambda: os.getenv("GLM_MODEL", "glm-5.2")
+    )
+    glm_model_label: str = field(
+        default_factory=lambda: os.getenv("GLM_MODEL_LABEL", "GLM-5.2 (Z.AI)")
+    )
+
+    @property
+    def glm_enabled(self) -> bool:
+        return bool(self.glm_api_key)
+
+    # Keep legacy names as aliases so nothing breaks if old env vars are set.
+    # (code_model_large / code_model_small pointed to Llama 70B/8B on Groq;
+    # Route B is now explicitly the fast/small model, Route C is GLM.)
+    @property
+    def code_model_large(self) -> str:
+        return os.getenv("CODE_MODEL_LARGE", self.glm_model)
+
+    @property
+    def code_model_large_label(self) -> str:
+        return os.getenv("CODE_MODEL_LARGE_LABEL", self.glm_model_label)
+
+    @property
+    def code_model_small(self) -> str:
+        return os.getenv("CODE_MODEL_SMALL", self.code_model_fast)
+
+    @property
+    def code_model_small_label(self) -> str:
+        return os.getenv("CODE_MODEL_SMALL_LABEL", self.code_model_fast_label)
+
     # The lightweight model used by the router to classify the agent.
-    # Kept on Groq for low latency; falls back to small code model.
     router_model: str = field(
         default_factory=lambda: os.getenv("ROUTER_MODEL", "llama-3.1-8b-instant")
     )

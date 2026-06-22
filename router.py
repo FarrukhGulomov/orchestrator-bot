@@ -4,13 +4,23 @@ The orchestrator / router.
 Stage 1 (this module): a single fast, cheap classifier call decides three things:
   1) WHICH agent should answer (department)
   2) WHAT KIND of request this is (idea / task / bug / improvement / question)
-  3) HOW complex it is (drives model size on the code route)
+  3) HOW complex it is (drives model choice on the code route)
 ...and writes a short title (used for GitHub issue/PR titles).
 
-The model is then derived deterministically:
+The model is then derived deterministically — THREE routes now:
 
-    route A  -> analysis model (Gemini)
-    route B  -> code model; "large" for non-trivial work, "small" for quick stuff
+    ROUTE A  → Gemini (analysis_model)
+               For analytical/text agents: PM, BA, System Analyst, QA, Designer.
+
+    ROUTE B  → Groq / Llama 8B (code_model_fast)
+               Fast, low-latency path for simple/quick technical tasks:
+               short scripts, quick edits, trivial Q&A on code topics.
+
+    ROUTE C  → GLM-5.2 via Z.AI (glm_model)
+               Complex coding, multi-file refactoring, deep architecture
+               reasoning, security audits. 200K context window — can hold
+               entire codebases in one pass. Falls back to Groq (Route B)
+               gracefully if GLM_API_KEY isn't configured.
 
 Stage 2 (handled in bot.py): the chosen agent's persona, combined with the
 request-type addendum, answers with the proper model — and, for actionable
@@ -130,12 +140,21 @@ class Route:
 
 
 def model_for(agent: Agent, complexity: str) -> tuple[str, str]:
+    """Deterministically pick (model_id, label) for a given agent + complexity.
+
+    ROUTE A — Gemini: analysis/text agents.
+    ROUTE B — Groq/Llama fast: technical agents, low-complexity tasks.
+    ROUTE C — GLM-5.2: technical agents, high-complexity tasks.
+              Falls back to Groq Route B if GLM_API_KEY isn't configured.
+    """
     if agent.route == "A":
         return settings.analysis_model, settings.analysis_model_label
-    # route B
-    if complexity == "low":
-        return settings.code_model_small, settings.code_model_small_label
-    return settings.code_model_large, settings.code_model_large_label
+    # Technical routes (B + C)
+    if complexity == "low" or not settings.glm_enabled:
+        # Route B: fast answer for simple tasks, or GLM not set up
+        return settings.code_model_fast, settings.code_model_fast_label
+    # Route C: GLM-5.2 for heavy coding / architecture / refactoring
+    return settings.glm_model, settings.glm_model_label
 
 
 async def classify(
