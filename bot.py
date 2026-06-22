@@ -147,21 +147,50 @@ def _strip_mention(text: str, bot_username: str) -> str:
     return text.strip()
 
 
-async def _build_system_prompt(chat_id: int, agent: Agent, addendum: str = "") -> str:
+async def _build_system_prompt(
+    chat_id: int, agent: Agent, addendum: str = "", compact: bool = False
+) -> str:
     """Agent persona + project memory (if any) + request-type addendum.
 
-    Centralised so every entry point (single-agent, collaborative synthesis,
-    /kickoff, voice mode) gets the same memory-aware prompt instead of each
-    building it ad hoc.
+    compact=True selects the shorter _COMMON_COMPACT persona (for Groq 8B)
+    to stay under the 6000 TPM free-tier limit.
     """
     facts = await memory.get_memory(chat_id)
     memory_block = (
         TEAM_MEMORY_HEADER + "\n".join(f"- {f}" for f in facts) + "\n\n" if facts else ""
     )
-    parts = [memory_block + agent.system]
+    if compact and agent.system_compact is not None:
+        base = agent.system_compact
+    else:
+        base = agent.system
+    parts = [memory_block + base]
     if addendum:
         parts.append(addendum)
     return "\n".join(parts)
+
+
+def _is_groq_model(model: str) -> bool:
+    """True for models routed through Groq (tight 6000 TPM free-tier limit)."""
+    return model not in (settings.glm_model, settings.analysis_model)
+
+
+def _trim_for_groq(messages: list[dict]) -> list[dict]:
+    """Trim message list to stay within Groq's token limits.
+
+    Keeps only the last GROQ_MAX_HISTORY_TURNS (user+assistant) pairs, plus
+    the current user message. Applies a final char-budget safety net.
+    """
+    if not messages:
+        return messages
+    current = messages[-1:]
+    history = messages[:-1]
+    max_turns = settings.groq_max_history_turns
+    trimmed = history[-(max_turns * 2):] + current
+
+    # Emergency: drop oldest messages until under char budget
+    while len(trimmed) > 1 and sum(len(m.get("content", "")) for m in trimmed) > settings.groq_max_chars:
+        trimmed = trimmed[1:]
+    return trimmed
 
 
 def _header(route: Route) -> str:
@@ -211,7 +240,8 @@ async def _answer_with_agent(route: Route, system_prompt: str, messages: list[di
         route.model if route.model != settings.glm_model
         else settings.code_model_fast
     )
-    return await groq_generate(groq_model, system_prompt, messages, temperature=0.3)
+    groq_msgs = _trim_for_groq(messages)
+    return await groq_generate(groq_model, system_prompt, groq_msgs, temperature=0.3)
 
 
 async def _maybe_create_tickets(route: Route, user_text: str, body: str) -> str:
@@ -439,11 +469,15 @@ async def _process(
             asyncio.create_task(_maybe_extract_memory(chat_id, user_text, body))
         return
 
-    system_prompt = await _build_system_prompt(chat_id, route.agent, route.request_type.addendum)
+    use_compact = _is_groq_model(route.model)
+    system_prompt = await _build_system_prompt(
+        chat_id, route.agent, route.request_type.addendum, compact=use_compact
+    )
 
-    msgs = await history.get_history(chat_id, route.agent.key) + [
+    raw_msgs = await history.get_history(chat_id, route.agent.key) + [
         {"role": "user", "content": user_text}
     ]
+    msgs = _trim_for_groq(raw_msgs) if use_compact else raw_msgs
 
     try:
         body = await asyncio.wait_for(
@@ -479,7 +513,9 @@ async def _kickoff_agent_call(agent_key: str, user_text: str, chat_id: int) -> d
     'body' instead, so one failing teammate doesn't blank out the others.
     Routes to Gemini (A), GLM-5.2 (C for high complexity), or Groq (B)."""
     agent: Agent = get_agent(agent_key)
-    system_prompt = await _build_system_prompt(chat_id, agent, REQUEST_TYPES["task"].addendum)
+    # Always use compact system prompt for Route B in kickoff to control payload
+    use_compact = (agent.route == "B")
+    system_prompt = await _build_system_prompt(chat_id, agent, REQUEST_TYPES["task"].addendum, compact=use_compact)
     model, label = model_for(agent, "high")
     try:
         # Build a minimal Route-like object and reuse _answer_with_agent so
@@ -795,7 +831,10 @@ async def _handle_voice_note(
     # a voice note is a quick spoken exchange, not a planning session).
     # Document-deliverable / capability-overview / GitHub-ticket paths are
     # intentionally not wired in either.
-    system_prompt = await _build_system_prompt(chat_id, route.agent, _VOICE_MODE_ADDENDUM)
+    system_prompt = await _build_system_prompt(
+        chat_id, route.agent, _VOICE_MODE_ADDENDUM,
+        compact=_is_groq_model(model_for(route.agent, "low")[0])
+    )
     msgs = await history.get_history(chat_id, route.agent.key) + [
         {"role": "user", "content": user_text}
     ]

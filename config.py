@@ -151,9 +151,22 @@ class Settings:
     )
 
     # --- Behaviour ---------------------------------------------------------
-    # How many (user, assistant) turns of history to keep per chat.
+    # How many (user, assistant) turns of history to keep per chat (for
+    # Route A/Gemini and Route C/GLM which have large context windows).
     history_turns: int = field(
         default_factory=lambda: int(os.getenv("HISTORY_TURNS", "8"))
+    )
+    # Route B (Groq / Llama 8B) has a much tighter token limit on the free
+    # tier (6000 TPM). We cap history to the last N turns to avoid 413 errors.
+    # Set higher if you've upgraded to Groq Dev Tier.
+    groq_max_history_turns: int = field(
+        default_factory=lambda: int(os.getenv("GROQ_MAX_HISTORY_TURNS", "2"))
+    )
+    # Hard cap on total characters in the payload sent to Groq (system +
+    # history + current message), as a safety net AFTER history trimming.
+    # ~4 chars/token, 6000 token limit → safe ceiling is ~20000 chars.
+    groq_max_chars: int = field(
+        default_factory=lambda: int(os.getenv("GROQ_MAX_CHARS", "20000"))
     )
     request_timeout: int = field(
         default_factory=lambda: int(os.getenv("REQUEST_TIMEOUT", "60"))

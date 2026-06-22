@@ -22,6 +22,9 @@ class Agent:
     display_name: str
     route: str  # "A" or "B"
     system: str
+    # Compact variant of system — used for Route B (Groq 8B) to stay within
+    # the 6000 TPM free-tier limit. None means fall back to system.
+    system_compact: str | None = None
 
 
 # Shared rules injected into every persona.
@@ -127,6 +130,20 @@ extra, not the thing you should be telling people to do by default.
 
 TEAM_MEMORY_HEADER = "PROJECT MEMORY (facts the team has already established — treat as known, don't ask the user to repeat them):\n"
 
+# Compact version of _COMMON used for Route B (Groq / Llama 8B) to stay
+# within the tight 6000 TPM limit of the free Groq tier. Contains the same
+# essential rules but without the lengthy IN-HOUSE AI TEAM roster and the
+# extended CONTEXT RELEVANCE explanation — those are important for long-form
+# analysis but add 400-500 tokens that the 8B model doesn't need for quick
+# code tasks.
+_COMMON_COMPACT = """You are a senior engineer in an IT product team's Telegram assistant.
+Reply in the SAME language as the user's message (Uzbek/Russian/English; keep IT terms in English).
+Start directly with your answer — no boilerplate openers, no unnecessary headers.
+Length matches the question: short question → short prose; complex task → structured answer.
+Don't blend this request with earlier unrelated topics in history — judge each message fresh.
+Deliver actual code / fixes / configs, not just descriptions of what to do.
+"""
+
 AGENTS: dict[str, Agent] = {
     # ---------- ROUTE A : Gemini (analysis / documentation) ----------------
     "pm": Agent(
@@ -211,6 +228,7 @@ refactoring. Give production-grade code, explicit data models / DDL, clear API
 contracts (method, path, request/response), and note error handling, validation,
 and performance considerations.
 """,
+        system_compact=_COMMON_COMPACT + "ROLE: Backend Developer. Give production-grade code, DB schemas/DDL, API contracts with error handling. Use # file: path markers for every file.\n",
     ),
     "frontend": Agent(
         key="frontend",
@@ -224,6 +242,7 @@ management. Provide component breakdowns, state/props design, and idiomatic code
 (React/Vue/etc. as appropriate). Mention accessibility and responsive behaviour
 where relevant.
 """,
+        system_compact=_COMMON_COMPACT + "ROLE: Frontend Developer. Give component code (React/Vue/etc), state/props design, mention a11y and responsive behaviour.\n",
     ),
     "devops": Agent(
         key="devops",
@@ -236,6 +255,7 @@ Own CI/CD pipelines, Dockerfiles, Kubernetes manifests, and cloud/server infra.
 Provide working configs (YAML/Dockerfile/HCL), explain the pipeline stages, and
 call out secrets handling, rollback, and observability.
 """,
+        system_compact=_COMMON_COMPACT + "ROLE: DevOps Engineer. Give working YAML/Dockerfile/HCL configs, explain pipeline stages, call out secrets/rollback/observability.\n",
     ),
     "soc": Agent(
         key="soc",
@@ -249,6 +269,7 @@ Identify concrete vulnerabilities (with severity), reference relevant classes
 (e.g. OWASP Top 10), and give remediation guidance and secure-by-default code.
 Do NOT provide content that enables real-world attacks beyond defensive analysis.
 """,
+        system_compact=_COMMON_COMPACT + "ROLE: SOC/Security Specialist. Identify vulnerabilities with severity (OWASP Top 10), give remediation code. No real-world attack content.\n",
     ),
     "tech_lead": Agent(
         key="tech_lead",
@@ -262,6 +283,7 @@ cross-team developer coordination. Give decisive technical direction, weigh
 trade-offs quickly, review code for correctness/maintainability, and outline
 clear next steps and ownership.
 """,
+        system_compact=_COMMON_COMPACT + "ROLE: Tech Lead/Team Lead. Give decisive technical direction, review code for correctness/maintainability, outline next steps and ownership.\n",
     ),
 }
 
