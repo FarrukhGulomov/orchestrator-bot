@@ -214,10 +214,44 @@ async def glm_generate(
     messages: list[dict],
     temperature: float = 0.3,
 ) -> str:
-    """Generate a response via GLM-5.2 (Z.AI). Runs synchronously in a thread
+    """Generate a response via GLM (Z.AI or Together AI). Runs synchronously in a thread
     to avoid blocking the aiogram event loop (same pattern as Gemini/Groq)."""
     return await asyncio.to_thread(_glm_sync, model, system, messages, temperature)
 
+
+async def glm_health_check() -> tuple[bool, str]:
+    """Send a minimal probe request to check if the configured GLM model is
+    actually accessible with this API key.
+    Returns (ok: bool, message: str).
+    Called once at bot startup — a 404 here means Route C will be disabled
+    to prevent error noise on every real request."""
+    try:
+        result = await asyncio.wait_for(
+            glm_generate(
+                settings.glm_model,
+                "You are a helpful assistant.",
+                [{"role": "user", "content": "Hi"}],
+                temperature=0.0,
+            ),
+            timeout=15,
+        )
+        return True, f"OK (sample response len={len(result)})"
+    except Exception as exc:
+        msg = str(exc)
+        if "404" in msg or "model_not_found" in msg or "does not exist" in msg:
+            return False, (
+                f"Model '{settings.glm_model}' not accessible on this key — 404. "
+                "This usually means the model requires a subscription. Fix options:\n"
+                "  A) Z.AI Coding Plan ($18/mo): change GLM_BASE_URL to "
+                "https://api.z.ai/api/coding/paas/v4/ and GLM_MODEL to glm-5.2\n"
+                "  B) Together AI (pay-per-token): change GLM_API_KEY to your "
+                "Together AI key, GLM_BASE_URL to https://api.together.xyz/v1/, "
+                "GLM_MODEL to zai-org/GLM-5.2\n"
+                "  C) Free Z.AI: set GLM_MODEL=glm-4.7 or glm-4.7-flash and "
+                "GLM_BASE_URL=https://api.z.ai/api/paas/v4/\n"
+                "Route C is DISABLED until fixed — falling back to Groq."
+            )
+        return False, f"GLM probe failed: {msg[:200]}"
 
     """Generate speech via Gemini's native TTS and wrap the raw PCM the API
     returns into a standard playable WAV container (pure Python, no ffmpeg

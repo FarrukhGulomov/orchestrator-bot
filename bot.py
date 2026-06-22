@@ -92,7 +92,13 @@ import redis_client
 from agents import Agent, TEAM_MEMORY_HEADER, get_agent
 from config import settings
 from file_processing import SUPPORTED_SUMMARY, extract, transcribe_audio
-from llm_clients import gemini_generate, gemini_text_to_speech, groq_generate
+from llm_clients import gemini_generate, gemini_text_to_speech, glm_generate, glm_health_check, groq_generate
+
+# Set to False at runtime if the GLM health-check at startup finds the model
+# inaccessible (e.g. 404 / subscription required). Prevents error noise on
+# every subsequent request — Route C falls back to Groq silently until the
+# operator fixes the GLM config and restarts the bot.
+_glm_runtime_ok: bool = True
 from request_types import REQUEST_TYPES, get_request_type
 from router import Route, classify, model_for
 
@@ -187,9 +193,25 @@ def _header(route: Route) -> str:
 
 
 async def _answer_with_agent(route: Route, system_prompt: str, messages: list[dict]) -> str:
+    """Dispatch to the right LLM based on the route's model selection.
+
+    ROUTE A (Gemini): route.model is a Gemini model name.
+    ROUTE B (Groq):   route.model is a Llama model on Groq, low-complexity.
+    ROUTE C (GLM):    route.model is the configured GLM model via OpenAI-compat API.
+                      Falls back to Groq if _glm_runtime_ok is False (startup 404).
+    """
+    global _glm_runtime_ok
     if route.agent.route == "A":
         return await gemini_generate(route.model, system_prompt, messages)
-    return await groq_generate(route.model, system_prompt, messages, temperature=0.3)
+    # For technical routes, check if this is the GLM model
+    if settings.glm_enabled and _glm_runtime_ok and route.model == settings.glm_model:
+        return await glm_generate(route.model, system_prompt, messages, temperature=0.3)
+    # Default: Groq / Llama (Route B) — also the fallback if GLM is down
+    groq_model = (
+        route.model if route.model != settings.glm_model
+        else settings.code_model_fast
+    )
+    return await groq_generate(groq_model, system_prompt, messages, temperature=0.3)
 
 
 async def _maybe_create_tickets(route: Route, user_text: str, body: str) -> str:
@@ -454,28 +476,25 @@ async def _process(
 async def _kickoff_agent_call(agent_key: str, user_text: str, chat_id: int) -> dict:
     """Run one team member's reply (used by both /kickoff and automatic
     multi-agent collaboration). Never raises — returns an error note in
-    'body' instead, so one failing teammate doesn't blank out the others."""
+    'body' instead, so one failing teammate doesn't blank out the others.
+    Routes to Gemini (A), GLM-5.2 (C for high complexity), or Groq (B)."""
     agent: Agent = get_agent(agent_key)
-    # Force an actual deliverable (not discussion) from every teammate, same
-    # as the TASK request type does for normal single-agent routing.
     system_prompt = await _build_system_prompt(chat_id, agent, REQUEST_TYPES["task"].addendum)
     model, label = model_for(agent, "high")
     try:
-        if agent.route == "A":
-            body = await asyncio.wait_for(
-                gemini_generate(model, system_prompt, [{"role": "user", "content": user_text}]),
-                timeout=settings.request_timeout,
-            )
-        else:
-            body = await asyncio.wait_for(
-                groq_generate(
-                    model,
-                    system_prompt,
-                    [{"role": "user", "content": user_text}],
-                    temperature=0.3,
-                ),
-                timeout=settings.request_timeout,
-            )
+        # Build a minimal Route-like object and reuse _answer_with_agent so
+        # the Route C (GLM) logic is in one place, not duplicated here.
+        from dataclasses import dataclass as _dc
+        from request_types import REQUEST_TYPES as _RT
+
+        _mini_route = type("_R", (), {
+            "agent": agent,
+            "model": model,
+        })()
+        body = await asyncio.wait_for(
+            _answer_with_agent(_mini_route, system_prompt, [{"role": "user", "content": user_text}]),  # type: ignore[arg-type]
+            timeout=settings.request_timeout,
+        )
         return {"agent": agent, "model_label": label, "body": body or "(пустой ответ)", "ok": True}
     except Exception as exc:  # noqa: BLE001
         logger.exception("Kickoff sub-call failed for agent=%s", agent_key)
@@ -1200,6 +1219,17 @@ async def main() -> None:
             "only and will be lost on every restart/redeploy. Add Railway's Redis database "
             "and set REDIS_URL to persist across deploys."
         )
+
+    if settings.glm_enabled:
+        global _glm_runtime_ok
+        ok, msg = await glm_health_check()
+        _glm_runtime_ok = ok
+        if ok:
+            logger.info("Route C (GLM) ENABLED: model=%s base_url=%s", settings.glm_model, settings.glm_base_url)
+        else:
+            logger.warning("Route C (GLM) DISABLED at startup: %s", msg)
+    else:
+        logger.info("Route C (GLM) disabled (GLM_API_KEY not set) — Route B (Groq) used for all code tasks.")
 
     if settings.github_enabled:
         logger.info(

@@ -71,18 +71,36 @@ class Settings:
         default_factory=lambda: os.getenv("CODE_MODEL_FAST_LABEL", "Llama 3.1 8B (Groq)")
     )
 
-    # ROUTE C — complex coding, architecture, refactoring, security audits
-    # (GLM-5.2 via Z.AI).  200K context makes it ideal for reasoning over
-    # entire codebases and multi-file refactors.
+    # ROUTE C — complex coding, architecture, refactoring, security audits.
+    # Supports three providers (pick ONE, set the corresponding env vars):
+    #
+    #   1. Z.AI Coding Plan (GLM-5.2, recommended — $18/month)
+    #      GLM_API_KEY = your Z.AI key
+    #      GLM_MODEL = glm-5.2
+    #      GLM_BASE_URL = https://api.z.ai/api/coding/paas/v4/   ← Coding Plan endpoint
+    #
+    #   2. Together AI (GLM-5.2, pay-per-token, no subscription)
+    #      GLM_API_KEY = your Together AI key
+    #      GLM_MODEL = zai-org/GLM-5.2
+    #      GLM_BASE_URL = https://api.together.xyz/v1/
+    #
+    #   3. Z.AI general API (GLM-4.7 or GLM-4.7-Flash — free tier, older model)
+    #      GLM_API_KEY = your Z.AI key
+    #      GLM_MODEL = glm-4.7            (or glm-4.7-flash for the free tier)
+    #      GLM_BASE_URL = https://api.z.ai/api/paas/v4/   ← general endpoint
+    #
+    # If GLM_API_KEY is empty, Route C falls back to Groq (Route B) silently.
+    # If the model isn't accessible (404), the bot logs the problem and falls
+    # back to Groq instead of crashing on every message.
     glm_api_key: str = field(default_factory=lambda: os.getenv("GLM_API_KEY", ""))
     glm_base_url: str = field(
         default_factory=lambda: os.getenv("GLM_BASE_URL", "https://api.z.ai/api/paas/v4/")
     )
     glm_model: str = field(
-        default_factory=lambda: os.getenv("GLM_MODEL", "glm-5.2")
+        default_factory=lambda: os.getenv("GLM_MODEL", "glm-4.7")
     )
     glm_model_label: str = field(
-        default_factory=lambda: os.getenv("GLM_MODEL_LABEL", "GLM-5.2 (Z.AI)")
+        default_factory=lambda: os.getenv("GLM_MODEL_LABEL", "GLM-4.7 (Z.AI)")
     )
 
     @property
