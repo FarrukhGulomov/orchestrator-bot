@@ -108,8 +108,6 @@ class Settings:
         return bool(self.glm_api_key)
 
     # Keep legacy names as aliases so nothing breaks if old env vars are set.
-    # (code_model_large / code_model_small pointed to Llama 70B/8B on Groq;
-    # Route B is now explicitly the fast/small model, Route C is GLM.)
     @property
     def code_model_large(self) -> str:
         return os.getenv("CODE_MODEL_LARGE", self.glm_model)
@@ -125,6 +123,40 @@ class Settings:
     @property
     def code_model_small_label(self) -> str:
         return os.getenv("CODE_MODEL_SMALL_LABEL", self.code_model_fast_label)
+
+    # ROUTE F — OpenRouter: unified free model pool for Fintech/Banking agents.
+    # Single key → 300+ models, 26+ free (:free suffix). No credit card needed.
+    # Get key at: openrouter.ai (sign up → Keys → Create Key).
+    # Free tier limits: 50 req/day, 20 req/min per model.
+    openrouter_api_key: str = field(
+        default_factory=lambda: os.getenv("OPENROUTER_API_KEY", "")
+    )
+    openrouter_referer: str = field(
+        default_factory=lambda: os.getenv("OPENROUTER_REFERER", "https://github.com/fintech-orchestrator")
+    )
+    openrouter_title: str = field(
+        default_factory=lambda: os.getenv("OPENROUTER_TITLE", "Fintech AI Orchestrator")
+    )
+    # Reasoning model for compliance/risk/regulatory analysis
+    or_model_reasoning: str = field(
+        default_factory=lambda: os.getenv("OR_MODEL_REASONING", "deepseek/deepseek-r1:free")
+    )
+    # Coding model for banking/payment systems code
+    or_model_coding: str = field(
+        default_factory=lambda: os.getenv("OR_MODEL_CODING", "qwen/qwen3-coder:free")
+    )
+    # Fast model for quick analysis tasks
+    or_model_fast: str = field(
+        default_factory=lambda: os.getenv("OR_MODEL_FAST", "meta-llama/llama-4-scout:free")
+    )
+    # Auto-select: always free, always available — use as universal fallback
+    or_model_auto: str = field(
+        default_factory=lambda: os.getenv("OR_MODEL_AUTO", "openrouter/free")
+    )
+
+    @property
+    def openrouter_enabled(self) -> bool:
+        return bool(self.openrouter_api_key)
 
     # The lightweight model used by the router to classify the agent.
     router_model: str = field(

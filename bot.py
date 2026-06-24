@@ -87,6 +87,7 @@ import document_generation as docgen
 import github_integration
 import history
 import memory
+import openrouter_client
 import railway_integration
 import redis_client
 from agents import Agent, TEAM_MEMORY_HEADER, get_agent
@@ -222,20 +223,29 @@ def _header(route: Route) -> str:
 
 
 async def _answer_with_agent(route: Route, system_prompt: str, messages: list[dict]) -> str:
-    """Dispatch to the right LLM based on the route's model selection.
+    """Dispatch to the right LLM based on the route's agent type and model.
 
-    ROUTE A (Gemini): route.model is a Gemini model name.
-    ROUTE B (Groq):   route.model is a Llama model on Groq, low-complexity.
-    ROUTE C (GLM):    route.model is the configured GLM model via OpenAI-compat API.
-                      Falls back to Groq if _glm_runtime_ok is False (startup 404).
+    ROUTE A (Gemini):       Gemini via Google API
+    ROUTE B (Groq fast):    Groq/Llama for simple tasks
+    ROUTE C (GLM complex):  GLM via Z.AI or OpenRouter fallback
+    ROUTE F (OpenRouter):   Fintech specialists via OpenRouter free model pool
     """
     global _glm_runtime_ok
+
+    # Route A — Gemini
     if route.agent.route == "A":
         return await gemini_generate(route.model, system_prompt, messages)
-    # For technical routes, check if this is the GLM model
+
+    # Route F — OpenRouter fintech specialists
+    if route.agent.route == "F":
+        or_msgs = _trim_for_groq(messages)  # same char-budget safety
+        return await openrouter_client.or_generate(route.model, system_prompt, or_msgs)
+
+    # Route C — GLM (if enabled and healthy)
     if settings.glm_enabled and _glm_runtime_ok and route.model == settings.glm_model:
         return await glm_generate(route.model, system_prompt, messages, temperature=0.3)
-    # Default: Groq / Llama (Route B) — also the fallback if GLM is down
+
+    # Route B — Groq fast (default for B, fallback for C)
     groq_model = (
         route.model if route.model != settings.glm_model
         else settings.code_model_fast
@@ -1269,6 +1279,21 @@ async def main() -> None:
             logger.warning("Route C (GLM) DISABLED at startup: %s", msg)
     else:
         logger.info("Route C (GLM) disabled (GLM_API_KEY not set) — Route B (Groq) used for all code tasks.")
+
+    if settings.openrouter_enabled:
+        ok_or, msg_or = await openrouter_client.or_health_check()
+        if ok_or:
+            logger.info(
+                "Route F (OpenRouter) ENABLED — fintech agents active: "
+                "compliance_officer, risk_analyst, core_banking_dev, payment_engineer, open_banking_dev"
+            )
+        else:
+            logger.warning("Route F (OpenRouter) health-check failed: %s", msg_or)
+    else:
+        logger.info(
+            "Route F (OpenRouter) disabled (OPENROUTER_API_KEY not set) — "
+            "fintech agents will fall back to Gemini for analysis."
+        )
 
     if settings.github_enabled:
         logger.info(

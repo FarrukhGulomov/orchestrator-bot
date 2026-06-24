@@ -55,11 +55,12 @@ _AGENT_KEYS = list(AGENTS.keys())
 _TYPE_KEYS = list(REQUEST_TYPES.keys())
 
 _ROUTER_SYSTEM = f"""
-You are a routing classifier for an IT product team's assistant. Read the user's
-message (it may be in Uzbek, Russian, English, or a mix, with IT slang) and
+You are a routing classifier for a Fintech/Banking AI team's assistant. Read the user's
+message (it may be in Uzbek, Russian, English, or a mix with IT/fintech slang) and
 decide three things.
 
 1) WHICH SPECIALIST AGENT should handle it:
+General IT/Product team:
 - pm                : product requirements, prioritisation, roadmap, backlog, business value
 - ba                : functional requirements, user stories, use cases, business processes
 - system_analyst   : system architecture, integrations, data flow, big documentation
@@ -70,6 +71,12 @@ decide three things.
 - devops           : CI/CD, Dockerfiles, Kubernetes, cloud/server infrastructure
 - soc              : code vulnerability review, encryption logic, security audits
 - tech_lead        : technical strategy, architecture validation, code review, coordination
+Fintech/Banking specialists (use when the request is clearly in the financial domain):
+- compliance_officer : AML/CFT, KYC/CDD, PCI-DSS, GDPR, regulatory reporting (STR/SAR), policy
+- risk_analyst       : credit risk, market risk, VaR/CVaR, stress testing, Basel III/IV, PD/LGD
+- core_banking_dev   : T24/Flexcube/Mambu integrations, GL logic, ISO 20022 mapping, CBS APIs
+- payment_engineer   : SWIFT MT/MX, ISO 20022, Humo/UzCard, card processing (EMV/3DS2), RTGS/ACH
+- open_banking_dev   : PSD2/PSD3, OAuth 2.0/PKCE, FAPI, consent flows, OpenAPI banking specs
 
 2) WHAT KIND OF REQUEST this is (the Input Classification Matrix):
 - idea        : IDEA — a conceptual suggestion, high-level thought, or new feature proposal
@@ -82,36 +89,23 @@ decide three things.
 
 3) COMPLEXITY:
 - "low"  : short, simple, quick question or trivial snippet
-- "high" : non-trivial reasoning, architecture, multi-step code, refactor, audit
+- "high" : non-trivial reasoning, architecture, multi-step code, compliance analysis
 
 4) DOES THIS NEED A FORMATTED DOCUMENT instead of a chat reply?
-Set wants_document=true when the user is asking for something that should be
-delivered as a polished, shareable file rather than a chat message — e.g. a
-commercial proposal / cost-and-resource estimate ("tijorat taklifi", "smeta",
-"byudjet", "narx taklifi"), a formal report, or anything where they
-explicitly ask for "Word", "PDF", "hujjat", "fayl qilib ber", "tayyor
-hujjat". Otherwise false — default to a normal chat answer.
+Set wants_document=true for commercial proposals, cost estimates, regulatory reports,
+compliance frameworks, AML policies, or anything where they ask for "Word", "PDF",
+"hujjat", "tijorat taklifi", "smeta", "compliance report", "policy document".
 
 5) IS THIS A META-QUESTION ABOUT WHAT THE ASSISTANT/TEAM ITSELF CAN DO?
-Set is_capability_question=true ONLY when the user is asking about the
-ASSISTANT'S OWN capabilities as a whole — e.g. "nima qila olasan", "sen
-qanday vazifalarni bajara olasan", "what can you do", "kimsan", "qaysi
-sohalarda yordam berasan", "sizning jamoangiz nima qiladi". This must NOT be
-routed to a single narrow specialist — it needs a short overview of the
-WHOLE team. Do not set this for real domain questions (e.g. "API qanday
-ishlaydi" is a real question, not a capability question). Default false.
+Set is_capability_question=true ONLY when the user is asking about the assistant's own
+capabilities — e.g. "nima qila olasan", "jamoang kimlardan iborat", "what can you do".
 
 6) DOES THIS NEED INPUT FROM MULTIPLE ROLES to be properly answered?
-Most requests are single-domain — leave collaborators as an EMPTY list, this
-should be the common case. Only add collaborators when the request clearly
-spans multiple distinct disciplines and a complete answer genuinely needs
-more than one perspective at once — e.g. planning/launching a new feature or
-product (needs pm + relevant engineering roles), a security-sensitive
-architecture decision (needs the engineering role + soc), a UX-affecting
-backend change (needs backend + product_designer). List 0-3 collaborator
-agent keys (from the list in section 1), NEVER including the primary agent
-itself. The user should not have to ask for each role separately — if the
-request needs a team, gather the team yourself.
+Only add collaborators when genuinely multidisciplinary. Common fintech combos:
+  - A new payment feature → payment_engineer + compliance_officer + backend
+  - AML system design → compliance_officer + risk_analyst + core_banking_dev
+  - Open banking launch → open_banking_dev + soc + compliance_officer
+Max 3 collaborators, exclude the primary agent.
 
 Also write a short TITLE (max ~70 characters) summarising the request, in the
 SAME language as the user's message.
@@ -140,20 +134,36 @@ class Route:
 
 
 def model_for(agent: Agent, complexity: str) -> tuple[str, str]:
-    """Deterministically pick (model_id, label) for a given agent + complexity.
+    """Pick (model_id, label) for an agent + complexity.
 
-    ROUTE A — Gemini: analysis/text agents.
-    ROUTE B — Groq/Llama fast: technical agents, low-complexity tasks.
-    ROUTE C — GLM-5.2: technical agents, high-complexity tasks.
+    ROUTE A — Gemini (Google): analysis/text/product agents.
+    ROUTE B — Groq fast: technical agents, low-complexity tasks.
+    ROUTE C — GLM: technical agents, high-complexity tasks.
               Falls back to Groq Route B if GLM_API_KEY isn't configured.
+    ROUTE F — OpenRouter: fintech/banking specialists.
+              Uses deepseek-r1:free for reasoning (compliance/risk),
+              qwen3-coder:free for code (payments/CBS).
+              Falls back to or_model_auto (openrouter/free) if not available.
     """
     if agent.route == "A":
         return settings.analysis_model, settings.analysis_model_label
+
+    if agent.route == "F":
+        if not settings.openrouter_enabled:
+            # No OpenRouter key: fall back to Gemini for analysis agents
+            return settings.analysis_model, settings.analysis_model_label + " (OR fallback)"
+        # Reasoning-heavy: compliance/risk → deepseek-r1
+        if agent.key in ("compliance_officer", "risk_analyst"):
+            return settings.or_model_reasoning, f"{settings.or_model_reasoning} (OpenRouter)"
+        # Code-heavy: payment/banking/open-banking → qwen3-coder
+        if agent.key in ("core_banking_dev", "payment_engineer", "open_banking_dev"):
+            return settings.or_model_coding, f"{settings.or_model_coding} (OpenRouter)"
+        # Default fintech: auto-select
+        return settings.or_model_auto, "OpenRouter Free"
+
     # Technical routes (B + C)
     if complexity == "low" or not settings.glm_enabled:
-        # Route B: fast answer for simple tasks, or GLM not set up
         return settings.code_model_fast, settings.code_model_fast_label
-    # Route C: GLM-5.2 for heavy coding / architecture / refactoring
     return settings.glm_model, settings.glm_model_label
 
 
