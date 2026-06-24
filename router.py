@@ -163,6 +163,10 @@ def model_for(agent: Agent, complexity: str) -> tuple[str, str]:
 
     # Technical routes (B + C)
     if complexity == "low" or not settings.glm_enabled:
+        # Route B: use OpenRouter fast model when available (no TPM limits),
+        # fall back to Groq only if OpenRouter isn't configured.
+        if settings.openrouter_enabled:
+            return settings.or_model_fast, f"{settings.or_model_fast} (OpenRouter)"
         return settings.code_model_fast, settings.code_model_fast_label
     return settings.glm_model, settings.glm_model_label
 
@@ -184,24 +188,32 @@ async def classify(
     context_hint = ""
     if last_agent in AGENTS:
         context_hint = (
-            "\nCONVERSATION CONTEXT: the previous message in this thread was "
-            f"handled by agent '{last_agent}' with request_type "
-            f"'{type_key}'. If the CURRENT message is a short follow-up with "
-            "no new concrete content of its own (e.g. 'continue', 'ok', "
-            "'yes', 'davom et', 'zo'r', 'ha zur'), KEEP that same agent and "
-            "request_type instead of guessing a new one. If the current "
-            "message clearly introduces a new or different request, classify "
-            "it fresh instead.\n"
+            "\nCONVERSATION CONTEXT: previous agent was "
+            f"'{last_agent}', type '{type_key}'. "
+            "Keep same agent/type for short follow-ups (ok, davom et, etc). "
+            "Reclassify fresh if the topic clearly changes.\n"
         )
 
-    try:
-        raw = await groq_generate(
+    # Try OpenRouter first (no tight TPM limits), fall back to Groq
+    async def _call_classifier(system: str) -> str:
+        if settings.openrouter_enabled:
+            from openrouter_client import or_generate
+            return await or_generate(
+                settings.or_model_auto,
+                system,
+                [{"role": "user", "content": user_text[:4000]}],
+                temperature=0.0,
+            )
+        return await groq_generate(
             model=settings.router_model,
-            system=_ROUTER_SYSTEM + context_hint,
+            system=system,
             messages=[{"role": "user", "content": user_text[:4000]}],
             temperature=0.0,
             json_mode=True,
         )
+
+    try:
+        raw = await _call_classifier(_ROUTER_SYSTEM + context_hint)
         data = json.loads(raw)
 
         candidate = str(data.get("agent", "")).strip().lower()

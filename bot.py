@@ -238,16 +238,21 @@ async def _answer_with_agent(route: Route, system_prompt: str, messages: list[di
 
     # Route F — OpenRouter fintech specialists
     if route.agent.route == "F":
-        or_msgs = _trim_for_groq(messages)  # same char-budget safety
-        return await openrouter_client.or_generate(route.model, system_prompt, or_msgs)
+        return await openrouter_client.or_generate(route.model, system_prompt, messages)
 
     # Route C — GLM (if enabled and healthy)
     if settings.glm_enabled and _glm_runtime_ok and route.model == settings.glm_model:
         return await glm_generate(route.model, system_prompt, messages, temperature=0.3)
 
-    # Route B — Groq fast (default for B, fallback for C)
+    # Route B — fast model
+    # When OpenRouter is enabled, Route B uses or_model_fast (no Groq TPM limits).
+    # When OpenRouter is disabled, falls back to Groq (with history trimming).
+    if settings.openrouter_enabled and route.model == settings.or_model_fast:
+        return await openrouter_client.or_generate(route.model, system_prompt, messages)
+
+    # Groq fallback (Route B without OpenRouter, or GLM fallback)
     groq_model = (
-        route.model if route.model != settings.glm_model
+        route.model if route.model not in (settings.glm_model, settings.or_model_fast)
         else settings.code_model_fast
     )
     groq_msgs = _trim_for_groq(messages)
@@ -1079,6 +1084,60 @@ async def cmd_forget(message: Message) -> None:
         return
     n = await memory.clear_memory(message.chat.id)
     await message.answer(f"O'chirildi: {n} ta fakt. ✅")
+
+
+@dp.message(Command("loops", "status"))
+async def cmd_loops(message: Message) -> None:
+    """Show current provider health + active routes — useful for debugging
+    the '413 loop' (repeated errors) and confirming which routes are live."""
+    if not _is_allowed(message.chat.id):
+        return
+
+    lines = ["**🔄 Orchestrator Status**\n"]
+
+    # Route A — Gemini
+    gemini_ok = bool(settings.gemini_api_key)
+    lines.append(f"**Route A — Gemini:** {'✅ ' + settings.analysis_model_label if gemini_ok else '❌ GEMINI_API_KEY yoq'}")
+
+    # Route B — OpenRouter fast or Groq fallback
+    if settings.openrouter_enabled:
+        lines.append(f"**Route B — OpenRouter:** ✅ `{settings.or_model_fast}`")
+    else:
+        lines.append(f"**Route B — Groq (413 xavfi!):** `{settings.code_model_fast}` — OPENROUTER_API_KEY qo'shing!")
+
+    # Route C — GLM
+    if settings.glm_enabled:
+        glm_status = "✅ (health-check o'tdi)" if _glm_runtime_ok else "⚠️ (404 — fallback'da)"
+        lines.append(f"**Route C — GLM:** {glm_status} `{settings.glm_model}`")
+    else:
+        lines.append("**Route C — GLM:** ❌ GLM_API_KEY yoq (Route B'ga fallback)")
+
+    # Route F — OpenRouter fintech
+    if settings.openrouter_enabled:
+        lines.append(f"**Route F — OpenRouter Fintech:** ✅ `{settings.or_model_reasoning}` / `{settings.or_model_coding}`")
+        lines.append("  Agentlar: compliance_officer, risk_analyst, core_banking_dev, payment_engineer, open_banking_dev")
+    else:
+        lines.append("**Route F — Fintech:** ❌ OPENROUTER_API_KEY yoq (Gemini'ga fallback)")
+
+    # Router
+    if settings.openrouter_enabled:
+        lines.append(f"\n**🧭 Router:** OpenRouter `{settings.or_model_auto}` (Groq TPM xavfi yo'q)")
+    else:
+        lines.append(f"\n**🧭 Router:** Groq `{settings.router_model}` ⚠️ 413 xavfi bor — OPENROUTER_API_KEY qo'shing!")
+
+    # Redis
+    not_persist = "In-memory (restart da yo'oladi)"
+    lines.append(f"\n**🗄 Redis:** {'✅ Persistent' if settings.redis_enabled else '⚠️ ' + not_persist}")
+
+    # 413 diagnosis
+    lines.append("\n**413 xatosi sababi va yechim:**")
+    if not settings.openrouter_enabled:
+        lines.append("❌ Groq free tier: 6000 TPM limit. Har bir so'rov tokenlar qo'shadi.")
+        lines.append("✅ Yechim: `OPENROUTER_API_KEY` qo'shing → barcha limitlar ketadi.")
+    else:
+        lines.append("✅ OpenRouter ulangan — 413 bo'lmasligi kerak.")
+
+    await _send_long(message, "\n".join(lines))
 
 
 @dp.message(Command("id"))
