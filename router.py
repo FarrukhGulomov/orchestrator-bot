@@ -1,38 +1,18 @@
 """
-The orchestrator / router.
+Orchestrator / router — Claude-only implementation.
 
-Stage 1 (this module): a single fast, cheap classifier call decides three things:
+Stage 1 (this module): a fast Claude Haiku classifier call decides:
   1) WHICH agent should answer (department)
-  2) WHAT KIND of request this is (idea / task / bug / improvement / question)
-  3) HOW complex it is (drives model choice on the code route)
-...and writes a short title (used for GitHub issue/PR titles).
+  2) WHAT KIND of request this is (idea/task/bug/improvement/question)
+  3) HOW complex it is (drives model choice)
+  4) Whether it needs a formatted document output
+  5) Whether it needs multiple agents to collaborate
 
-The model is then derived deterministically — THREE routes now:
+Stage 2 (bot.py): the chosen agent's persona answers with Claude Sonnet,
+using the chat's own scoped history.
 
-    ROUTE A  → Gemini (analysis_model)
-               For analytical/text agents: PM, BA, System Analyst, QA, Designer.
-
-    ROUTE B  → Groq / Llama 8B (code_model_fast)
-               Fast, low-latency path for simple/quick technical tasks:
-               short scripts, quick edits, trivial Q&A on code topics.
-
-    ROUTE C  → GLM-5.2 via Z.AI (glm_model)
-               Complex coding, multi-file refactoring, deep architecture
-               reasoning, security audits. 200K context window — can hold
-               entire codebases in one pass. Falls back to Groq (Route B)
-               gracefully if GLM_API_KEY isn't configured.
-
-Stage 2 (handled in bot.py): the chosen agent's persona, combined with the
-request-type addendum, answers with the proper model — and, for actionable
-types, the result can be filed as a GitHub issue/PR (see github_integration.py).
-
-STICKY ROUTING: callers may pass the (agent, request_type) of the previous
-turn in this chat. Short, content-free follow-ups ("ok", "continue", "ha
-zur", "davom et") have nothing for the classifier to actually classify, and
-guessing fresh on them was a real source of misrouting (e.g. a continuation
-of a Product Manager conversation getting reclassified as SOC/BUG). The
-hint nudges the classifier to keep the same agent/type for such messages,
-and is also used as the fallback if the classifier call itself fails.
+STICKY ROUTING: short, content-free follow-ups ("ok", "continue", "davom et")
+reuse the previous turn's agent/type rather than misrouting.
 """
 
 import json
@@ -41,7 +21,7 @@ from dataclasses import dataclass, field
 
 from agents import AGENTS, DEFAULT_AGENT_KEY, Agent, get_agent
 from config import settings
-from llm_clients import groq_generate
+from llm_clients import claude_generate_json
 from request_types import (
     DEFAULT_REQUEST_TYPE_KEY,
     REQUEST_TYPES,
@@ -55,60 +35,55 @@ _AGENT_KEYS = list(AGENTS.keys())
 _TYPE_KEYS = list(REQUEST_TYPES.keys())
 
 _ROUTER_SYSTEM = f"""
-You are a routing classifier for a Fintech/Banking AI team's assistant. Read the user's
-message (it may be in Uzbek, Russian, English, or a mix with IT/fintech slang) and
-decide three things.
+You are a routing classifier for a Senior Business Analyst's AI team. Read
+the user's message (may be in Uzbek, Russian, English, or a professional mix)
+and decide four things.
 
 1) WHICH SPECIALIST AGENT should handle it:
-General IT/Product team:
-- pm                : product requirements, prioritisation, roadmap, backlog, business value
-- ba                : functional requirements, user stories, use cases, business processes
-- system_analyst   : system architecture, integrations, data flow, big documentation
-- qa               : test scenarios, bug report structure, quality metrics
-- product_designer : UX/UI design — user research, personas, journey maps, wireframes, design system
-- backend          : server logic, DB schemas, APIs, code optimisation, refactoring
-- frontend         : UI/UX implementation, web/mobile components, state management
-- devops           : CI/CD, Dockerfiles, Kubernetes, cloud/server infrastructure
-- soc              : code vulnerability review, encryption logic, security audits
-- tech_lead        : technical strategy, architecture validation, code review, coordination
-Fintech/Banking specialists (use when the request is clearly in the financial domain):
-- compliance_officer : AML/CFT, KYC/CDD, PCI-DSS, GDPR, regulatory reporting (STR/SAR), policy
-- risk_analyst       : credit risk, market risk, VaR/CVaR, stress testing, Basel III/IV, PD/LGD
-- core_banking_dev   : T24/Flexcube/Mambu integrations, GL logic, ISO 20022 mapping, CBS APIs
-- payment_engineer   : SWIFT MT/MX, ISO 20022, Humo/UzCard, card processing (EMV/3DS2), RTGS/ACH
-- open_banking_dev   : PSD2/PSD3, OAuth 2.0/PKCE, FAPI, consent flows, OpenAPI banking specs
+BA & Analysis team:
+- ba                   : business requirements, user stories, acceptance criteria, GAP analysis, stakeholder needs
+- data_analyst         : SQL queries, KPIs, data analysis, metrics, Excel formulas, cohort/funnel analysis
+- bi_analyst           : dashboards, Power BI, Tableau, Looker, reports, data visualisation for management
+- process_analyst      : BPMN, AS-IS/TO-BE process mapping, workflow optimization, RACI, SOPs
+- financial_analyst    : P&L, unit economics, forecasting, budgeting, ROI/NPV/IRR, financial models
+- market_analyst       : market sizing, SWOT, PESTLE, competitive analysis, customer segmentation, GTM
+- requirements_engineer: BRD, FRS, NFR, traceability matrix, use case specs, data dictionary
+- data_governance      : data quality, MDM, data governance framework, GDPR, data classification
+Product & Delivery team:
+- pm                   : product roadmap, backlog, prioritisation (RICE/MoSCoW), OKRs, product metrics
+- system_analyst       : system architecture, integrations, API contracts, ERD, data flows
+- qa                   : test plans, test cases, UAT, bug reports, acceptance testing
+- project_manager      : project charter, WBS, Gantt, RAID log, status reports, sprint planning
+- tech_consultant      : vendor selection, build-vs-buy, tech stack recommendations, digital transformation
 
-2) WHAT KIND OF REQUEST this is (the Input Classification Matrix):
-- idea        : IDEA — a conceptual suggestion, high-level thought, or new feature proposal
-- task        : TASK / FEATURE — a direct requirement for a new component, field, endpoint, or script
-- bug         : BUG — a system error, crash, broken behaviour, or security vulnerability
-- improvement : REFINEMENT / ДОРАБОТКА — improvement to existing code: performance, refactor, UI/UX
-- question    : QUESTION — just asking for information or advice, nothing to implement or track
-  (use this ONLY for genuine non-actionable chat; if there is any concrete thing
-  to build, fix, or improve, classify it as task/bug/improvement instead)
+2) WHAT KIND OF REQUEST:
+- idea        : conceptual suggestion, high-level proposal, brainstorm
+- task        : concrete deliverable to produce (document, analysis, SQL, model, etc.)
+- bug         : error, broken process, data quality issue, system problem
+- improvement : refining existing work, improving a process or document
+- question    : information/advice request, no concrete deliverable
 
 3) COMPLEXITY:
-- "low"  : short, simple, quick question or trivial snippet
-- "high" : non-trivial reasoning, architecture, multi-step code, compliance analysis
+- "low"  : quick answer, simple query, brief explanation
+- "high" : non-trivial analysis, multi-part deliverable, complex reasoning
 
-4) DOES THIS NEED A FORMATTED DOCUMENT instead of a chat reply?
-Set wants_document=true for commercial proposals, cost estimates, regulatory reports,
-compliance frameworks, AML policies, or anything where they ask for "Word", "PDF",
-"hujjat", "tijorat taklifi", "smeta", "compliance report", "policy document".
+4) DOES THIS NEED A FORMATTED DOCUMENT (Word/PDF)?
+Set wants_document=true for commercial proposals, business cases, formal
+reports, policies, FRS/BRD documents, or when user asks for "Word", "PDF",
+"hujjat", "tijorat taklifi", "hisobot", "tahlil hisoboti".
 
-5) IS THIS A META-QUESTION ABOUT WHAT THE ASSISTANT/TEAM ITSELF CAN DO?
-Set is_capability_question=true ONLY when the user is asking about the assistant's own
-capabilities — e.g. "nima qila olasan", "jamoang kimlardan iborat", "what can you do".
+5) IS THIS A CAPABILITY QUESTION?
+Set is_capability_question=true ONLY when asking what the assistant/team can do.
 
-6) DOES THIS NEED INPUT FROM MULTIPLE ROLES to be properly answered?
-Only add collaborators when genuinely multidisciplinary. Common fintech combos:
-  - A new payment feature → payment_engineer + compliance_officer + backend
-  - AML system design → compliance_officer + risk_analyst + core_banking_dev
-  - Open banking launch → open_banking_dev + soc + compliance_officer
+6) COLLABORATORS (0-3 other agents genuinely needed for this request)?
+Examples:
+  - New product feature: ba + pm + system_analyst
+  - Financial reporting dashboard: financial_analyst + bi_analyst + data_analyst
+  - Market entry analysis: market_analyst + financial_analyst + pm
+  - Data platform governance: data_governance + data_analyst + system_analyst
 Max 3 collaborators, exclude the primary agent.
 
-Also write a short TITLE (max ~70 characters) summarising the request, in the
-SAME language as the user's message.
+Also write a short TITLE (max 70 chars) in the SAME language as the user's message.
 
 Respond with ONLY a JSON object, no prose:
 {{"agent": "<one of: {", ".join(_AGENT_KEYS)}>",
@@ -116,7 +91,7 @@ Respond with ONLY a JSON object, no prose:
   "complexity": "low"|"high",
   "wants_document": true|false,
   "is_capability_question": true|false,
-  "collaborators": ["<0-3 agent keys, excluding the primary agent>"],
+  "collaborators": ["<0-3 agent keys>"],
   "title": "<short title>"}}
 """
 
@@ -134,41 +109,10 @@ class Route:
 
 
 def model_for(agent: Agent, complexity: str) -> tuple[str, str]:
-    """Pick (model_id, label) for an agent + complexity.
-
-    ROUTE A — Gemini (Google): analysis/text/product agents.
-    ROUTE B — Groq fast: technical agents, low-complexity tasks.
-    ROUTE C — GLM: technical agents, high-complexity tasks.
-              Falls back to Groq Route B if GLM_API_KEY isn't configured.
-    ROUTE F — OpenRouter: fintech/banking specialists.
-              Uses deepseek-r1:free for reasoning (compliance/risk),
-              qwen3-coder:free for code (payments/CBS).
-              Falls back to or_model_auto (openrouter/free) if not available.
-    """
-    if agent.route == "A":
-        return settings.analysis_model, settings.analysis_model_label
-
-    if agent.route == "F":
-        if not settings.openrouter_enabled:
-            # No OpenRouter key: fall back to Gemini for analysis agents
-            return settings.analysis_model, settings.analysis_model_label + " (OR fallback)"
-        # Reasoning-heavy: compliance/risk → deepseek-r1
-        if agent.key in ("compliance_officer", "risk_analyst"):
-            return settings.or_model_reasoning, f"{settings.or_model_reasoning} (OpenRouter)"
-        # Code-heavy: payment/banking/open-banking → qwen3-coder
-        if agent.key in ("core_banking_dev", "payment_engineer", "open_banking_dev"):
-            return settings.or_model_coding, f"{settings.or_model_coding} (OpenRouter)"
-        # Default fintech: auto-select
-        return settings.or_model_auto, "OpenRouter Free"
-
-    # Technical routes (B + C)
-    if complexity == "low" or not settings.glm_enabled:
-        # Route B: use OpenRouter fast model when available (no TPM limits),
-        # fall back to Groq only if OpenRouter isn't configured.
-        if settings.openrouter_enabled:
-            return settings.or_model_fast, f"{settings.or_model_fast} (OpenRouter)"
-        return settings.code_model_fast, settings.code_model_fast_label
-    return settings.glm_model, settings.glm_model_label
+    """All agents use Claude. Complex tasks use Sonnet, simple use Haiku."""
+    if complexity == "low":
+        return settings.claude_fast_model, settings.claude_fast_model_label
+    return settings.claude_model, settings.claude_model_label
 
 
 async def classify(
@@ -176,7 +120,7 @@ async def classify(
     last_agent: str | None = None,
     last_type: str | None = None,
 ) -> Route:
-    """Pick agent + request type + model for a message. Always returns a valid Route."""
+    """Classify a message and return its Route. Never raises."""
     agent_key = last_agent if last_agent in AGENTS else DEFAULT_AGENT_KEY
     type_key = last_type if last_type in REQUEST_TYPES else DEFAULT_REQUEST_TYPE_KEY
     complexity = "high"
@@ -194,26 +138,11 @@ async def classify(
             "Reclassify fresh if the topic clearly changes.\n"
         )
 
-    # Try OpenRouter first (no tight TPM limits), fall back to Groq
-    async def _call_classifier(system: str) -> str:
-        if settings.openrouter_enabled:
-            from openrouter_client import or_generate
-            return await or_generate(
-                settings.or_model_auto,
-                system,
-                [{"role": "user", "content": user_text[:4000]}],
-                temperature=0.0,
-            )
-        return await groq_generate(
-            model=settings.router_model,
-            system=system,
-            messages=[{"role": "user", "content": user_text[:4000]}],
-            temperature=0.0,
-            json_mode=True,
-        )
-
     try:
-        raw = await _call_classifier(_ROUTER_SYSTEM + context_hint)
+        raw = await claude_generate_json(
+            _ROUTER_SYSTEM + context_hint,
+            [{"role": "user", "content": user_text[:4000]}],
+        )
         data = json.loads(raw)
 
         candidate = str(data.get("agent", "")).strip().lower()
@@ -224,7 +153,7 @@ async def classify(
         if type_candidate in REQUEST_TYPES:
             type_key = type_candidate
 
-        complexity = "low" if str(data.get("complexity")).lower() == "low" else "high"
+        complexity = "low" if str(data.get("complexity", "")).lower() == "low" else "high"
         wants_document = bool(data.get("wants_document", False))
         is_capability_question = bool(data.get("is_capability_question", False))
 
@@ -242,9 +171,8 @@ async def classify(
         raw_title = str(data.get("title", "")).strip()
         if raw_title:
             title = raw_title[:120]
-    except Exception as exc:  # noqa: BLE001 - router must never crash the bot
-        # Fall back to the previous turn's agent/type when we have one — far
-        # safer than a hardcoded default for a follow-up message.
+
+    except Exception as exc:
         logger.warning(
             "Router classification failed, using fallback agent=%s type=%s. %s",
             agent_key, type_key, exc,

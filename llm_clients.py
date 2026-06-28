@@ -1,299 +1,147 @@
 """
-Thin async wrappers around the Gemini (google-genai) and Groq SDKs.
+Claude (Anthropic) client wrappers.
 
-Both SDKs are synchronous, so calls are pushed to a thread with asyncio.to_thread
-to avoid blocking the aiogram event loop.
+All agent calls use the Anthropic SDK. Two tiers:
+  - claude_generate()      — full model (Sonnet) for all agent responses
+  - claude_generate_fast() — fast model (Haiku) for routing/classification
 
 Message format used across the app is provider-neutral:
     messages = [{"role": "user"|"assistant", "content": "..."}, ...]
 """
 
 import asyncio
+import base64
 import logging
 
 from config import settings
 
 logger = logging.getLogger(__name__)
 
-# --- Lazy singletons ------------------------------------------------------
-_gemini_client = None
-_groq_client = None
+_client = None
 
 
-def _get_gemini():
-    global _gemini_client
-    if _gemini_client is None:
-        from google import genai  # imported lazily so the app starts without it
-
-        _gemini_client = genai.Client(api_key=settings.gemini_api_key)
-    return _gemini_client
-
-
-def _get_groq():
-    global _groq_client
-    if _groq_client is None:
-        from groq import Groq
-
-        _groq_client = Groq(api_key=settings.groq_api_key)
-    return _groq_client
+def _get_client():
+    global _client
+    if _client is None:
+        import anthropic
+        _client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+    return _client
 
 
-# --- Gemini (ROUTE A) -----------------------------------------------------
-def _gemini_sync(model: str, system: str, messages: list[dict]) -> str:
-    from google.genai import types
-
-    client = _get_gemini()
-    contents = []
-    for m in messages:
-        role = "model" if m["role"] == "assistant" else "user"
-        contents.append(
-            types.Content(role=role, parts=[types.Part.from_text(text=m["content"])])
-        )
-
-    resp = client.models.generate_content(
-        model=model,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            system_instruction=system,
-            temperature=0.4,
-            max_output_tokens=settings.max_output_tokens,
-        ),
-    )
-    return (resp.text or "").strip()
-
-
-async def gemini_generate(model: str, system: str, messages: list[dict]) -> str:
-    return await asyncio.to_thread(_gemini_sync, model, system, messages)
-
-
-def _gemini_describe_file_sync(data: bytes, mime_type: str, instruction: str) -> str:
-    """One-off multimodal call: an image/PDF/etc. + an instruction, no chat
-    history. Used by file_processing.py to turn uploaded files into text that
-    then flows through the normal agent pipeline."""
-    from google.genai import types
-
-    client = _get_gemini()
-    contents = [
-        types.Content(
-            role="user",
-            parts=[
-                types.Part.from_bytes(data=data, mime_type=mime_type),
-                types.Part.from_text(text=instruction),
-            ],
-        )
-    ]
-    resp = client.models.generate_content(
-        model=settings.analysis_model,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            temperature=0.2,
-            max_output_tokens=4096,
-        ),
-    )
-    return (resp.text or "").strip()
-
-
-async def gemini_describe_file(data: bytes, mime_type: str, instruction: str) -> str:
-    return await asyncio.to_thread(_gemini_describe_file_sync, data, mime_type, instruction)
-
-
-def _gemini_json_sync(model: str, system: str, messages: list[dict]) -> str:
-    """Like _gemini_sync, but forces strict JSON output via the API's
-    response_mime_type — used for structured document content generation,
-    not regular chat."""
-    from google.genai import types
-
-    client = _get_gemini()
-    contents = []
-    for m in messages:
-        role = "model" if m["role"] == "assistant" else "user"
-        contents.append(
-            types.Content(role=role, parts=[types.Part.from_text(text=m["content"])])
-        )
-
-    resp = client.models.generate_content(
-        model=model,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            system_instruction=system,
-            temperature=0.4,
-            max_output_tokens=4096,
-            response_mime_type="application/json",
-        ),
-    )
-    return (resp.text or "").strip()
-
-
-async def gemini_generate_json(model: str, system: str, messages: list[dict]) -> str:
-    return await asyncio.to_thread(_gemini_json_sync, model, system, messages)
-
-
-# --- Groq / Llama (ROUTE B + router) --------------------------------------
-def _groq_sync(
-    model: str, system: str, messages: list[dict], temperature: float, json_mode: bool
-) -> str:
-    client = _get_groq()
-    full = [{"role": "system", "content": system}] + messages
-    kwargs = {
-        "model": model,
-        "messages": full,
-        "temperature": temperature,
-        "max_tokens": settings.max_output_tokens,
-    }
-    if json_mode:
-        kwargs["response_format"] = {"type": "json_object"}
-    resp = client.chat.completions.create(**kwargs)
-    return (resp.choices[0].message.content or "").strip()
-
-
-async def groq_generate(
+def _claude_sync(
     model: str,
     system: str,
     messages: list[dict],
-    temperature: float = 0.3,
-    json_mode: bool = False,
+    temperature: float,
+    max_tokens: int,
 ) -> str:
-    return await asyncio.to_thread(
-        _groq_sync, model, system, messages, temperature, json_mode
-    )
-
-
-def _groq_transcribe_sync(data: bytes, filename: str) -> str:
-    client = _get_groq()
-    resp = client.audio.transcriptions.create(
-        model=settings.whisper_model,
-        file=(filename, data),
-        response_format="text",
-    )
-    # response_format="text" -> SDK returns a plain string; other formats
-    # return an object with a .text attribute. Handle both defensively.
-    return resp if isinstance(resp, str) else getattr(resp, "text", str(resp))
-
-
-async def groq_transcribe(data: bytes, filename: str) -> str:
-    return await asyncio.to_thread(_groq_transcribe_sync, data, filename)
-
-
-# --- GLM-5.2 via Z.AI (ROUTE C — complex coding / large-context reasoning) -
-# OpenAI-compatible API — uses the official openai Python package with a
-# custom base_url. No new heavy dependency, just openai>=1.0 (already added).
-# Falls back gracefully (raises, caught upstream) when GLM_API_KEY isn't set.
-
-_glm_client = None
-
-
-def _get_glm():
-    global _glm_client
-    if _glm_client is None:
-        from openai import OpenAI
-
-        _glm_client = OpenAI(
-            api_key=settings.glm_api_key,
-            base_url=settings.glm_base_url,
-        )
-    return _glm_client
-
-
-def _glm_sync(
-    model: str, system: str, messages: list[dict], temperature: float
-) -> str:
-    client = _get_glm()
-    full = [{"role": "system", "content": system}] + messages
-    resp = client.chat.completions.create(
+    client = _get_client()
+    resp = client.messages.create(
         model=model,
-        messages=full,
+        system=system,
+        messages=messages,
         temperature=temperature,
-        max_tokens=settings.max_output_tokens,
+        max_tokens=max_tokens,
     )
-    return (resp.choices[0].message.content or "").strip()
+    return (resp.content[0].text if resp.content else "").strip()
 
 
-async def glm_generate(
-    model: str,
+async def claude_generate(
     system: str,
     messages: list[dict],
-    temperature: float = 0.3,
+    temperature: float = 0.4,
+    model: str | None = None,
 ) -> str:
-    """Generate a response via GLM (Z.AI or Together AI). Runs synchronously in a thread
-    to avoid blocking the aiogram event loop (same pattern as Gemini/Groq)."""
-    return await asyncio.to_thread(_glm_sync, model, system, messages, temperature)
-
-
-async def glm_health_check() -> tuple[bool, str]:
-    """Send a minimal probe request to check if the configured GLM model is
-    actually accessible with this API key.
-    Returns (ok: bool, message: str).
-    Called once at bot startup — a 404 here means Route C will be disabled
-    to prevent error noise on every real request."""
-    try:
-        result = await asyncio.wait_for(
-            glm_generate(
-                settings.glm_model,
-                "You are a helpful assistant.",
-                [{"role": "user", "content": "Hi"}],
-                temperature=0.0,
-            ),
-            timeout=15,
-        )
-        return True, f"OK (sample response len={len(result)})"
-    except Exception as exc:
-        msg = str(exc)
-        if "404" in msg or "model_not_found" in msg or "does not exist" in msg:
-            return False, (
-                f"Model '{settings.glm_model}' not accessible on this key — 404. "
-                "This usually means the model requires a subscription. Fix options:\n"
-                "  A) Z.AI Coding Plan ($18/mo): change GLM_BASE_URL to "
-                "https://api.z.ai/api/coding/paas/v4/ and GLM_MODEL to glm-5.2\n"
-                "  B) Together AI (pay-per-token): change GLM_API_KEY to your "
-                "Together AI key, GLM_BASE_URL to https://api.together.xyz/v1/, "
-                "GLM_MODEL to zai-org/GLM-5.2\n"
-                "  C) Free Z.AI: set GLM_MODEL=glm-4.7 or glm-4.7-flash and "
-                "GLM_BASE_URL=https://api.z.ai/api/paas/v4/\n"
-                "Route C is DISABLED until fixed — falling back to Groq."
-            )
-        return False, f"GLM probe failed: {msg[:200]}"
-
-    """Generate speech via Gemini's native TTS and wrap the raw PCM the API
-    returns into a standard playable WAV container (pure Python, no ffmpeg
-    dependency). Telegram's native 'voice note' bubble technically wants
-    OGG/OPUS, but that requires ffmpeg which isn't guaranteed to be present
-    on every deployment target — WAV via send_audio is the reliable choice
-    and still plays as real speech.
-
-    language_code is passed EXPLICITLY (e.g. 'uz-UZ', 'ru-RU', 'en-US')
-    rather than relying on Gemini's language auto-detection — auto-detect
-    was observed picking the wrong language entirely (Kazakh) for Uzbek
-    text, since Uzbek isn't a confirmed-GA language for this model."""
-    import wave
-    import io
-    from google.genai import types
-
-    client = _get_gemini()
-    resp = client.models.generate_content(
-        model=settings.tts_model,
-        contents=text,
-        config=types.GenerateContentConfig(
-            response_modalities=["AUDIO"],
-            speech_config=types.SpeechConfig(
-                voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                        voice_name=settings.tts_voice,
-                    )
-                ),
-                language_code=language_code,
-            ),
-        ),
+    """Generate a full agent response using the configured main Claude model."""
+    m = model or settings.claude_model
+    return await asyncio.to_thread(
+        _claude_sync, m, system, messages, temperature, settings.max_output_tokens
     )
-    pcm = resp.candidates[0].content.parts[0].inline_data.data
-
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(24000)
-        wf.writeframes(pcm)
-    return buf.getvalue()
 
 
-async def gemini_text_to_speech(text: str, language_code: str) -> bytes:
-    return await asyncio.to_thread(_gemini_tts_sync, text, language_code)
+async def claude_generate_fast(
+    system: str,
+    messages: list[dict],
+    temperature: float = 0.0,
+) -> str:
+    """Quick call using the fast (Haiku) model — for routing and classification."""
+    return await asyncio.to_thread(
+        _claude_sync,
+        settings.claude_fast_model,
+        system,
+        messages,
+        temperature,
+        1024,
+    )
+
+
+def _claude_describe_file_sync(data: bytes, mime_type: str, instruction: str) -> str:
+    """Multimodal call: image/PDF bytes + text instruction. Used for file analysis."""
+    client = _get_client()
+
+    if mime_type.startswith("image/"):
+        ext_map = {
+            "image/jpeg": "image/jpeg",
+            "image/png": "image/png",
+            "image/gif": "image/gif",
+            "image/webp": "image/webp",
+        }
+        media_type = ext_map.get(mime_type, "image/jpeg")
+        content = [
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": media_type,
+                    "data": base64.standard_b64encode(data).decode("utf-8"),
+                },
+            },
+            {"type": "text", "text": instruction},
+        ]
+    else:
+        # For non-image files (PDF etc.), send as base64 document
+        content = [
+            {
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": mime_type,
+                    "data": base64.standard_b64encode(data).decode("utf-8"),
+                },
+            },
+            {"type": "text", "text": instruction},
+        ]
+
+    resp = client.messages.create(
+        model=settings.claude_model,
+        system="You are a senior business analyst. Extract and summarize the key information from this file.",
+        messages=[{"role": "user", "content": content}],
+        temperature=0.2,
+        max_tokens=4096,
+    )
+    return (resp.content[0].text if resp.content else "").strip()
+
+
+async def claude_describe_file(data: bytes, mime_type: str, instruction: str) -> str:
+    return await asyncio.to_thread(_claude_describe_file_sync, data, mime_type, instruction)
+
+
+def _claude_json_sync(system: str, messages: list[dict]) -> str:
+    """Force JSON output via prefilling the assistant response with '{'."""
+    client = _get_client()
+    # Claude doesn't have a native JSON mode — prefix the assistant turn to force JSON
+    messages_with_prefix = list(messages) + [{"role": "assistant", "content": "{"}]
+    resp = client.messages.create(
+        model=settings.claude_fast_model,
+        system=system,
+        messages=messages_with_prefix,
+        temperature=0.0,
+        max_tokens=512,
+    )
+    raw = (resp.content[0].text if resp.content else "").strip()
+    # Re-attach the opening brace we used as a prefix
+    return "{" + raw if not raw.startswith("{") else raw
+
+
+async def claude_generate_json(system: str, messages: list[dict]) -> str:
+    return await asyncio.to_thread(_claude_json_sync, system, messages)

@@ -33,7 +33,7 @@ import logging
 from datetime import date
 
 from agents import Agent
-from llm_clients import gemini_generate_json, groq_generate
+from llm_clients import claude_generate_json
 from router import model_for
 
 logger = logging.getLogger(__name__)
@@ -67,21 +67,10 @@ _FOOTER_TEXT = "Master Orchestrator AI Team tomonidan tayyorlandi"
 
 async def generate_proposal_content(agent: Agent, user_text: str) -> dict:
     system_prompt = agent.system + "\n" + _SCHEMA_INSTRUCTION
-    model, _label = model_for(agent, "high")
-
-    if agent.route == "A":
-        raw = await gemini_generate_json(
-            model, system_prompt, [{"role": "user", "content": user_text}]
-        )
-    else:
-        raw = await groq_generate(
-            model,
-            system_prompt,
-            [{"role": "user", "content": user_text}],
-            temperature=0.4,
-            json_mode=True,
-        )
-
+    raw = await claude_generate_json(
+        system_prompt,
+        [{"role": "user", "content": user_text}],
+    )
     data = json.loads(raw)
     data.setdefault("title", "Taklif")
     data.setdefault("subtitle", None)

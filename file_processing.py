@@ -34,7 +34,7 @@ import csv
 import io
 import logging
 
-from llm_clients import gemini_describe_file, groq_transcribe
+from llm_clients import claude_describe_file
 
 logger = logging.getLogger(__name__)
 
@@ -165,7 +165,7 @@ async def describe_image(data: bytes, mime_type: str) -> str:
         "strelkalar, jadval ustunlari, bog'lanishlar) tasvirlang. Javobni "
         "faqat shu tahlil bilan bering, boshqa izoh qo'shmang."
     )
-    text = await gemini_describe_file(data, mime_type or "image/jpeg", instruction)
+    text = await claude_describe_file(data, mime_type or "image/jpeg", instruction)
     return _truncate(text)
 
 
@@ -177,13 +177,17 @@ async def describe_pdf(data: bytes) -> str:
         "qolganini qisqa umumlashtiring. Faqat shu tarkibni bering, ortiqcha "
         "sharh qo'shmang."
     )
-    text = await gemini_describe_file(data, "application/pdf", instruction)
+    text = await claude_describe_file(data, "application/pdf", instruction)
     return _truncate(text)
 
 
 async def transcribe_audio(data: bytes, filename: str) -> str:
-    text = await groq_transcribe(data, filename or "audio.ogg")
-    return _truncate(text)
+    # Audio transcription is not available in Claude-only mode.
+    # Return a user-friendly message instead of failing silently.
+    raise NotImplementedError(
+        "Ovozni matnga o'girish uchun qo'shimcha xizmat kerak. "
+        "Hozircha ovozli xabarlarni matn orqali yuboring."
+    )
 
 
 async def extract(
