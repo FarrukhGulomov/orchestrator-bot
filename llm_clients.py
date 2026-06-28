@@ -63,6 +63,11 @@ def _is_retryable(exc: Exception) -> bool:
     return any(code in msg for code in ("529", "503", "429", "overloaded", "rate limit"))
 
 
+def _is_model_unavailable(exc: Exception) -> bool:
+    msg = str(exc)
+    return "404" in msg or "No endpoints found" in msg or "model not found" in msg.lower()
+
+
 # --------------------------------------------------------------------------
 # OpenRouter (OpenAI-compatible)
 # --------------------------------------------------------------------------
@@ -82,12 +87,15 @@ def _or_sync(model: str, system: str, messages: list[dict], temperature: float, 
             return (resp.choices[0].message.content or "").strip()
         except Exception as exc:
             last_exc = exc
+            if _is_model_unavailable(exc) and model != settings.or_auto_model:
+                logger.warning("OpenRouter model unavailable (%s), switching to auto fallback", model)
+                model = settings.or_auto_model
+                continue
             if _is_retryable(exc) and attempt < _MAX_RETRIES - 1:
                 delay = _RETRY_BASE * (2 ** attempt)
                 logger.warning("OpenRouter overloaded (attempt %d), retry in %ds: %s",
                                attempt + 1, delay, str(exc)[:100])
                 time.sleep(delay)
-                # Try fallback model on second retry
                 if attempt == 1 and model != settings.or_auto_model:
                     model = settings.or_auto_model
                 continue
@@ -98,8 +106,7 @@ def _or_sync(model: str, system: str, messages: list[dict], temperature: float, 
 
 def _or_vision_sync(data: bytes, mime_type: str, instruction: str) -> str:
     client = _get_or_client()
-    # Vision via OpenRouter — use a model that supports images
-    vision_model = "google/gemini-2.0-flash-exp:free"
+    vision_model = settings.or_main_model
 
     if mime_type.startswith("image/"):
         b64 = base64.standard_b64encode(data).decode()
