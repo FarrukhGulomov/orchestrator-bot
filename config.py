@@ -54,13 +54,13 @@ class Settings:
 
     # --- OpenRouter free models --------------------------------------------
     # Main model: deep analysis, agent responses, document generation.
-    # google/gemini-2.0-flash-exp:free — fast, smart, 1M context, free.
-    # meta-llama/llama-4-maverick:free — 128K context, great quality, free.
+    # meta-llama/llama-4-maverick:free — 128K context, multimodal, great quality, free.
+    # google/gemini-2.5-flash:free — fast, smart, free (if available on OpenRouter).
     or_main_model: str = field(
-        default_factory=lambda: os.getenv("OR_MAIN_MODEL", "google/gemini-2.0-flash-exp:free")
+        default_factory=lambda: os.getenv("OR_MAIN_MODEL", "meta-llama/llama-4-maverick:free")
     )
     or_main_model_label: str = field(
-        default_factory=lambda: os.getenv("OR_MAIN_MODEL_LABEL", "Gemini 2.0 Flash (free)")
+        default_factory=lambda: os.getenv("OR_MAIN_MODEL_LABEL", "Llama 4 Maverick (free)")
     )
     # Fast model: routing/classification, memory extraction (cheap & quick).
     or_fast_model: str = field(
