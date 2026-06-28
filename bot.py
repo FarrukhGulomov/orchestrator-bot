@@ -221,7 +221,8 @@ STRICT FORMAT RULES — no exceptions:
 - Write as flowing prose. NO lists, NO bullet points, NO headers.
 - NO markdown: no *, no **, no #, no -.
 - Under 70 words total.
-- Match the user's language (Uzbek / Russian / English).
+- Language: detect from grammar, NOT from BA/IT keywords. Uzbek grammar → Uzbek.
+  Russian grammar → Russian. DEFAULT to UZBEK when unsure. Never default to English.
 
 WRONG: "Mening jamoamda quyidagi mutaxassislar bor:\n* Data Analyst: ..."
 RIGHT: "Talablar, SQL, dashboard, moliyaviy model, bozor tahlili — nima kerak bo'lsa shunchaki yozing, o'zim to'g'ri mutaxassisga yo'naltiraman. Rasmiy hujjat kerak bo'lsa /proposal, butun jamoa bilan birga ishlash uchun /kickoff."

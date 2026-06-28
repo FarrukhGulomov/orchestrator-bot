@@ -42,8 +42,13 @@ _SCHEMA_INSTRUCTION = """
 DOCUMENT MODE.
 You are generating the CONTENT for a polished, professional document (e.g. a
 commercial proposal / resource-and-cost estimate, or a formal report) based
-on the user's request. Write in the SAME dominant language as the user's
-request (Uzbek/Russian/English; keep IT/business terms in English as usual).
+on the user's request.
+
+LANGUAGE: detect from the GRAMMAR of the request, NOT from BA/IT keywords.
+Uzbek grammar markers: "faylda", "tayyorla", "qiling", "menga", "kerak", "-da", "-ni".
+Russian grammar markers: "в", "на", "для", "мне", "нужно", "сделай".
+DEFAULT to UZBEK when unsure. Keep BA/IT terms (BRD, KPI, SQL, etc.) in English.
+
 Be concrete: real numbers/estimates where the request gives enough to infer
 them (briefly state assumptions if you must estimate), real deliverables,
 real timeline — not vague generalities. This becomes a real file someone may
