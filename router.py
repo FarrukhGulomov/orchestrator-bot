@@ -114,7 +114,11 @@ class Route:
 
 
 def model_for(agent: Agent, complexity: str) -> tuple[str, str]:
-    """All agents use Claude. Complex tasks use Sonnet, simple use Haiku."""
+    """Return (model_id, label) based on active provider and complexity."""
+    if settings.provider == "openrouter":
+        if complexity == "low":
+            return settings.or_fast_model, settings.or_fast_model_label
+        return settings.or_main_model, settings.or_main_model_label
     if complexity == "low":
         return settings.claude_fast_model, settings.claude_fast_model_label
     return settings.claude_model, settings.claude_model_label
