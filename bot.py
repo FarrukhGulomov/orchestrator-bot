@@ -334,7 +334,16 @@ async def _process(
         return
     except Exception as exc:
         logger.exception("Generation failed")
-        await message.answer(f"⚠️ Xatolik: {exc}")
+        msg = str(exc)
+        if "529" in msg or "overloaded" in msg.lower() or "503" in msg:
+            await message.answer(
+                "⏳ Claude hozir juda band (overloaded). "
+                "30 soniya kutib, qaytadan yuboring."
+            )
+        elif "401" in msg or "authentication" in msg.lower():
+            await message.answer("⚠️ ANTHROPIC_API_KEY noto'g'ri yoki muddati o'tgan.")
+        else:
+            await message.answer(f"⚠️ Xatolik yuz berdi: {exc}")
         return
 
     if not body:
