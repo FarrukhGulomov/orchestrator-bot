@@ -211,22 +211,20 @@ async def _send_document_deliverable(message: Message, route: Route, user_text: 
 
 
 _CAPABILITY_OVERVIEW_SYSTEM = """
-You are answering on behalf of the whole Senior BA AI team in this Telegram bot.
-The user is asking what you/the team can do. Give a SHORT, warm, human-sounding
-answer. Mention the team covers:
-- Core BA work: requirements, user stories, process analysis, stakeholder communication
-- Data & BI: SQL, KPIs, dashboards (Power BI/Tableau), data quality
-- Financial analysis: P&L, forecasting, unit economics, financial modeling
-- Market & strategy: market sizing, SWOT, competitive analysis
-- Formal documentation: BRD/FRS, traceability matrix, data dictionary
-- Project delivery: project planning, RAID, status reporting
-- Technology consulting: vendor evaluation, digital transformation
+You are the BA AI team, answering in Telegram. The user asked what you can do.
 
-Mention how to use it: just describe what's needed and it routes to the right
-specialist automatically. /kickoff pulls the core BA team. /proposal returns a
-Word/PDF document.
-Keep it under 100 words, conversational prose, no bullet list, no markdown.
-Match the dominant language: Uzbek/Russian/English.
+Write 2-3 SHORT sentences, like a quick reply from a colleague. Cover the basics:
+auto-routing to the right specialist (BA, Data/BI, Financial, Market, Process,
+Engineering), /kickoff for team brainstorm, /proposal for Word/PDF output.
+
+STRICT FORMAT RULES — no exceptions:
+- Write as flowing prose. NO lists, NO bullet points, NO headers.
+- NO markdown: no *, no **, no #, no -.
+- Under 70 words total.
+- Match the user's language (Uzbek / Russian / English).
+
+WRONG: "Mening jamoamda quyidagi mutaxassislar bor:\n* Data Analyst: ..."
+RIGHT: "Talablar, SQL, dashboard, moliyaviy model, bozor tahlili — nima kerak bo'lsa shunchaki yozing, o'zim to'g'ri mutaxassisga yo'naltiraman. Rasmiy hujjat kerak bo'lsa /proposal, butun jamoa bilan birga ishlash uchun /kickoff."
 """
 
 _CAPABILITY_FALLBACK_UZ = (
@@ -636,44 +634,18 @@ async def cmd_start(message: Message) -> None:
     if not _is_allowed(message.chat.id):
         return
     await message.answer(
-        "Senior BA + Texnik Jamoa AI Assistenti — tayyor!\n\n"
-        "Menga har qanday savol yozing — avtomatik to'g'ri mutaxassisga yo'naltiraman.\n\n"
-        "BA & Tahlil jamoasi:\n"
-        "- Senior BA — talablar, user story, GAP tahlil\n"
-        "- Data Analyst — SQL, KPI, cohort/funnel tahlil\n"
-        "- BI Analyst — Power BI DAX, Tableau, dashboard\n"
-        "- Process Analyst — BPMN, AS-IS/TO-BE, SOP\n"
-        "- Financial Analyst — P&L, unit economics, moliyaviy model\n"
-        "- Market Analyst — bozor tahlili, SWOT, PESTLE, raqobatchilar\n"
-        "- Requirements Engineer — BRD/FRS/NFR hujjatlar\n"
-        "- Data Governance — MDM, ma'lumotlar sifati, GDPR\n\n"
-        "Mahsulot & Yetkazish jamoasi:\n"
-        "- PM — roadmap, backlog, RICE/MoSCoW, OKR\n"
-        "- System Analyst — arxitektura, ERD, API kontrakt\n"
-        "- Project Manager — WBS, RAID, Gantt, status hisobot\n"
-        "- Tech Consultant — vendor tanlash, build-vs-buy\n\n"
-        "Muhandislik jamoasi:\n"
-        "- Senior Backend — REST/GraphQL API, DB schema, kesh, auth\n"
-        "- Senior Frontend — React/Vue komponentlar, hooks, a11y\n"
-        "- Senior DevOps — Docker, K8s, CI/CD, Terraform, AWS/Azure\n"
-        "- Senior QA — test strategiya, avtomatlashtirish, UAT\n"
-        "- Senior Product Designer — UX tadqiqot, wireframe, design system\n\n"
-        f"Fayllar qabul qilinadi: {SUPPORTED_SUMMARY}\n\n"
-        "Maxsus buyruqlar:\n"
-        "/idea — g'oya/taklif\n"
-        "/task — aniq vazifa\n"
-        "/bug — muammo/xato\n"
-        "/improve — mavjudni yaxshilash\n"
-        "/kickoff — butun BA jamoasi bir vaqtda (BA + PM + Data + Process Analyst)\n"
-        "/proposal — tayyor hujjat (Word+PDF)\n\n"
-        "/remember <fakt> — loyiha haqida fakt yodida saqlash\n"
-        "/memory — saqlangan faktlar\n"
-        "/forget — barchasini o'chirish\n"
-        "/logs — Railway server loglarini tahlil qilish\n"
-        "/readfile <yo'l> — GitHub'dan fayl kodi\n"
-        "/reset — kontekstni tozalash\n"
+        "Salom! Senior BA AI jamoasi ishga tayyor.\n\n"
+        "Nima kerak bo'lsa shunchaki yozing — BA, Data/BI, Financial, Market, "
+        "Process, Engineering va boshqa mutaxassislarga o'zim yo'naltiraman.\n\n"
+        "Asosiy buyruqlar:\n"
+        "/kickoff — jamoa bilan birgalikda (BA + PM + Data + Process)\n"
+        "/proposal — Word + PDF hujjat tayyorlash\n"
+        "/remember <fakt> — loyiha ma'lumotini yodlash\n"
+        "/memory — yodlangan faktlar\n"
+        "/reset — suhbatni tozalash\n"
         "/status — tizim holati\n\n"
-        f"chat_id: `{message.chat.id}`",
+        f"Fayllar: {SUPPORTED_SUMMARY}\n"
+        f"`chat_id: {message.chat.id}`",
         parse_mode="Markdown",
     )
 
