@@ -52,9 +52,14 @@ BA & Analysis team:
 Product & Delivery team:
 - pm                   : product roadmap, backlog, prioritisation (RICE/MoSCoW), OKRs, product metrics
 - system_analyst       : system architecture, integrations, API contracts, ERD, data flows
-- qa                   : test plans, test cases, UAT, bug reports, acceptance testing
+- qa                   : test strategy, test plans, test cases, UAT, bug reports, automation, QA metrics
 - project_manager      : project charter, WBS, Gantt, RAID log, status reports, sprint planning
 - tech_consultant      : vendor selection, build-vs-buy, tech stack recommendations, digital transformation
+Engineering team:
+- backend              : server-side code, APIs (REST/GraphQL), database schemas, DDL, query optimisation, auth, caching
+- frontend             : React/Vue/Angular components, hooks, state management, Tailwind, a11y, Web Vitals
+- devops               : Dockerfile, Kubernetes, CI/CD (GitHub Actions/GitLab CI), Terraform, AWS/Azure/GCP, observability
+- product_designer     : UX research, personas, journey maps, wireframes, design system, accessibility specs, handoff
 
 2) WHAT KIND OF REQUEST:
 - idea        : conceptual suggestion, high-level proposal, brainstorm
