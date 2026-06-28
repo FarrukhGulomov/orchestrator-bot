@@ -724,9 +724,16 @@ async def cmd_status(message: Message) -> None:
         return
 
     lines = ["**AI Orchestrator Status**\n"]
-    claude_ok = bool(settings.anthropic_api_key)
-    lines.append(f"**Claude (barcha agentlar):** {'✅ ' + settings.claude_model_label if claude_ok else '❌ ANTHROPIC_API_KEY yoq'}")
-    lines.append(f"**Fast model (routing):** {settings.claude_fast_model_label}")
+    if settings.provider == "openrouter":
+        lines.append(f"**Provider:** ✅ OpenRouter (bepul)")
+        lines.append(f"**Asosiy model:** {settings.or_main_model_label} (`{settings.or_main_model}`)")
+        lines.append(f"**Tez model (routing):** {settings.or_fast_model_label}")
+    elif settings.provider == "claude":
+        lines.append(f"**Provider:** ✅ Claude (Anthropic)")
+        lines.append(f"**Asosiy model:** {settings.claude_model_label}")
+        lines.append(f"**Tez model:** {settings.claude_fast_model_label}")
+    else:
+        lines.append("**Provider:** ❌ Sozlanmagan (OPENROUTER_API_KEY yoki ANTHROPIC_API_KEY kerak)")
     redis_status = "✅ Persistent" if settings.redis_enabled else "⚠️ In-memory (restart da yo'oladi)"
     lines.append(f"\n**Redis:** {redis_status}")
     lines.append(f"**GitHub:** {'✅ ' + settings.github_repo if settings.github_enabled else '❌ Sozlanmagan'}")
@@ -898,10 +905,14 @@ async def main() -> None:
     else:
         logger.info("Redis: in-memory only (lost on restart). Set REDIS_URL to persist.")
 
-    logger.info(
-        "Claude models: main=%s fast=%s",
-        settings.claude_model, settings.claude_fast_model,
-    )
+    if settings.provider == "openrouter":
+        logger.info("Provider: OpenRouter (free) — main=%s fast=%s",
+                    settings.or_main_model, settings.or_fast_model)
+    elif settings.provider == "claude":
+        logger.info("Provider: Claude (Anthropic) — main=%s fast=%s",
+                    settings.claude_model, settings.claude_fast_model)
+    else:
+        logger.warning("No AI provider configured! Set OPENROUTER_API_KEY or ANTHROPIC_API_KEY.")
 
     if settings.github_enabled:
         logger.info("GitHub: repo=%s auto_pr=%s", settings.github_repo, settings.github_auto_pr)
