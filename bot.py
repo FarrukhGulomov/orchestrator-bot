@@ -914,17 +914,44 @@ async def handle_text(message: Message, bot: Bot) -> None:
     if not user_text:
         return
 
-    # If the user replied to a non-bot message, prepend the quoted content so
-    # the agent sees "Unda javob ber" together with the original question.
+    # If the user replied to a non-bot message, include the context:
+    # - if the replied message has a FILE → download & extract it
+    # - otherwise → prepend the quoted text
     if message.reply_to_message:
         replied = message.reply_to_message
-        is_replied_to_bot = (
-            replied.from_user and replied.from_user.is_bot
-        )
+        is_replied_to_bot = replied.from_user and replied.from_user.is_bot
         if not is_replied_to_bot:
-            quoted = (replied.text or replied.caption or "").strip()
-            if quoted:
-                user_text = f'[Iqtibos: "{quoted[:600]}"]\n{user_text}'
+            doc = replied.document
+            photo = replied.photo
+            if doc:
+                max_bytes = settings.max_file_size_mb * 1024 * 1024
+                if not doc.file_size or doc.file_size <= max_bytes:
+                    try:
+                        buf = await bot.download(doc.file_id)
+                        data = buf.read() if hasattr(buf, "read") else bytes(buf)
+                        extracted, _kind = await extract(doc.file_name, doc.mime_type, data)
+                        if extracted:
+                            label = doc.file_name or "fayl"
+                            user_text = (
+                                f"{user_text}\n\n"
+                                f"--- Fayl: {label} ---\n{extracted}"
+                            )
+                    except Exception:
+                        logger.exception("Failed to extract document from replied message")
+            elif photo:
+                try:
+                    biggest = photo[-1]
+                    buf = await bot.download(biggest.file_id)
+                    data = buf.read() if hasattr(buf, "read") else bytes(buf)
+                    extracted, _kind = await extract("photo.jpg", "image/jpeg", data)
+                    if extracted:
+                        user_text = f"{user_text}\n\n--- Rasm tahlili ---\n{extracted}"
+                except Exception:
+                    logger.exception("Failed to extract photo from replied message")
+            else:
+                quoted = (replied.text or replied.caption or "").strip()
+                if quoted:
+                    user_text = f'[Iqtibos: "{quoted[:600]}"]\n{user_text}'
 
     if is_direct:
         # @mention, reply-to-bot, or private chat → respond normally
