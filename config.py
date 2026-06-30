@@ -131,6 +131,15 @@ class Settings:
         default_factory=lambda: os.getenv("REQUIRE_MENTION_IN_GROUPS", "true").lower() == "true"
     )
 
+    # Proactive group mode: bot analyses every group message and joins in when relevant,
+    # even without @mention. Cooldown prevents spam (seconds between proactive replies).
+    proactive_in_groups: bool = field(
+        default_factory=lambda: os.getenv("PROACTIVE_IN_GROUPS", "false").lower() == "true"
+    )
+    proactive_cooldown_seconds: int = field(
+        default_factory=lambda: int(os.getenv("PROACTIVE_COOLDOWN_SECONDS", "45"))
+    )
+
     # --- Output metadata header --------------------------------------------
     show_metadata_header: bool = field(
         default_factory=lambda: os.getenv("SHOW_METADATA_HEADER", "false").lower() == "true"

@@ -25,8 +25,10 @@ Run:  python bot.py
 """
 
 import asyncio
+import json
 import logging
 import re
+import time
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -44,7 +46,7 @@ import redis_client
 from agents import Agent, TEAM_MEMORY_HEADER, get_agent
 from config import settings
 from file_processing import SUPPORTED_SUMMARY, extract, transcribe_audio
-from llm_clients import claude_generate, claude_generate_fast
+from llm_clients import claude_generate, claude_generate_fast, claude_generate_json
 from request_types import REQUEST_TYPES, get_request_type
 from router import Route, classify, model_for
 
@@ -60,6 +62,48 @@ TELEGRAM_LIMIT = 4096
 
 # Default cross-functional team for /kickoff: core BA team
 KICKOFF_ROLES = ["ba", "pm", "data_analyst", "process_analyst"]
+
+# Proactive group mode: tracks last proactive reply time per chat to avoid spam
+_proactive_last: dict[int, float] = {}
+
+_RELEVANCE_SYSTEM = """
+You are a relevance filter for a Senior Business Analyst AI team in a Telegram group.
+Decide whether the message below needs a response from the team.
+
+Reply with ONLY this JSON — no prose, no markdown:
+{"relevant": true}  or  {"relevant": false}
+
+Respond TRUE if the message:
+- Asks a professional question (business analysis, requirements, data, SQL, KPIs,
+  dashboards, financial modeling, market research, architecture, APIs, DevOps, QA)
+- Describes a problem or challenge needing help
+- Requests analysis, a document, a plan, or expert advice
+- Discusses specifications, integrations, process design, or delivery
+
+Respond FALSE if:
+- Casual chat, greetings, emojis only, jokes
+- Short ack: "ok", "ha", "rahmat", "спасибо", "got it", "+1", "👍"
+- Off-topic personal or social conversation
+- The question is clearly already fully answered in the same message
+"""
+
+
+async def _check_group_relevance(text: str) -> bool:
+    """Return True if this group message is relevant enough to respond to proactively."""
+    if len(text.strip()) < 15:
+        return False
+    try:
+        raw = await asyncio.wait_for(
+            claude_generate_json(
+                _RELEVANCE_SYSTEM,
+                [{"role": "user", "content": text[:800]}],
+            ),
+            timeout=10,
+        )
+        data = json.loads(raw)
+        return bool(data.get("relevant", False))
+    except Exception:
+        return False
 
 
 # --------------------------------------------------------------------------
@@ -144,12 +188,22 @@ async def _maybe_create_tickets(route: Route, user_text: str, body: str) -> str:
     return ("\n\n" + "\n".join(lines)) if lines else ""
 
 
-async def _send_long(message: Message, text: str) -> None:
-    for chunk in _split(text, TELEGRAM_LIMIT):
+async def _send_long(message: Message, text: str, reply_mode: bool = False) -> None:
+    """Send a (possibly long) reply, splitting at TELEGRAM_LIMIT. If reply_mode,
+    the first chunk quotes the original message so group context is clear."""
+    chunks = _split(text, TELEGRAM_LIMIT)
+    for i, chunk in enumerate(chunks):
+        use_reply = reply_mode and i == 0
         try:
-            await message.answer(chunk, parse_mode="Markdown")
+            if use_reply:
+                await message.reply(chunk, parse_mode="Markdown")
+            else:
+                await message.answer(chunk, parse_mode="Markdown")
         except TelegramBadRequest:
-            await message.answer(chunk, parse_mode=None)
+            if use_reply:
+                await message.reply(chunk, parse_mode=None)
+            else:
+                await message.answer(chunk, parse_mode=None)
 
 
 def _split(text: str, limit: int) -> list[str]:
@@ -266,6 +320,7 @@ async def _process(
     user_text: str | None,
     forced_type: str | None,
     forced_document: bool | None = None,
+    reply_mode: bool = False,
 ) -> None:
     chat_id = message.chat.id
     if not _is_allowed(chat_id):
@@ -313,7 +368,7 @@ async def _process(
         await history.append(chat_id, route.agent.key, "assistant", body)
         await history.set_last_route(chat_id, route.agent.key, route.request_type.key)
         footer = await _maybe_create_tickets(route, user_text, body)
-        await _send_long(message, _header(route) + body + footer)
+        await _send_long(message, _header(route) + body + footer, reply_mode=reply_mode)
         if route.request_type.creates_ticket:
             asyncio.create_task(_maybe_extract_memory(chat_id, user_text, body))
         return
@@ -353,7 +408,7 @@ async def _process(
     await history.set_last_route(chat_id, route.agent.key, route.request_type.key)
 
     footer = await _maybe_create_tickets(route, user_text, body)
-    await _send_long(message, _header(route) + body + footer)
+    await _send_long(message, _header(route) + body + footer, reply_mode=reply_mode)
     if route.request_type.creates_ticket:
         asyncio.create_task(_maybe_extract_memory(chat_id, user_text, body))
 
@@ -852,14 +907,36 @@ async def handle_text(message: Message, bot: Bot) -> None:
         return
 
     me = await bot.me()
-    if not _should_answer(message, me.username or ""):
-        return
+    username = me.username or ""
+    is_direct = _should_answer(message, username)
 
-    user_text = _strip_mention(message.text or "", me.username or "")
+    user_text = _strip_mention(message.text or "", username)
     if not user_text:
         return
 
-    await _process(message, bot, user_text, forced_type=None)
+    if is_direct:
+        # @mention, reply-to-bot, or private chat → respond normally
+        await _process(message, bot, user_text, forced_type=None)
+        return
+
+    # Proactive group mode: analyse all messages and join in when relevant
+    if not settings.proactive_in_groups:
+        return
+    if message.chat.type == "private":
+        return
+
+    # Cooldown: don't respond more than once per N seconds per group
+    now = time.monotonic()
+    if now - _proactive_last.get(chat_id, 0) < settings.proactive_cooldown_seconds:
+        return
+
+    # Fast relevance check
+    if not await _check_group_relevance(user_text):
+        return
+
+    logger.info("chat=%s PROACTIVE match: %.60s", chat_id, user_text)
+    _proactive_last[chat_id] = now
+    await _process(message, bot, user_text, forced_type=None, reply_mode=True)
 
 
 # --------------------------------------------------------------------------
