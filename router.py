@@ -37,9 +37,9 @@ _TYPE_KEYS = list(REQUEST_TYPES.keys())
 _ROUTER_SYSTEM = f"""
 You are a routing classifier for a Senior Business Analyst's AI team. Read
 the user's message (may be in Uzbek, Russian, English, or a professional mix)
-and decide four things.
+and decide the following.
 
-1) WHICH SPECIALIST AGENT should handle it:
+1) WHICH SPECIALIST AGENT should handle it (primary agent):
 BA & Analysis team:
 - ba                   : business requirements, user stories, acceptance criteria, GAP analysis, stakeholder needs
 - data_analyst         : SQL queries, KPIs, data analysis, metrics, Excel formulas, cohort/funnel analysis
@@ -60,6 +60,17 @@ Engineering team:
 - frontend             : React/Vue/Angular components, hooks, state management, Tailwind, a11y, Web Vitals
 - devops               : Dockerfile, Kubernetes, CI/CD (GitHub Actions/GitLab CI), Terraform, AWS/Azure/GCP, observability
 - product_designer     : UX research, personas, journey maps, wireframes, design system, accessibility specs, handoff
+Specialised team:
+- translator           : professional translation EN ↔ RU ↔ UZ, business/technical documents, UI copy
+- diagram              : Mermaid BPMN/UML/ER/Sequence/Activity/Architecture diagrams
+- technical_analyst    : API/Swagger/OpenAPI review, JSON/XML analysis, log analysis, REST critique
+- jira                 : Jira Epic/Feature/Story/Task/Bug formatting with AC, story points, labels
+Banking domain:
+- credit_conveyor      : loan lifecycle (online/offline), credit pipeline stages, KYC/AML, decision engine
+- core_banking         : accounts, transactions, GL/posting, core banking operations, accounting
+- integration          : REST/SOAP/Kafka/ESB integration design, OpenAPI spec, event-driven architecture
+- scoring              : credit scorecard, decision rules, PD/LGD/EAD, fraud detection, IFRS 9
+- insurance            : credit life insurance, premium calculation, policy lifecycle, claims processing
 
 2) WHAT KIND OF REQUEST:
 - idea        : conceptual suggestion, high-level proposal, brainstorm
@@ -80,13 +91,25 @@ reports, policies, FRS/BRD documents, or when user asks for "Word", "PDF",
 5) IS THIS A CAPABILITY QUESTION?
 Set is_capability_question=true ONLY when asking what the assistant/team can do.
 
-6) COLLABORATORS (0-3 other agents genuinely needed for this request)?
+6) COLLABORATORS (0-3 other agents for PARALLEL input on this request)?
+Use when multiple specialists must each contribute simultaneously.
 Examples:
-  - New product feature: ba + pm + system_analyst
+  - New product feature brainstorm: ba + pm + system_analyst
   - Financial reporting dashboard: financial_analyst + bi_analyst + data_analyst
   - Market entry analysis: market_analyst + financial_analyst + pm
   - Data platform governance: data_governance + data_analyst + system_analyst
-Max 3 collaborators, exclude the primary agent.
+Max 3 collaborators, exclude the primary agent. Leave [] if execution_chain is set.
+
+7) SEQUENTIAL CHAIN (for complex multi-domain requests needing step-by-step pipeline)?
+Use execution_chain when one specialist must BUILD ON the previous specialist's output
+(not just parallel contributions). Keep to 2-4 agents. Leave [] for simple requests.
+IMPORTANT: if execution_chain is non-empty, set collaborators to [].
+Examples:
+  - Full feature spec end-to-end: ["ba", "system_analyst", "technical_analyst", "qa"]
+  - Banking loan product design: ["ba", "credit_conveyor", "integration", "scoring"]
+  - New API design: ["ba", "system_analyst", "technical_analyst", "backend"]
+  - Process redesign with diagrams: ["process_analyst", "diagram", "requirements_engineer"]
+  - Translation request / simple question → []
 
 Also write a short TITLE (max 70 chars) in the SAME language as the user's message.
 
@@ -97,6 +120,7 @@ Respond with ONLY a JSON object, no prose:
   "wants_document": true|false,
   "is_capability_question": true|false,
   "collaborators": ["<0-3 agent keys>"],
+  "execution_chain": ["<0-4 agent keys in sequence>"],
   "title": "<short title>"}}
 """
 
@@ -111,6 +135,7 @@ class Route:
     wants_document: bool = False
     is_capability_question: bool = False
     collaborators: list[str] = field(default_factory=list)
+    execution_chain: list[str] = field(default_factory=list)
 
 
 def model_for(agent: Agent, complexity: str) -> tuple[str, str]:
@@ -136,6 +161,7 @@ async def classify(
     wants_document = False
     is_capability_question = False
     collaborators: list[str] = []
+    execution_chain: list[str] = []
     title = (user_text.strip()[:70] or "Untitled")
 
     context_hint = ""
@@ -167,7 +193,18 @@ async def classify(
         is_capability_question = bool(data.get("is_capability_question", False))
 
         raw_collabs = data.get("collaborators", [])
-        if isinstance(raw_collabs, list):
+        raw_chain = data.get("execution_chain", [])
+        if isinstance(raw_chain, list) and raw_chain:
+            seen_chain: list[str] = []
+            for c in raw_chain:
+                ck = str(c).strip().lower()
+                if ck in AGENTS and ck not in seen_chain:
+                    seen_chain.append(ck)
+                if len(seen_chain) >= 4:
+                    break
+            execution_chain = seen_chain
+
+        if not execution_chain and isinstance(raw_collabs, list):
             seen: list[str] = []
             for c in raw_collabs:
                 ck = str(c).strip().lower()
@@ -198,4 +235,5 @@ async def classify(
         wants_document=wants_document,
         is_capability_question=is_capability_question,
         collaborators=collaborators,
+        execution_chain=execution_chain,
     )

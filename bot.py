@@ -362,6 +362,18 @@ async def _process(
         chat_id, route.agent.key, route.model, route.request_type.key, route.collaborators,
     )
 
+    if route.execution_chain:
+        logger.info(
+            "chat=%s -> CHAIN %s", chat_id, route.execution_chain
+        )
+        body = await _run_sequential_chain(route, user_text, chat_id)
+        await history.set_last_route(chat_id, route.agent.key, route.request_type.key)
+        footer = await _maybe_create_tickets(route, user_text, body)
+        await _send_long(message, _header(route) + body + footer, reply_mode=reply_mode)
+        if route.request_type.creates_ticket:
+            asyncio.create_task(_maybe_extract_memory(chat_id, user_text, body))
+        return
+
     if route.collaborators:
         body = await _run_collaborative_answer(route, user_text, chat_id)
         await history.append(chat_id, route.agent.key, "user", user_text)
@@ -476,7 +488,7 @@ async def _run_collaborative_answer(route: Route, user_text: str, chat_id: int) 
             claude_generate(
                 _SYNTHESIS_SYSTEM,
                 [{"role": "user", "content": synthesis_input}],
-                model=settings.claude_model,
+                model=route.model,
             ),
             timeout=settings.request_timeout,
         )
@@ -490,6 +502,47 @@ async def _run_collaborative_answer(route: Route, user_text: str, chat_id: int) 
         body = primary["body"]
 
     return body
+
+
+async def _run_sequential_chain(route: Route, user_text: str, chat_id: int) -> str:
+    """Run agents in sequence, each specialist building on the previous output."""
+    chain = route.execution_chain
+    outputs: list[tuple[str, str]] = []
+
+    for agent_key in chain:
+        agent = get_agent(agent_key)
+        system_prompt = await _build_system_prompt(chat_id, agent, route.request_type.addendum)
+        model, _ = model_for(agent, "high")
+
+        if outputs:
+            prev_work = "\n\n".join(
+                f"=== {name} ===\n{body}" for name, body in outputs
+            )
+            content = (
+                f"Original request:\n{user_text}\n\n"
+                f"Previous specialists' work:\n{prev_work}\n\n"
+                "Your task: add your specialist contribution building on the above."
+            )
+        else:
+            content = user_text
+
+        try:
+            body = await asyncio.wait_for(
+                claude_generate(system_prompt, [{"role": "user", "content": content}], model=model),
+                timeout=settings.request_timeout,
+            )
+            body = (body or "").strip() or "(bo'sh javob)"
+        except Exception as exc:
+            logger.exception("Sequential chain agent=%s failed", agent_key)
+            body = f"⚠️ {agent.display_name}: {exc}"
+
+        outputs.append((agent.display_name, body))
+        await history.append(chat_id, agent_key, "user", user_text)
+        await history.append(chat_id, agent_key, "assistant", body)
+
+    if not outputs:
+        return "(zanjir bo'sh)"
+    return "\n\n---\n\n".join(f"### {name}\n\n{body}" for name, body in outputs)
 
 
 _MEMORY_EXTRACT_SYSTEM = """
