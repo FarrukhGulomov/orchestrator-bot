@@ -992,12 +992,17 @@ async def cmd_status(message: Message) -> None:
         return
 
     lines = ["**AI Orchestrator Status**\n"]
-    if settings.provider == "openrouter":
-        lines.append(f"**Provider:** ✅ OpenRouter (bepul)")
+    if settings.provider == "hybrid":
+        lines.append("**Provider:** ✅ Hybrid (OpenRouter + Claude)")
+        lines.append(f"**Agent javoblari:** {settings.claude_model_label} (Claude Sonnet)")
+        lines.append(f"**Routing/tez:** {settings.or_fast_model_label} (OpenRouter, bepul)")
+        lines.append(f"**Vision/PDF:** Claude (native tahlil)")
+    elif settings.provider == "openrouter":
+        lines.append("**Provider:** ✅ OpenRouter (bepul)")
         lines.append(f"**Asosiy model:** {settings.or_main_model_label} (`{settings.or_main_model}`)")
         lines.append(f"**Tez model (routing):** {settings.or_fast_model_label}")
     elif settings.provider == "claude":
-        lines.append(f"**Provider:** ✅ Claude (Anthropic)")
+        lines.append("**Provider:** ✅ Claude (Anthropic)")
         lines.append(f"**Asosiy model:** {settings.claude_model_label}")
         lines.append(f"**Tez model:** {settings.claude_fast_model_label}")
     else:
@@ -1270,7 +1275,12 @@ async def main() -> None:
     else:
         logger.info("Redis: in-memory only (lost on restart). Set REDIS_URL to persist.")
 
-    if settings.provider == "openrouter":
+    if settings.provider == "hybrid":
+        logger.info(
+            "Provider: HYBRID — agents=%s | routing=%s (free) | vision=Claude",
+            settings.claude_model, settings.or_fast_model,
+        )
+    elif settings.provider == "openrouter":
         logger.info("Provider: OpenRouter (free) — main=%s fast=%s",
                     settings.or_main_model, settings.or_fast_model)
     elif settings.provider == "claude":

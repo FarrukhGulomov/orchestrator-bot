@@ -1,8 +1,12 @@
 """
 Central configuration for the Senior Business Analyst AI Orchestrator.
 
-All secrets are read from environment variables (see .env.example).
-Only Claude (Anthropic) is used — no other AI provider keys required.
+Provider modes (auto-detected at runtime):
+  hybrid     — BOTH keys set: OpenRouter handles routing/fast calls (free),
+               Claude handles agent responses and vision (quality)
+  openrouter — Only OPENROUTER_API_KEY: all calls go through free models
+  claude     — Only ANTHROPIC_API_KEY: all calls use Claude Sonnet/Haiku
+  none       — No keys set (startup validation warns)
 """
 
 import logging
@@ -110,7 +114,15 @@ class Settings:
 
     @property
     def provider(self) -> str:
-        """Active AI provider: 'openrouter' or 'claude'."""
+        """Active AI provider: 'hybrid' | 'openrouter' | 'claude' | 'none'.
+
+        hybrid = both keys set:
+          - fast/routing calls → OpenRouter free models
+          - main agent calls   → Claude Sonnet
+          - vision/PDF         → Claude (native document understanding)
+        """
+        if self.openrouter_api_key and self.anthropic_api_key:
+            return "hybrid"
         if self.openrouter_api_key:
             return "openrouter"
         if self.anthropic_api_key:
@@ -119,15 +131,15 @@ class Settings:
 
     @property
     def main_model_label(self) -> str:
-        if self.provider == "openrouter":
-            return self.or_main_model_label
-        return self.claude_model_label
+        if self.provider in ("claude", "hybrid"):
+            return self.claude_model_label
+        return self.or_main_model_label
 
     @property
     def fast_model_label(self) -> str:
-        if self.provider == "openrouter":
-            return self.or_fast_model_label
-        return self.claude_fast_model_label
+        if self.provider == "claude":
+            return self.claude_fast_model_label
+        return self.or_fast_model_label
 
     # Max tokens for agent replies. Bump if long deliverables get cut off.
     max_output_tokens: int = field(
@@ -218,7 +230,7 @@ class Settings:
         if self.provider == "none":
             problems.append(
                 "No AI provider configured. Set OPENROUTER_API_KEY (free) "
-                "or ANTHROPIC_API_KEY (paid)."
+                "or ANTHROPIC_API_KEY (paid), or both for hybrid mode."
             )
         return problems
 
