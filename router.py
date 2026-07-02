@@ -149,8 +149,9 @@ def model_for(agent: Agent, complexity: str) -> tuple[str, str]:
             return settings.or_fast_model, settings.or_fast_model_label
         return settings.or_main_model, settings.or_main_model_label
     if settings.provider == "hybrid":
+        # Agent responses always go to Claude — OR is only used internally for routing.
         if complexity == "low":
-            return settings.or_fast_model, settings.or_fast_model_label
+            return settings.claude_fast_model, settings.claude_fast_model_label
         return settings.claude_model, settings.claude_model_label
     # claude-only
     if complexity == "low":

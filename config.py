@@ -88,10 +88,10 @@ class Settings:
     )
     # Fast model: routing/classification, memory extraction (cheap & quick).
     or_fast_model: str = field(
-        default_factory=lambda: os.getenv("OR_FAST_MODEL", "meta-llama/llama-4-scout:free")
+        default_factory=lambda: os.getenv("OR_FAST_MODEL", "meta-llama/llama-4-maverick:free")
     )
     or_fast_model_label: str = field(
-        default_factory=lambda: os.getenv("OR_FAST_MODEL_LABEL", "Llama 4 Scout (free)")
+        default_factory=lambda: os.getenv("OR_FAST_MODEL_LABEL", "Llama 4 Maverick (free)")
     )
     # Universal fallback — OpenRouter auto-picks best available free model.
     or_auto_model: str = field(
