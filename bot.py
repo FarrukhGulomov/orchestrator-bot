@@ -484,6 +484,18 @@ async def _process_inner(
         chat_id, route.agent.key, route.model, route.request_type.key, route.collaborators,
     )
 
+    if route.execution_chain:
+        logger.info(
+            "chat=%s -> CHAIN %s", chat_id, route.execution_chain
+        )
+        body = await _run_sequential_chain(route, user_text, chat_id)
+        await history.set_last_route(chat_id, route.agent.key, route.request_type.key)
+        footer = await _maybe_create_tickets(route, user_text, body)
+        await _send_long(message, _header(route) + body + footer, reply_mode=reply_mode)
+        if route.request_type.creates_ticket:
+            asyncio.create_task(_maybe_extract_memory(chat_id, user_text, body))
+        return
+
     if route.collaborators:
         n = 1 + len(route.collaborators)
         status = await message.answer(f"🔄 Jamoam bilan ishlayapman... ({n} mutaxassis parallel)")
