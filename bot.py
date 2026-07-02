@@ -12,6 +12,7 @@ Flow per message:
   6. GitHub issue/PR filed for actionable types (if configured).
 
 Commands:
+  /agents — list all available specialists
   /idea /task /bug /improve — force request type
   /kickoff — whole team responds in parallel (PM, BA, Data Analyst, Process Analyst)
   /proposal — deliver as Word + PDF document
@@ -60,11 +61,62 @@ dp = Dispatcher()
 
 TELEGRAM_LIMIT = 4096
 
+# Hard cap on combined user input (typed text + quoted file/reply context)
+# before it reaches the router/agents — protects token budget and free-tier
+# quota from unbounded pasted content.
+MAX_USER_TEXT = 20000
+
 # Default cross-functional team for /kickoff: core BA team
 KICKOFF_ROLES = ["ba", "pm", "data_analyst", "process_analyst"]
 
 # Proactive group mode: tracks last proactive reply time per chat to avoid spam
 _proactive_last: dict[int, float] = {}
+
+# Cost protection: one in-flight LLM pipeline per chat. A second message while
+# the first is still generating gets a polite "wait" instead of spawning more
+# parallel chains/collaborations (each one is multiple LLM calls).
+_in_flight: set[int] = set()
+
+# Grouped agent catalogue — used by /agents (discoverability) and /status.
+# Keys must match agents.AGENTS; anything missing there is skipped gracefully.
+AGENT_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
+    ("BA & Analysis", [
+        ("ba", "biznes talablar, user story, GAP tahlil"),
+        ("data_analyst", "SQL, KPI, ma'lumotlar tahlili"),
+        ("bi_analyst", "Power BI/Tableau dashboard va hisobotlar"),
+        ("process_analyst", "BPMN, AS-IS/TO-BE jarayon xaritalari"),
+        ("financial_analyst", "P&L, moliyaviy model, ROI/NPV"),
+        ("market_analyst", "bozor tahlili, SWOT, raqobat"),
+        ("requirements_engineer", "BRD, FRS, NFR hujjatlar"),
+        ("data_governance", "data quality, MDM, GDPR"),
+    ]),
+    ("Product & Delivery", [
+        ("pm", "roadmap, backlog, prioritizatsiya, OKR"),
+        ("system_analyst", "arxitektura, integratsiya, API kontraktlar"),
+        ("qa", "test strategiya, test case, UAT"),
+        ("project_manager", "WBS, Gantt, RAID, sprint rejalashtirish"),
+        ("tech_consultant", "vendor tanlash, build-vs-buy, texnologiya maslahat"),
+    ]),
+    ("Engineering", [
+        ("backend", "server kod, API, ma'lumotlar bazasi"),
+        ("frontend", "React/Vue komponentlar, UI kod"),
+        ("devops", "Docker, Kubernetes, CI/CD, cloud"),
+        ("product_designer", "UX/UI, wireframe, dizayn tizimi"),
+    ]),
+    ("Maxsus mutaxassislar", [
+        ("translator", "professional tarjima EN ↔ RU ↔ UZ"),
+        ("diagram", "Mermaid BPMN/UML/ER diagrammalar"),
+        ("technical_analyst", "API/Swagger, JSON/XML, log tahlili"),
+        ("jira", "Jira Epic/Story/Task/Bug formatlash"),
+    ]),
+    ("Bank sohasi", [
+        ("credit_conveyor", "kredit konveyer, KYC/AML, qaror mexanizmi"),
+        ("core_banking", "hisoblar, tranzaksiyalar, GL/posting"),
+        ("integration", "REST/SOAP/Kafka/ESB integratsiya"),
+        ("scoring", "kredit skoring, PD/LGD/EAD, fraud"),
+        ("insurance", "kredit sug'urtasi, polis, premiya hisobi"),
+    ]),
+]
 
 _RELEVANCE_SYSTEM = """
 You are a relevance filter for a Senior Business Analyst AI team in a Telegram group.
@@ -218,7 +270,8 @@ def _split(text: str, limit: int) -> list[str]:
             parts.append(line[:limit])
             line = line[limit:]
         if len(current) + len(line) + 1 > limit:
-            parts.append(current)
+            if current:  # never emit an empty chunk (Telegram rejects empty text)
+                parts.append(current)
             current = line
         else:
             current = f"{current}\n{line}" if current else line
@@ -334,6 +387,39 @@ async def _process(
         return
     user_text = user_text.strip()
 
+    # Hard input cap: combined text (message + quoted file + reply context)
+    # can exceed the file extractor's own limit — trim before any LLM call.
+    truncation_notice = ""
+    if len(user_text) > MAX_USER_TEXT:
+        logger.info("chat=%s input truncated from %d to %d chars", chat_id, len(user_text), MAX_USER_TEXT)
+        user_text = user_text[:MAX_USER_TEXT]
+        truncation_notice = (
+            f"\n\n✂️ _Eslatma: matn juda uzun bo'lgani uchun birinchi "
+            f"{MAX_USER_TEXT} belgisi tahlil qilindi._"
+        )
+
+    # Cost protection: don't stack a second multi-call pipeline on top of a
+    # still-running one for the same chat.
+    if chat_id in _in_flight:
+        await message.answer("⏳ Oldingi so'rovingiz hali ishlanmoqda. Javobni kuting, keyin yuboring.")
+        return
+    _in_flight.add(chat_id)
+    try:
+        await _process_inner(message, bot, user_text, forced_type, forced_document, reply_mode, truncation_notice)
+    finally:
+        _in_flight.discard(chat_id)
+
+
+async def _process_inner(
+    message: Message,
+    bot: Bot,
+    user_text: str,
+    forced_type: str | None,
+    forced_document: bool | None,
+    reply_mode: bool,
+    truncation_notice: str,
+) -> None:
+    chat_id = message.chat.id
     await bot.send_chat_action(chat_id, ChatAction.TYPING)
 
     last = await history.get_last_route(chat_id)
@@ -357,30 +443,60 @@ async def _process(
         await _send_document_deliverable(message, route, user_text)
         return
 
+    if route.execution_chain:
+        # Chain has its own log — the generic agent/model line below would be
+        # misleading here (it shows only the primary agent, not the pipeline).
+        logger.info(
+            "chat=%s -> CHAIN %s type=%s",
+            chat_id, route.execution_chain, route.request_type.key,
+        )
+        # Telegram's typing indicator only lasts ~5s; a 2-4 minute chain needs
+        # a visible, updating status message so the user knows work is ongoing.
+        status = await message.answer(
+            f"🔄 Jamoam bilan ishlayapman... (0/{len(route.execution_chain)})"
+        )
+
+        async def _chain_progress(done: int, total: int, agent_name: str) -> None:
+            try:
+                await status.edit_text(
+                    f"🔄 Jamoam bilan ishlayapman... {agent_name} tugatdi ({done}/{total})"
+                )
+            except TelegramBadRequest:
+                pass
+
+        body = await _run_sequential_chain(route, user_text, chat_id, progress=_chain_progress)
+        try:
+            await status.delete()
+        except TelegramBadRequest:
+            pass
+        # Follow-ups should route to the LAST specialist in the chain — its
+        # history holds the final, most complete state of the work.
+        last_agent_key = route.execution_chain[-1]
+        await history.set_last_route(chat_id, last_agent_key, route.request_type.key)
+        footer = await _maybe_create_tickets(route, user_text, body)
+        await _send_long(message, _header(route) + body + footer + truncation_notice, reply_mode=reply_mode)
+        if route.request_type.creates_ticket:
+            asyncio.create_task(_maybe_extract_memory(chat_id, user_text, body))
+        return
+
     logger.info(
         "chat=%s -> agent=%s model=%s type=%s collaborators=%s",
         chat_id, route.agent.key, route.model, route.request_type.key, route.collaborators,
     )
 
-    if route.execution_chain:
-        logger.info(
-            "chat=%s -> CHAIN %s", chat_id, route.execution_chain
-        )
-        body = await _run_sequential_chain(route, user_text, chat_id)
-        await history.set_last_route(chat_id, route.agent.key, route.request_type.key)
-        footer = await _maybe_create_tickets(route, user_text, body)
-        await _send_long(message, _header(route) + body + footer, reply_mode=reply_mode)
-        if route.request_type.creates_ticket:
-            asyncio.create_task(_maybe_extract_memory(chat_id, user_text, body))
-        return
-
     if route.collaborators:
+        n = 1 + len(route.collaborators)
+        status = await message.answer(f"🔄 Jamoam bilan ishlayapman... ({n} mutaxassis parallel)")
         body = await _run_collaborative_answer(route, user_text, chat_id)
+        try:
+            await status.delete()
+        except TelegramBadRequest:
+            pass
         await history.append(chat_id, route.agent.key, "user", user_text)
         await history.append(chat_id, route.agent.key, "assistant", body)
         await history.set_last_route(chat_id, route.agent.key, route.request_type.key)
         footer = await _maybe_create_tickets(route, user_text, body)
-        await _send_long(message, _header(route) + body + footer, reply_mode=reply_mode)
+        await _send_long(message, _header(route) + body + footer + truncation_notice, reply_mode=reply_mode)
         if route.request_type.creates_ticket:
             asyncio.create_task(_maybe_extract_memory(chat_id, user_text, body))
         return
@@ -403,13 +519,13 @@ async def _process(
         msg = str(exc)
         if "529" in msg or "overloaded" in msg.lower() or "503" in msg:
             await message.answer(
-                "⏳ Claude hozir juda band (overloaded). "
+                "⏳ Model hozir juda band (overloaded). "
                 "30 soniya kutib, qaytadan yuboring."
             )
         elif "401" in msg or "authentication" in msg.lower():
-            await message.answer("⚠️ ANTHROPIC_API_KEY noto'g'ri yoki muddati o'tgan.")
+            await message.answer("⚠️ API kaliti noto'g'ri yoki muddati o'tgan (provider sozlamalarini tekshiring).")
         else:
-            await message.answer(f"⚠️ Xatolik yuz berdi: {exc}")
+            await message.answer(f"⚠️ Xatolik yuz berdi: {msg[:300]}")
         return
 
     if not body:
@@ -420,7 +536,7 @@ async def _process(
     await history.set_last_route(chat_id, route.agent.key, route.request_type.key)
 
     footer = await _maybe_create_tickets(route, user_text, body)
-    await _send_long(message, _header(route) + body + footer, reply_mode=reply_mode)
+    await _send_long(message, _header(route) + body + footer + truncation_notice, reply_mode=reply_mode)
     if route.request_type.creates_ticket:
         asyncio.create_task(_maybe_extract_memory(chat_id, user_text, body))
 
@@ -430,6 +546,8 @@ async def _process(
 # --------------------------------------------------------------------------
 async def _kickoff_agent_call(agent_key: str, user_text: str, chat_id: int) -> dict:
     agent: Agent = get_agent(agent_key)
+    # Intentionally always the "task" addendum: kickoff/collaborative calls ask
+    # each specialist for a concrete deliverable regardless of request type.
     system_prompt = await _build_system_prompt(chat_id, agent, REQUEST_TYPES["task"].addendum)
     model, label = model_for(agent, "high")
     try:
@@ -470,7 +588,11 @@ async def _run_collaborative_answer(route: Route, user_text: str, chat_id: int) 
     results = await asyncio.gather(*[_kickoff_agent_call(key, user_text, chat_id) for key in roles])
 
     for r in results:
-        if r["ok"]:
+        # Collaborators keep their own contribution in their thread. The
+        # PRIMARY agent's thread gets the final SYNTHESIZED answer appended by
+        # the caller (_process) — appending its raw draft here too would store
+        # the same user turn twice and pollute its history.
+        if r["ok"] and r["agent"].key != route.agent.key:
             await history.append(chat_id, r["agent"].key, "user", user_text)
             await history.append(chat_id, r["agent"].key, "assistant", r["body"])
 
@@ -504,8 +626,12 @@ async def _run_collaborative_answer(route: Route, user_text: str, chat_id: int) 
     return body
 
 
-async def _run_sequential_chain(route: Route, user_text: str, chat_id: int) -> str:
-    """Run agents in sequence, each specialist building on the previous output."""
+async def _run_sequential_chain(route: Route, user_text: str, chat_id: int, progress=None) -> str:
+    """Run agents in sequence, each specialist building on the previous output.
+
+    `progress` is an optional async callback (done, total, agent_display_name)
+    invoked after each agent finishes — used to keep the user informed during
+    multi-minute chains (Telegram's typing indicator expires after ~5s)."""
     chain = route.execution_chain
     outputs: list[tuple[str, str]] = []
 
@@ -539,6 +665,12 @@ async def _run_sequential_chain(route: Route, user_text: str, chat_id: int) -> s
         outputs.append((agent.display_name, body))
         await history.append(chat_id, agent_key, "user", user_text)
         await history.append(chat_id, agent_key, "assistant", body)
+
+        if progress is not None:
+            try:
+                await progress(len(outputs), len(chain), agent.display_name)
+            except Exception:  # noqa: BLE001 — a status-update hiccup must not kill the chain
+                logger.exception("Chain progress callback failed (non-fatal)")
 
     if not outputs:
         return "(zanjir bo'sh)"
@@ -592,9 +724,17 @@ async def cmd_kickoff(message: Message, bot: Bot, command: CommandObject) -> Non
         return
 
     await bot.send_chat_action(chat_id, ChatAction.TYPING)
+    # Long parallel run — typing indicator expires in ~5s, keep a visible status.
+    status = await message.answer(
+        f"🔄 Jamoa ishlayapti ({len(KICKOFF_ROLES)} mutaxassis parallel)..."
+    )
     results = await asyncio.gather(
         *[_kickoff_agent_call(key, user_text, chat_id) for key in KICKOFF_ROLES]
     )
+    try:
+        await status.delete()
+    except TelegramBadRequest:
+        pass
 
     parts = [_kickoff_header(results)]
     for r in results:
@@ -745,10 +885,14 @@ async def cmd_start(message: Message) -> None:
     await message.answer(
         "Salom! Senior BA AI jamoasi ishga tayyor.\n\n"
         "Nima kerak bo'lsa shunchaki yozing — BA, Data/BI, Financial, Market, "
-        "Process, Engineering va boshqa mutaxassislarga o'zim yo'naltiraman.\n\n"
+        "Process, Engineering, tarjima, diagramma, Jira va bank sohasi "
+        "(kredit konveyer, core banking, skoring, integratsiya, sug'urta) "
+        "mutaxassislariga o'zim yo'naltiraman.\n\n"
         "Asosiy buyruqlar:\n"
+        "/agents — barcha mutaxassislar ro'yxati\n"
         "/kickoff — jamoa bilan birgalikda (BA + PM + Data + Process)\n"
         "/proposal — Word + PDF hujjat tayyorlash\n"
+        "/idea /task /bug /improve — so'rov turini majburlash\n"
         "/remember <fakt> — loyiha ma'lumotini yodlash\n"
         "/memory — yodlangan faktlar\n"
         "/reset — suhbatni tozalash\n"
@@ -757,6 +901,37 @@ async def cmd_start(message: Message) -> None:
         f"`chat_id: {message.chat.id}`",
         parse_mode="Markdown",
     )
+
+
+@dp.message(Command("agents", "team"))
+async def cmd_agents(message: Message) -> None:
+    """Discoverability: list every specialist so users know what to ask for."""
+    if not _is_allowed(message.chat.id):
+        return
+    from agents import AGENTS
+
+    lines = ["👥 **Jamoa — barcha mutaxassislar:**"]
+    listed: set[str] = set()
+    for group_name, members in AGENT_GROUPS:
+        rows = []
+        for key, blurb in members:
+            agent = AGENTS.get(key)
+            if agent is None:
+                continue
+            listed.add(key)
+            rows.append(f"• {agent.display_name} — {blurb}")
+        if rows:
+            lines.append(f"\n**{group_name}:**")
+            lines.extend(rows)
+    # Future-proofing: any registered agent not in the catalogue still shows up.
+    extra = [a for k, a in AGENTS.items() if k not in listed]
+    if extra:
+        lines.append("\n**Boshqa:**")
+        lines.extend(f"• {a.display_name}" for a in extra)
+    lines.append(
+        "\nShunchaki savolingizni yozing — o'zim to'g'ri mutaxassisga yo'naltiraman."
+    )
+    await _send_long(message, "\n".join(lines))
 
 
 @dp.message(Command("reset"))
@@ -822,13 +997,21 @@ async def cmd_status(message: Message) -> None:
 
     from agents import AGENTS
     lines.append(f"\n**Faol agentlar ({len(AGENTS)} ta):**")
-    for key, agent in AGENTS.items():
-        lines.append(f"  - {agent.display_name}")
+    listed: set[str] = set()
+    for group_name, members in AGENT_GROUPS:
+        names = [AGENTS[k].display_name for k, _ in members if k in AGENTS]
+        listed.update(k for k, _ in members if k in AGENTS)
+        if names:
+            lines.append(f"  _{group_name}:_ " + ", ".join(names))
+    extra_names = [a.display_name for k, a in AGENTS.items() if k not in listed]
+    if extra_names:
+        lines.append("  _Boshqa:_ " + ", ".join(extra_names))
+    lines.append("\nTo'liq ro'yxat va tavsiflar: /agents")
 
     await _send_long(message, "\n".join(lines))
 
 
-@dp.message(Command("loops", "loops"))
+@dp.message(Command("loops"))
 async def cmd_loops(message: Message) -> None:
     await cmd_status(message)
 
@@ -1031,6 +1214,27 @@ async def handle_text(message: Message, bot: Bot) -> None:
     await _process(message, bot, user_text, forced_type=None, reply_mode=True)
 
 
+# Registered LAST so every known Command() handler above matches first:
+# typo'd / unknown commands get a help pointer instead of dead silence.
+@dp.message(F.text.startswith("/"))
+async def handle_unknown_command(message: Message, bot: Bot) -> None:
+    if not _is_allowed(message.chat.id):
+        return
+    cmd = (message.text or "").split()[0]
+    if message.chat.type != "private":
+        # In groups, only react if the command explicitly targets THIS bot —
+        # otherwise we'd answer other bots' commands with noise.
+        if "@" not in cmd:
+            return
+        me = await bot.me()
+        if cmd.rpartition("@")[2].lower() != (me.username or "").lower():
+            return
+    await message.answer(
+        f"Noma'lum buyruq: {cmd.split('@')[0]}\n"
+        "Buyruqlar ro'yxati: /help · Mutaxassislar: /agents"
+    )
+
+
 # --------------------------------------------------------------------------
 # Bootstrap
 # --------------------------------------------------------------------------
@@ -1040,8 +1244,15 @@ async def main() -> None:
         logger.warning("CONFIG: %s", p)
 
     if settings.redis_enabled:
-        if redis_client.get_client() is not None:
-            logger.info("Redis: persistent storage ENABLED.")
+        client = redis_client.get_client()
+        if client is not None:
+            # from_url() is lazy — actually verify connectivity so the startup
+            # log tells the truth about whether persistence is working.
+            try:
+                await client.ping()
+                logger.info("Redis: persistent storage ENABLED (ping OK).")
+            except Exception:  # noqa: BLE001
+                logger.warning("Redis URL set but PING failed — history/memory calls will fall back to in-memory.")
         else:
             logger.warning("Redis URL set but client failed — falling back to in-memory.")
     else:
