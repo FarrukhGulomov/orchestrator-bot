@@ -33,6 +33,7 @@ import logging
 from datetime import date
 
 from agents import Agent
+from config import settings
 from llm_clients import claude_generate_json
 from router import model_for
 
@@ -72,11 +73,37 @@ _FOOTER_TEXT = "Master Orchestrator AI Team tomonidan tayyorlandi"
 
 async def generate_proposal_content(agent: Agent, user_text: str) -> dict:
     system_prompt = agent.system + "\n" + _SCHEMA_INSTRUCTION
+    # Use the agent's own MAIN model with a full token budget — the default
+    # claude_generate_json settings (fast model, 512 tokens) are for routing
+    # and would truncate a real document's JSON mid-object.
+    model, _label = model_for(agent, "high")
     raw = await claude_generate_json(
         system_prompt,
         [{"role": "user", "content": user_text}],
+        model=model,
+        max_tokens=settings.max_output_tokens,
     )
-    data = json.loads(raw)
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise ValueError(f"expected JSON object, got {type(data).__name__}")
+    except (json.JSONDecodeError, ValueError) as exc:
+        # Model returned malformed/truncated JSON — degrade gracefully instead
+        # of crashing the whole /proposal flow with an uncaught exception.
+        logger.warning(
+            "Proposal JSON parse failed (%s); raw head: %.200s", exc, raw
+        )
+        data = {
+            "title": "Taklif",
+            "subtitle": None,
+            "intro": raw.strip()[:3000] if raw.strip() else (
+                "Hujjat tarkibini tayyorlab bo'lmadi. Iltimos, so'rovni qisqartirib "
+                "yoki aniqlashtirib qaytadan yuboring."
+            ),
+            "sections": [],
+            "table": None,
+            "closing": "",
+        }
     data.setdefault("title", "Taklif")
     data.setdefault("subtitle", None)
     data.setdefault("intro", "")

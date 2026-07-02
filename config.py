@@ -5,7 +5,9 @@ All secrets are read from environment variables (see .env.example).
 Only Claude (Anthropic) is used — no other AI provider keys required.
 """
 
+import logging
 import os
+import re
 from dataclasses import dataclass, field
 
 try:
@@ -13,6 +15,24 @@ try:
     load_dotenv()
 except ImportError:
     pass
+
+_logger = logging.getLogger(__name__)
+
+# Telegram bot tokens look like "<numeric id>:<35+ chars of [A-Za-z0-9_-]>".
+_BOT_TOKEN_RE = re.compile(r"^\d+:[\w-]{35,}$")
+
+
+def _int_env(name: str, default: int) -> int:
+    """Read an int env var, falling back to default (with a warning) on junk
+    values instead of crashing the whole process at import time."""
+    raw = os.getenv(name, "")
+    if not raw.strip():
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        _logger.warning("Env %s=%r is not a valid integer, using default %d", name, raw, default)
+        return default
 
 
 def _csv_ints(raw: str) -> set[int]:
@@ -111,20 +131,20 @@ class Settings:
 
     # Max tokens for agent replies. Bump if long deliverables get cut off.
     max_output_tokens: int = field(
-        default_factory=lambda: int(os.getenv("MAX_OUTPUT_TOKENS", "8192"))
+        default_factory=lambda: _int_env("MAX_OUTPUT_TOKENS", 8192)
     )
 
     # Reject inbound files larger than this (Telegram Bot API limit is ~20 MB).
     max_file_size_mb: int = field(
-        default_factory=lambda: int(os.getenv("MAX_FILE_SIZE_MB", "20"))
+        default_factory=lambda: _int_env("MAX_FILE_SIZE_MB", 20)
     )
 
     # --- Behaviour ---------------------------------------------------------
     history_turns: int = field(
-        default_factory=lambda: int(os.getenv("HISTORY_TURNS", "10"))
+        default_factory=lambda: _int_env("HISTORY_TURNS", 10)
     )
     request_timeout: int = field(
-        default_factory=lambda: int(os.getenv("REQUEST_TIMEOUT", "90"))
+        default_factory=lambda: _int_env("REQUEST_TIMEOUT", 90)
     )
     # In groups: only respond when explicitly @mentioned or replied to.
     require_mention_in_groups: bool = field(
@@ -137,7 +157,7 @@ class Settings:
         default_factory=lambda: os.getenv("PROACTIVE_IN_GROUPS", "false").lower() == "true"
     )
     proactive_cooldown_seconds: int = field(
-        default_factory=lambda: int(os.getenv("PROACTIVE_COOLDOWN_SECONDS", "45"))
+        default_factory=lambda: _int_env("PROACTIVE_COOLDOWN_SECONDS", 45)
     )
 
     # --- Output metadata header --------------------------------------------
@@ -158,7 +178,7 @@ class Settings:
     # --- Persistent storage (Redis) ----------------------------------------
     redis_url: str = field(default_factory=lambda: os.getenv("REDIS_URL", ""))
     redis_history_ttl_seconds: int = field(
-        default_factory=lambda: int(os.getenv("REDIS_HISTORY_TTL_SECONDS", str(60 * 60 * 24 * 30)))
+        default_factory=lambda: _int_env("REDIS_HISTORY_TTL_SECONDS", 60 * 60 * 24 * 30)
     )
 
     # --- Railway integration (optional, read-only) -------------------------
@@ -190,6 +210,11 @@ class Settings:
         problems = []
         if not self.bot_token:
             problems.append("BOT_TOKEN is not set.")
+        elif not _BOT_TOKEN_RE.match(self.bot_token):
+            problems.append(
+                "BOT_TOKEN does not look like a valid Telegram bot token "
+                "(expected '<digits>:<35+ chars>' from @BotFather)."
+            )
         if self.provider == "none":
             problems.append(
                 "No AI provider configured. Set OPENROUTER_API_KEY (free) "

@@ -18,6 +18,7 @@ Retry logic: both providers are retried up to 3x with exponential backoff
 
 import asyncio
 import base64
+import io
 import logging
 import time
 
@@ -104,6 +105,25 @@ def _or_sync(model: str, system: str, messages: list[dict], temperature: float, 
     raise last_exc  # type: ignore[misc]
 
 
+def _extract_pdf_text(data: bytes) -> str:
+    """Best-effort local PDF text extraction (used when the provider has no
+    native PDF understanding, i.e. OpenRouter). Returns "" for scans/images."""
+    try:
+        from pypdf import PdfReader
+    except Exception:  # noqa: BLE001 — missing/broken optional dep must not crash
+        logger.warning("pypdf unavailable — cannot extract PDF text locally")
+        return ""
+    try:
+        reader = PdfReader(io.BytesIO(data))
+        pages = []
+        for page in reader.pages[:50]:
+            pages.append(page.extract_text() or "")
+        return "\n".join(pages).strip()
+    except Exception:  # noqa: BLE001 — corrupt PDF must not crash the caller
+        logger.exception("Local PDF text extraction failed")
+        return ""
+
+
 def _or_vision_sync(data: bytes, mime_type: str, instruction: str) -> str:
     client = _get_or_client()
     vision_model = settings.or_main_model
@@ -114,20 +134,52 @@ def _or_vision_sync(data: bytes, mime_type: str, instruction: str) -> str:
             {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64}"}},
             {"type": "text", "text": instruction},
         ]
+    elif mime_type == "application/pdf":
+        # OpenRouter chat models have no native PDF input — extract the text
+        # locally and analyse that instead of silently sending a placeholder.
+        text = _extract_pdf_text(data)
+        if not text:
+            raise ValueError(
+                "Bu PDF matnini ajratib bo'lmadi (skan yoki rasm bo'lishi mumkin). "
+                "PDF skan tahlili uchun Claude provider (ANTHROPIC_API_KEY) kerak."
+            )
+        return _or_sync(
+            vision_model,
+            "You are a senior business analyst. Analyse files thoroughly.",
+            [{"role": "user", "content": f"{instruction}\n\n--- PDF content ---\n{text[:30000]}"}],
+            0.2,
+            4096,
+        )
     else:
-        # For PDFs and other docs, send as text extraction instruction
-        content = [{"type": "text", "text": f"{instruction}\n\n[File content in base64 — {mime_type}]"}]
+        raise ValueError(
+            f"OpenRouter provider bu fayl turini ({mime_type}) tahlil qila olmaydi. "
+            "Rasm yoki PDF yuboring, yoki Claude provider (ANTHROPIC_API_KEY) sozlang."
+        )
 
-    resp = client.chat.completions.create(
-        model=vision_model,
-        messages=[
-            {"role": "system", "content": "You are a senior business analyst. Analyse files thoroughly."},
-            {"role": "user", "content": content},
-        ],
-        temperature=0.2,
-        max_tokens=4096,
-    )
-    return (resp.choices[0].message.content or "").strip()
+    last_exc: Exception | None = None
+    for attempt in range(_MAX_RETRIES):
+        try:
+            resp = client.chat.completions.create(
+                model=vision_model,
+                messages=[
+                    {"role": "system", "content": "You are a senior business analyst. Analyse files thoroughly."},
+                    {"role": "user", "content": content},
+                ],
+                temperature=0.2,
+                max_tokens=4096,
+            )
+            return (resp.choices[0].message.content or "").strip()
+        except Exception as exc:
+            last_exc = exc
+            if _is_retryable(exc) and attempt < _MAX_RETRIES - 1:
+                delay = _RETRY_BASE * (2 ** attempt)
+                logger.warning("OpenRouter vision overloaded (attempt %d), retry in %ds",
+                               attempt + 1, delay)
+                time.sleep(delay)
+                continue
+            raise
+
+    raise last_exc  # type: ignore[misc]
 
 
 # --------------------------------------------------------------------------
@@ -177,13 +229,26 @@ def _claude_vision_sync(data: bytes, mime_type: str, instruction: str) -> str:
             }},
             {"type": "text", "text": instruction},
         ]
-    resp = client.messages.create(
-        model=settings.claude_model,
-        system="You are a senior business analyst. Extract and summarize the key information from this file.",
-        messages=[{"role": "user", "content": content}],
-        temperature=0.2, max_tokens=4096,
-    )
-    return (resp.content[0].text if resp.content else "").strip()
+    last_exc: Exception | None = None
+    for attempt in range(_MAX_RETRIES):
+        try:
+            resp = client.messages.create(
+                model=settings.claude_model,
+                system="You are a senior business analyst. Extract and summarize the key information from this file.",
+                messages=[{"role": "user", "content": content}],
+                temperature=0.2, max_tokens=4096,
+            )
+            return (resp.content[0].text if resp.content else "").strip()
+        except Exception as exc:
+            last_exc = exc
+            if _is_retryable(exc) and attempt < _MAX_RETRIES - 1:
+                delay = _RETRY_BASE * (2 ** attempt)
+                logger.warning("Claude vision overloaded (attempt %d), retry in %ds", attempt + 1, delay)
+                time.sleep(delay)
+                continue
+            raise
+
+    raise last_exc  # type: ignore[misc]
 
 
 # --------------------------------------------------------------------------
@@ -229,16 +294,7 @@ async def claude_describe_file(data: bytes, mime_type: str, instruction: str) ->
     return await asyncio.to_thread(_claude_vision_sync, data, mime_type, instruction)
 
 
-def _or_json_sync(system: str, messages: list[dict]) -> str:
-    client = _get_or_client()
-    full = [{"role": "system", "content": system + "\nRespond with ONLY valid JSON, no markdown, no prose."}] + messages
-    resp = client.chat.completions.create(
-        model=settings.or_fast_model,
-        messages=full,
-        temperature=0.0,
-        max_tokens=512,
-    )
-    raw = (resp.choices[0].message.content or "").strip()
+def _strip_json_fences(raw: str) -> str:
     # Strip markdown code fences if model wraps JSON in ```json ... ```
     if raw.startswith("```"):
         raw = raw.split("```")[1]
@@ -247,19 +303,77 @@ def _or_json_sync(system: str, messages: list[dict]) -> str:
     return raw.strip()
 
 
-def _claude_json_sync(system: str, messages: list[dict]) -> str:
+def _or_json_sync(system: str, messages: list[dict], model: str, max_tokens: int) -> str:
+    client = _get_or_client()
+    full = [{"role": "system", "content": system + "\nRespond with ONLY valid JSON, no markdown, no prose."}] + messages
+    last_exc: Exception | None = None
+
+    for attempt in range(_MAX_RETRIES):
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=full,
+                temperature=0.0,
+                max_tokens=max_tokens,
+            )
+            raw = (resp.choices[0].message.content or "").strip()
+            return _strip_json_fences(raw)
+        except Exception as exc:
+            last_exc = exc
+            if _is_model_unavailable(exc) and model != settings.or_auto_model:
+                logger.warning("OpenRouter JSON model unavailable (%s), switching to auto fallback", model)
+                model = settings.or_auto_model
+                continue
+            if _is_retryable(exc) and attempt < _MAX_RETRIES - 1:
+                delay = _RETRY_BASE * (2 ** attempt)
+                logger.warning("OpenRouter JSON call overloaded (attempt %d), retry in %ds: %s",
+                               attempt + 1, delay, str(exc)[:100])
+                time.sleep(delay)
+                if attempt == 1 and model != settings.or_auto_model:
+                    model = settings.or_auto_model
+                continue
+            raise
+
+    raise last_exc  # type: ignore[misc]
+
+
+def _claude_json_sync(system: str, messages: list[dict], model: str, max_tokens: int) -> str:
     client = _get_claude_client()
     msgs = list(messages) + [{"role": "assistant", "content": "{"}]
-    resp = client.messages.create(
-        model=settings.claude_fast_model, system=system,
-        messages=msgs, temperature=0.0, max_tokens=512,
-    )
-    raw = (resp.content[0].text if resp.content else "").strip()
-    return "{" + raw if not raw.startswith("{") else raw
+    last_exc: Exception | None = None
+
+    for attempt in range(_MAX_RETRIES):
+        try:
+            resp = client.messages.create(
+                model=model, system=system,
+                messages=msgs, temperature=0.0, max_tokens=max_tokens,
+            )
+            raw = (resp.content[0].text if resp.content else "").strip()
+            return "{" + raw if not raw.startswith("{") else raw
+        except Exception as exc:
+            last_exc = exc
+            if _is_retryable(exc) and attempt < _MAX_RETRIES - 1:
+                delay = _RETRY_BASE * (2 ** attempt)
+                logger.warning("Claude JSON call overloaded (attempt %d), retry in %ds", attempt + 1, delay)
+                time.sleep(delay)
+                continue
+            raise
+
+    raise last_exc  # type: ignore[misc]
 
 
-async def claude_generate_json(system: str, messages: list[dict]) -> str:
-    """Structured JSON output for router classification."""
+async def claude_generate_json(
+    system: str,
+    messages: list[dict],
+    model: str | None = None,
+    max_tokens: int = 512,
+) -> str:
+    """Structured JSON output. Defaults to the fast model with a small token
+    budget (router classification). Callers producing large JSON payloads
+    (e.g. document generation) MUST pass a bigger max_tokens — otherwise the
+    JSON gets truncated mid-object and fails to parse."""
     if settings.provider == "openrouter":
-        return await asyncio.to_thread(_or_json_sync, system, messages)
-    return await asyncio.to_thread(_claude_json_sync, system, messages)
+        m = model or settings.or_fast_model
+        return await asyncio.to_thread(_or_json_sync, system, messages, m, max_tokens)
+    m = model or settings.claude_fast_model
+    return await asyncio.to_thread(_claude_json_sync, system, messages, m, max_tokens)

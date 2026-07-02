@@ -35,6 +35,28 @@ MAX_FACTS = 40
 _store: dict[int, list[str]] = {}
 
 
+def _words(text: str) -> set[str]:
+    return {w for w in text.lower().split() if w}
+
+
+def _is_near_duplicate(fact: str, existing: list[str]) -> bool:
+    """True if `fact` is an exact match OR shares >= 80% of its words with an
+    already-stored fact — stops trivially-reworded duplicates accumulating."""
+    if fact in existing:
+        return True
+    new_words = _words(fact)
+    if not new_words:
+        return True
+    for old in existing:
+        old_words = _words(old)
+        if not old_words:
+            continue
+        overlap = len(new_words & old_words)
+        if overlap / len(new_words) >= 0.8 or overlap / len(old_words) >= 0.8:
+            return True
+    return False
+
+
 def _mem_key(chat_id: int) -> str:
     return f"mem:{chat_id}"
 
@@ -59,7 +81,7 @@ async def add_memory(chat_id: int, fact: str) -> bool:
     client = redis_client.get_client()
     if client is None:
         facts = _store.setdefault(chat_id, [])
-        if fact in facts:
+        if _is_near_duplicate(fact, facts):
             return False
         facts.append(fact)
         if len(facts) > MAX_FACTS:
@@ -68,7 +90,7 @@ async def add_memory(chat_id: int, fact: str) -> bool:
 
     try:
         existing = await client.lrange(_mem_key(chat_id), 0, -1)
-        if fact in existing:
+        if _is_near_duplicate(fact, existing):
             return False
         async with client.pipeline(transaction=True) as pipe:
             pipe.rpush(_mem_key(chat_id), fact)
