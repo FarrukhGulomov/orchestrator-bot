@@ -1,19 +1,18 @@
 """
-Unified LLM client — OpenRouter (free) or Claude (Anthropic).
+Unified LLM client — OpenRouter (free), Claude (Anthropic), or Hybrid.
 
-Provider priority (checked at runtime):
-  1. OPENROUTER_API_KEY is set → use OpenRouter free models (default)
-  2. ANTHROPIC_API_KEY is set  → use Claude (Sonnet/Haiku)
-  3. Neither set               → startup validation warns, calls will fail
+Provider modes (auto-detected from config.settings.provider):
+  hybrid     — BOTH keys set: fast/routing → OpenRouter, main/vision → Claude
+  openrouter — Only OR key: all calls use free models
+  claude     — Only Anthropic key: all calls use Claude Sonnet/Haiku
 
-Public API (same regardless of provider):
-  claude_generate()      — main model, deep analysis / agent responses
-  claude_generate_fast() — fast model, routing / classification
-  claude_describe_file() — vision / PDF file understanding
-  claude_generate_json() — structured JSON output
+Public API (provider-transparent):
+  claude_generate()      — main model: agent responses, deep analysis
+  claude_generate_fast() — fast model: routing, classification, memory
+  claude_describe_file() — vision/PDF understanding
+  claude_generate_json() — structured JSON (router, docgen)
 
-Retry logic: both providers are retried up to 3x with exponential backoff
-(2s → 4s → 8s) on overload/503/429 errors.
+Retry logic: 3x exponential backoff (2s → 4s → 8s) on 503/429/529.
 """
 
 import asyncio
@@ -260,12 +259,17 @@ async def claude_generate(
     temperature: float = 0.4,
     model: str | None = None,
 ) -> str:
-    """Main model response. Dispatches to OpenRouter or Claude."""
+    """Main model: agent responses, deep analysis, document generation.
+
+    hybrid/claude → Claude Sonnet (quality)
+    openrouter    → OpenRouter main model (free)
+    """
     if settings.provider == "openrouter":
         m = model or settings.or_main_model
         return await asyncio.to_thread(
             _or_sync, m, system, messages, temperature, settings.max_output_tokens
         )
+    # hybrid or claude: use Claude main model
     m = model or settings.claude_model
     return await asyncio.to_thread(
         _claude_sync, m, system, messages, temperature, settings.max_output_tokens
@@ -277,8 +281,12 @@ async def claude_generate_fast(
     messages: list[dict],
     temperature: float = 0.0,
 ) -> str:
-    """Fast model for routing/classification."""
-    if settings.provider == "openrouter":
+    """Fast model: routing, classification, memory extraction, relevance checks.
+
+    hybrid/openrouter → OpenRouter fast free model
+    claude            → Claude Haiku
+    """
+    if settings.provider in ("openrouter", "hybrid"):
         return await asyncio.to_thread(
             _or_sync, settings.or_fast_model, system, messages, temperature, 1024
         )
@@ -288,10 +296,14 @@ async def claude_generate_fast(
 
 
 async def claude_describe_file(data: bytes, mime_type: str, instruction: str) -> str:
-    """Vision/PDF file understanding."""
-    if settings.provider == "openrouter":
-        return await asyncio.to_thread(_or_vision_sync, data, mime_type, instruction)
-    return await asyncio.to_thread(_claude_vision_sync, data, mime_type, instruction)
+    """Vision/PDF file understanding.
+
+    hybrid/claude → Claude (native PDF + vision, better accuracy)
+    openrouter    → OpenRouter vision model (images) + pypdf (PDFs)
+    """
+    if settings.provider in ("claude", "hybrid"):
+        return await asyncio.to_thread(_claude_vision_sync, data, mime_type, instruction)
+    return await asyncio.to_thread(_or_vision_sync, data, mime_type, instruction)
 
 
 def _strip_json_fences(raw: str) -> str:
@@ -368,11 +380,15 @@ async def claude_generate_json(
     model: str | None = None,
     max_tokens: int = 512,
 ) -> str:
-    """Structured JSON output. Defaults to the fast model with a small token
-    budget (router classification). Callers producing large JSON payloads
-    (e.g. document generation) MUST pass a bigger max_tokens — otherwise the
-    JSON gets truncated mid-object and fails to parse."""
-    if settings.provider == "openrouter":
+    """Structured JSON output.
+
+    Defaults to fast model + small token budget (router classification).
+    Pass larger max_tokens for document generation to avoid mid-JSON truncation.
+
+    hybrid/openrouter → OpenRouter fast free model (routing is free)
+    claude            → Claude Haiku
+    """
+    if settings.provider in ("openrouter", "hybrid"):
         m = model or settings.or_fast_model
         return await asyncio.to_thread(_or_json_sync, system, messages, m, max_tokens)
     m = model or settings.claude_fast_model
