@@ -16,6 +16,8 @@ Commands:
   /idea /task /bug /improve — force request type
   /kickoff — whole team responds in parallel (PM, BA, Data Analyst, Process Analyst)
   /proposal — deliver as Word + PDF document
+  /addtask — add a daily task/reminder (also auto-detected from plain messages)
+  /tasks — list active tasks; /done /canceltask — mark complete/cancelled
   /remember /memory /forget — project memory management
   /logs — Railway deployment log analysis (if configured)
   /readfile — pull current file from GitHub into conversation
@@ -36,7 +38,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatAction
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject
-from aiogram.types import BufferedInputFile, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
 import document_generation as docgen
 import github_integration
@@ -44,6 +46,8 @@ import history
 import memory
 import railway_integration
 import redis_client
+import task_assistant
+import tasks
 from agents import Agent, TEAM_MEMORY_HEADER, get_agent
 from config import settings
 from file_processing import SUPPORTED_SUMMARY, extract, transcribe_audio
@@ -904,6 +908,8 @@ async def cmd_start(message: Message) -> None:
         "/agents — barcha mutaxassislar ro'yxati\n"
         "/kickoff — jamoa bilan birgalikda (BA + PM + Data + Process)\n"
         "/proposal — Word + PDF hujjat tayyorlash\n"
+        "/addtask — vazifa/eslatma qo'shish (oddiy yozuvdan ham avtomatik aniqlayman)\n"
+        "/tasks — faol vazifalar ro'yxati (/done, /canceltask bilan boshqarish)\n"
         "/idea /task /bug /improve — so'rov turini majburlash\n"
         "/remember <fakt> — loyiha ma'lumotini yodlash\n"
         "/memory — yodlangan faktlar\n"
@@ -1151,6 +1157,154 @@ async def cmd_readfile(message: Message, bot: Bot, command: CommandObject) -> No
 
 
 # --------------------------------------------------------------------------
+# Daily task reminders
+# --------------------------------------------------------------------------
+@dp.message(Command("addtask"))
+async def cmd_addtask(message: Message, command: CommandObject) -> None:
+    chat_id = message.chat.id
+    if not _is_allowed(chat_id):
+        return
+    text = (command.args or "").strip()
+    if not text:
+        await message.answer(
+            "Vazifa matnini yozing, masalan:\n"
+            "/addtask Ertaga soat 15:00 gacha mijoz uchun hisobot tayyorlash"
+        )
+        return
+
+    status = await message.answer("🧠 Vazifani tahlil qilyapman...")
+    uid = message.from_user.id if message.from_user else 0
+    task = await task_assistant.build_task_from_text(chat_id, uid, text)
+    if task is None:
+        await status.edit_text(
+            "⚠️ Vazifani aniqlab bo'lmadi. Nima va qachon kerakligini aniqroq yozib ko'ring."
+        )
+        return
+    try:
+        await status.delete()
+    except TelegramBadRequest:
+        pass
+    await message.answer(
+        task_assistant.format_confirmation(task),
+        reply_markup=task_assistant.confirmation_keyboard(task.id),
+    )
+
+
+@dp.message(Command("tasks", "todo"))
+async def cmd_tasks(message: Message) -> None:
+    chat_id = message.chat.id
+    if not _is_allowed(chat_id):
+        return
+    pending = await tasks.list_tasks(chat_id, {"pending"})
+    if not pending:
+        await message.answer("Hozircha faol vazifalar yo'q. /addtask bilan qo'shing.")
+        return
+    lines = ["📋 **Faol vazifalar:**\n"]
+    lines.extend(task_assistant.format_task_line(t) for t in pending[:20])
+    lines.append("\n✅ Bajarish: /done <id>   ❌ Bekor qilish: /canceltask <id>")
+    await _send_long(message, "\n".join(lines))
+
+
+@dp.message(Command("done"))
+async def cmd_done(message: Message, command: CommandObject) -> None:
+    if not _is_allowed(message.chat.id):
+        return
+    task_id = (command.args or "").strip().split()[0] if command.args else ""
+    if not task_id:
+        await message.answer("Vazifa ID sini yozing: /done <id>  (ID lar /tasks da ko'rsatilgan)")
+        return
+    task = await tasks.set_status(task_id, "done")
+    if task is None or task.chat_id != message.chat.id:
+        await message.answer("⚠️ Bunday vazifa topilmadi.")
+        return
+    await message.answer(f"✅ Bajarildi deb belgilandi: {task.title}")
+
+
+@dp.message(Command("canceltask"))
+async def cmd_canceltask(message: Message, command: CommandObject) -> None:
+    if not _is_allowed(message.chat.id):
+        return
+    task_id = (command.args or "").strip().split()[0] if command.args else ""
+    if not task_id:
+        await message.answer("Vazifa ID sini yozing: /canceltask <id>")
+        return
+    task = await tasks.set_status(task_id, "cancelled")
+    if task is None or task.chat_id != message.chat.id:
+        await message.answer("⚠️ Bunday vazifa topilmadi.")
+        return
+    await message.answer(f"❌ Bekor qilindi: {task.title}")
+
+
+@dp.callback_query(F.data.startswith("tsk:"))
+async def handle_task_callback(callback: CallbackQuery, bot: Bot) -> None:
+    if not callback.data or not callback.message:
+        await callback.answer()
+        return
+    chat_id = callback.message.chat.id
+    if not _is_allowed(chat_id):
+        await callback.answer()
+        return
+    try:
+        _, action, task_id = callback.data.split(":", 2)
+    except ValueError:
+        await callback.answer()
+        return
+
+    task = await tasks.get_task(task_id)
+    if task is None or task.chat_id != chat_id:
+        await callback.answer("Vazifa topilmadi (eskirgan bo'lishi mumkin).", show_alert=True)
+        return
+
+    # Buttons stay on the sent message after it's resolved (Telegram keeps a
+    # message's reply_markup unless a new one is explicitly set), so guard
+    # every action except "done"/"cancel" themselves against a task that was
+    # already resolved by an earlier click.
+    if action in ("s", "w") and task.status != "pending":
+        await callback.answer("Bu vazifa allaqachon yakunlangan.", show_alert=True)
+        return
+
+    if action == "d":  # done
+        await tasks.set_status(task_id, "done")
+        await callback.answer("Bajarildi deb belgilandi ✅")
+        try:
+            await callback.message.edit_text(f"✅ Bajarildi: {task.title}", reply_markup=None)
+        except Exception:  # noqa: BLE001 — best-effort cosmetic edit (stale/inaccessible message, etc.)
+            pass
+        return
+
+    if action == "x":  # cancel
+        await tasks.set_status(task_id, "cancelled")
+        await callback.answer("Bekor qilindi")
+        try:
+            await callback.message.edit_text(f"❌ Bekor qilindi: {task.title}", reply_markup=None)
+        except Exception:  # noqa: BLE001 — best-effort cosmetic edit (stale/inaccessible message, etc.)
+            pass
+        return
+
+    if action == "s":  # snooze 30 min
+        await tasks.snooze(task_id, 30)
+        await callback.answer("30 daqiqaga kechiktirildi ⏰")
+        try:
+            await callback.message.edit_reply_markup(reply_markup=task_assistant.reminder_keyboard(task_id))
+        except Exception:  # noqa: BLE001 — best-effort cosmetic edit (stale/inaccessible message, etc.)
+            pass
+        return
+
+    if action == "w":  # work / discuss — only runs after this explicit button click
+        await callback.answer("Boshladim 🤖")
+        agent_hint = f" (mutaxassis: {task.agent_key})" if task.agent_key else ""
+        prompt = (
+            f"Quyidagi vazifani bajarishda yordam bering{agent_hint}:\n"
+            f"Sarlavha: {task.title}\n"
+            f"Tafsilot: {task.description or '—'}"
+        )
+        await _process(callback.message, bot, prompt, forced_type="task")
+        return
+
+    await callback.answer()
+
+
+# --------------------------------------------------------------------------
 # Free-text handler
 # --------------------------------------------------------------------------
 @dp.message(F.text & ~F.text.startswith("/"))
@@ -1207,6 +1361,18 @@ async def handle_text(message: Message, bot: Bot) -> None:
                     user_text = f'[Iqtibos: "{quoted[:600]}"]\n{user_text}'
 
     if is_direct:
+        # Natural-language task/reminder detection — private chats only (avoids
+        # misfiring in group business discussions). Cheap keyword pre-filter
+        # first; the LLM call itself makes the real is_task decision.
+        if message.chat.type == "private" and task_assistant.looks_like_task(user_text):
+            uid = message.from_user.id if message.from_user else 0
+            task = await task_assistant.build_task_from_text(chat_id, uid, user_text)
+            if task is not None:
+                await message.answer(
+                    task_assistant.format_confirmation(task),
+                    reply_markup=task_assistant.confirmation_keyboard(task.id),
+                )
+                return
         # @mention, reply-to-bot, or private chat → respond normally
         await _process(message, bot, user_text, forced_type=None)
         return
@@ -1301,6 +1467,7 @@ async def main() -> None:
         token=settings.bot_token,
         default=DefaultBotProperties(parse_mode=None),
     )
+    asyncio.create_task(task_assistant.reminder_loop(bot))
     logger.info("Starting polling…")
     await dp.start_polling(bot)
 
