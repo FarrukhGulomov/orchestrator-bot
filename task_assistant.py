@@ -28,9 +28,19 @@ logger = logging.getLogger(__name__)
 # call on every single message — only messages containing one of these get
 # classified. The LLM call itself still makes the real is_task decision, so
 # this only controls cost, not accuracy.
+#
+# Uzbek is written in BOTH Latin and Cyrillic script depending on the user's
+# keyboard/habit — "eslat" (Latin) and "эслат" (Cyrillic) are different
+# Unicode codepoints, so both must be listed explicitly or Cyrillic-script
+# messages silently never reach the classifier at all.
 _TRIGGER_WORDS = (
+    # Uzbek — Latin
     "eslat", "vazifa", "topshiriq", "reja qil", "kunlik reja",
+    # Uzbek — Cyrillic
+    "эслат", "вазифа", "топшир", "режа қил", "кундалик реж",
+    # Russian
     "напомни", "напоминание", "задача", "напоминай",
+    # English
     "remind", "reminder", "todo", "to-do",
 )
 
