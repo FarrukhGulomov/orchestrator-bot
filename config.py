@@ -151,6 +151,14 @@ class Settings:
         default_factory=lambda: _int_env("MAX_FILE_SIZE_MB", 20)
     )
 
+    # --- Daily task reminders ------------------------------------------------
+    # IANA tz name used to interpret/display due times ("bugun soat 15:00" etc).
+    timezone: str = field(default_factory=lambda: os.getenv("TIMEZONE", "Asia/Tashkent"))
+    # How often the reminder background loop polls for due tasks.
+    reminder_poll_seconds: int = field(
+        default_factory=lambda: _int_env("REMINDER_POLL_SECONDS", 30)
+    )
+
     # --- Behaviour ---------------------------------------------------------
     history_turns: int = field(
         default_factory=lambda: _int_env("HISTORY_TURNS", 10)
