@@ -203,9 +203,9 @@ async def _relay_business_reply(admin_message: Message, relay_msg_id: int, relay
         await business_copilot.append_own_message(relay["conn"], relay["chat"], text)
         await business_copilot.clear_relay(relay_msg_id)
         await admin_message.reply("✅ Yuborildi.")
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         logger.exception("Failed to relay admin's custom business-chat reply")
-        await admin_message.reply("⚠️ Yuborib bo'lmadi.")
+        await admin_message.reply(f"⚠️ Yuborib bo'lmadi: {str(exc)[:200]}")
 
 
 class AccessGateMiddleware(BaseMiddleware):
@@ -1768,8 +1768,19 @@ async def cmd_users(message: Message) -> None:
 # Separate update types (business_connection / business_message), unrelated
 # to the normal message flow above; see business_copilot.py for the design.
 # --------------------------------------------------------------------------
+def _business_can_reply(connection: BusinessConnection) -> bool:
+    # can_reply moved under `rights` in newer Bot API versions but the
+    # top-level field is kept for backward compatibility — prefer rights
+    # when present, default True only if Telegram gave us neither.
+    if connection.rights is not None:
+        return bool(connection.rights.can_reply)
+    if connection.can_reply is not None:
+        return bool(connection.can_reply)
+    return True
+
+
 @dp.business_connection()
-async def handle_business_connection(connection: BusinessConnection) -> None:
+async def handle_business_connection(connection: BusinessConnection, bot: Bot) -> None:
     owner_id = connection.user.id
     owner_uname = connection.user.username
     if not access_control.is_admin(owner_id, owner_uname):
@@ -1778,11 +1789,26 @@ async def handle_business_connection(connection: BusinessConnection) -> None:
             "configured admin's Business account is supported).", owner_id,
         )
         return
-    await business_copilot.save_connection(connection.id, owner_id, connection.user_chat_id, connection.is_enabled)
-    logger.info(
-        "Business connection %s %s for admin=%s",
-        connection.id, "enabled" if connection.is_enabled else "disabled", owner_id,
+    can_reply = _business_can_reply(connection)
+    await business_copilot.save_connection(
+        connection.id, owner_id, connection.user_chat_id, connection.is_enabled, can_reply
     )
+    logger.info(
+        "Business connection %s %s (can_reply=%s) for admin=%s",
+        connection.id, "enabled" if connection.is_enabled else "disabled", can_reply, owner_id,
+    )
+    if connection.is_enabled and not can_reply:
+        try:
+            await bot.send_message(
+                connection.user_chat_id,
+                "⚠️ Business Copilot ulandi, lekin \"Javob yozish\" (Reply to messages) "
+                "ruxsati berilmagan — men xabarlarni tahlil qila olaman, lekin taklif "
+                "qilingan javobni mijozga yubora olmayman.\n\n"
+                "Tuzatish: Telegram → Sozlamalar → Business → Chatbots → botni tanlang → "
+                "ruxsatlar ro'yxatida \"Javob yozish\"ni yoqing.",
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to send can_reply warning to admin")
 
 
 @dp.business_message()
@@ -1800,8 +1826,12 @@ async def handle_business_message(message: Message, bot: Bot) -> None:
             return
         if not access_control.is_admin(bc.user.id, bc.user.username):
             return
-        await business_copilot.save_connection(bc.id, bc.user.id, bc.user_chat_id, bc.is_enabled)
-        conn = {"owner_user_id": bc.user.id, "owner_chat_id": bc.user_chat_id, "is_enabled": bc.is_enabled}
+        can_reply = _business_can_reply(bc)
+        await business_copilot.save_connection(bc.id, bc.user.id, bc.user_chat_id, bc.is_enabled, can_reply)
+        conn = {
+            "owner_user_id": bc.user.id, "owner_chat_id": bc.user_chat_id,
+            "is_enabled": bc.is_enabled, "can_reply": can_reply,
+        }
 
     sender = message.from_user
     text = message.text or message.caption or "(media xabar)"
@@ -1833,18 +1863,27 @@ async def handle_business_message(message: Message, bot: Bot) -> None:
 
     analysis = data.get("analysis", "")
     suggested = data.get("suggested_reply", "")
+    can_reply = conn.get("can_reply", True)
+    action_line = (
+        "⚠️ Ushbu ulanishda \"Javob yozish\" ruxsati yo'q — men bu javobni sizning "
+        "nomingizdan yubora olmayman. Uni o'zingiz qo'lda yuboring."
+        if not can_reply else
+        "Yuborish uchun tugmani bosing, yoki shu xabarga Reply qilib o'zingiz "
+        "yozgan javobni yuboring."
+    )
     card = (
         f"💼 {sender_name} sizga yozdi:\n\n\"{text}\"\n\n"
         f"🧠 Tahlil: {analysis}\n\n"
-        f"💬 Taklif qilingan javob:\n{suggested}\n\n"
-        "Yuborish uchun tugmani bosing, yoki shu xabarga Reply qilib o'zingiz "
-        "yozgan javobni yuboring."
+        f"💬 Taklif qilingan javob:\n{suggested}\n\n{action_line}"
     )
     try:
         sent = await bot.send_message(owner_chat_id, card)
     except Exception:  # noqa: BLE001
         logger.exception("Failed to send business-copilot notification to admin")
         return
+
+    if not can_reply:
+        return  # nothing to link/attach — the buttons would only fail too
 
     await business_copilot.link_relay(sent.message_id, conn_id, message.chat.id, suggested)
     try:
@@ -1888,9 +1927,10 @@ async def handle_business_copilot_callback(callback: CallbackQuery, bot: Bot) ->
         try:
             await bot.send_message(relay["chat"], relay["reply"], business_connection_id=relay["conn"])
             await business_copilot.append_own_message(relay["conn"], relay["chat"], relay["reply"])
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             logger.exception("Failed to send business-copilot suggested reply")
-            await callback.answer("⚠️ Yuborib bo'lmadi.", show_alert=True)
+            # Telegram caps callback-answer text at 200 chars — leave headroom for the prefix.
+            await callback.answer(f"⚠️ Yuborib bo'lmadi: {str(exc)[:150]}", show_alert=True)
             return
         await business_copilot.clear_relay(relay_msg_id)
         await callback.answer("Yuborildi ✅")
