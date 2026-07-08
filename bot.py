@@ -1855,7 +1855,8 @@ async def handle_business_message(message: Message, bot: Bot) -> None:
         try:
             await bot.send_message(
                 owner_chat_id,
-                f"💼 {sender_name} sizga yozdi:\n\n{text}\n\n⚠️ AI tahlili muvaffaqiyatsiz — o'zingiz javob yozing.",
+                f"💼 {sender_name} sizga yozdi:\n\n{text}\n\n⚠️ AI tahlili muvaffaqiyatsiz — o'zingiz javob yozing.\n"
+                "(Agar bu tez-tez takrorlansa, AI provider balansi/tokeni tugagan bo'lishi mumkin — /status bilan tekshiring.)",
             )
         except Exception:  # noqa: BLE001
             logger.exception("Failed to notify admin of business message (analysis failed)")
