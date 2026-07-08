@@ -68,8 +68,13 @@ def _relay_key(admin_message_id: int) -> str:
 # --------------------------------------------------------------------------
 # Connection cache
 # --------------------------------------------------------------------------
-async def save_connection(business_connection_id: str, owner_user_id: int, owner_chat_id: int, is_enabled: bool) -> None:
-    payload = json.dumps({"owner_user_id": owner_user_id, "owner_chat_id": owner_chat_id, "is_enabled": is_enabled})
+async def save_connection(
+    business_connection_id: str, owner_user_id: int, owner_chat_id: int, is_enabled: bool, can_reply: bool = True
+) -> None:
+    payload = json.dumps({
+        "owner_user_id": owner_user_id, "owner_chat_id": owner_chat_id,
+        "is_enabled": is_enabled, "can_reply": can_reply,
+    })
     client = redis_client.get_client()
     if client is None:
         _conn_mem[business_connection_id] = json.loads(payload)
