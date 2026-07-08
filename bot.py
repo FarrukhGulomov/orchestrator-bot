@@ -1201,8 +1201,8 @@ async def cmd_status(message: Message) -> None:
     lines = ["**AI Orchestrator Status**\n"]
     if settings.provider == "hybrid":
         lines.append("**Provider:** ✅ Hybrid (OpenRouter + Claude)")
-        lines.append(f"**Agent javoblari:** {settings.claude_model_label} (Claude Sonnet)")
-        lines.append(f"**Routing/tez:** {settings.or_fast_model_label} (OpenRouter, bepul)")
+        lines.append(f"**Murakkab ish (hujjat/kod/tahlil):** {settings.claude_model_label} (Claude Sonnet)")
+        lines.append(f"**Oddiy savollar + routing:** {settings.or_fast_model_label} (OpenRouter, bepul)")
         lines.append(f"**Vision/PDF:** Claude (native tahlil)")
     elif settings.provider == "openrouter":
         lines.append("**Provider:** ✅ OpenRouter (bepul)")
@@ -2206,7 +2206,7 @@ async def main() -> None:
 
     if settings.provider == "hybrid":
         logger.info(
-            "Provider: HYBRID — agents=%s | routing=%s (free) | vision=Claude",
+            "Provider: HYBRID — complex work=%s | simple questions/routing=%s (free) | vision=Claude",
             settings.claude_model, settings.or_fast_model,
         )
     elif settings.provider == "openrouter":

@@ -261,15 +261,23 @@ async def claude_generate(
 ) -> str:
     """Main model: agent responses, deep analysis, document generation.
 
-    hybrid/claude → Claude Sonnet (quality)
-    openrouter    → OpenRouter main model (free)
+    hybrid — routes PER CALL based on the model id's shape: an OpenRouter id
+    (always contains "/", e.g. from model_for()'s low-complexity branch —
+    simple questions, saving Claude usage) goes to OpenRouter; a bare Claude
+    id (e.g. "claude-sonnet-4-6", from high-complexity work) goes to Claude.
+    claude     → always Claude.
+    openrouter → always OpenRouter (free).
     """
     if settings.provider == "openrouter":
         m = model or settings.or_main_model
         return await asyncio.to_thread(
             _or_sync, m, system, messages, temperature, settings.max_output_tokens
         )
-    # hybrid or claude: use Claude main model
+    if settings.provider == "hybrid" and model and "/" in model:
+        return await asyncio.to_thread(
+            _or_sync, model, system, messages, temperature, settings.max_output_tokens
+        )
+    # hybrid with a Claude id (or no explicit model), or claude-only.
     m = model or settings.claude_model
     return await asyncio.to_thread(
         _claude_sync, m, system, messages, temperature, settings.max_output_tokens
