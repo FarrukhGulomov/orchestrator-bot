@@ -18,6 +18,9 @@ Commands:
   /proposal — deliver as Word + PDF document
   /addtask — add a daily task/reminder (also auto-detected from plain messages)
   /tasks — list active tasks; /done /canceltask — mark complete/cancelled
+  /digest — opt-in daily morning plan; /standup /week — status drafts
+  /minutes — meeting notes → structured minutes + action items → tasks
+  /decision /decisions — dated project decision log
   /remember /memory /forget — project memory management
   /logs — Railway deployment log analysis (if configured)
   /readfile — pull current file from GitHub into conversation
@@ -40,10 +43,13 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
+import decisions as decisions_store
+import digest
 import document_generation as docgen
 import github_integration
 import history
 import memory
+import minutes as minutes_mod
 import railway_integration
 import redis_client
 import task_assistant
@@ -910,6 +916,10 @@ async def cmd_start(message: Message) -> None:
         "/proposal — Word + PDF hujjat tayyorlash\n"
         "/addtask — vazifa/eslatma qo'shish (oddiy yozuvdan ham avtomatik aniqlayman)\n"
         "/tasks — faol vazifalar ro'yxati (/done, /canceltask bilan boshqarish)\n"
+        "/digest on — har kuni ertalab kun rejasi\n"
+        "/standup — kecha/bugun/blockers draft · /week — haftalik hisobot\n"
+        "/minutes — uchrashuv yozuvidan protokol + action itemlar\n"
+        "/decision — qarorlar jurnaliga yozish · /decisions — ko'rish\n"
         "/idea /task /bug /improve — so'rov turini majburlash\n"
         "/remember <fakt> — loyiha ma'lumotini yodlash\n"
         "/memory — yodlangan faktlar\n"
@@ -1235,6 +1245,215 @@ async def cmd_canceltask(message: Message, command: CommandObject) -> None:
     await message.answer(f"❌ Bekor qilindi: {task.title}")
 
 
+# --------------------------------------------------------------------------
+# PM/BA daily workflow: digest, standup, weekly review, minutes, decisions
+# --------------------------------------------------------------------------
+@dp.message(Command("digest"))
+async def cmd_digest(message: Message, command: CommandObject) -> None:
+    chat_id = message.chat.id
+    if not _is_allowed(chat_id):
+        return
+    arg = (command.args or "").strip().lower()
+    cfg = await digest.get_config(chat_id)
+
+    if not arg:
+        state = f"✅ yoqilgan, har kuni {cfg.time} da" if cfg.enabled else "❌ o'chirilgan"
+        await message.answer(
+            f"☀️ Kunlik reja (digest): {state}\n\n"
+            "/digest on — yoqish (standart 08:30)\n"
+            "/digest 07:45 — vaqtni o'zgartirish\n"
+            "/digest off — o'chirish\n"
+            "/digest now — hozir ko'rish"
+        )
+        return
+    if arg == "now":
+        await _send_long(message, await digest.build_digest(chat_id))
+        return
+    if arg in ("on", "yoq", "вкл"):
+        cfg.enabled = True
+        await digest.set_config(chat_id, cfg)
+        await message.answer(f"☀️ Kunlik reja yoqildi — har kuni soat {cfg.time} da yuboraman.")
+        return
+    if arg in ("off", "o'chir", "выкл"):
+        cfg.enabled = False
+        await digest.set_config(chat_id, cfg)
+        await message.answer("Kunlik reja o'chirildi.")
+        return
+    t = digest.normalize_time(arg)
+    if t:
+        cfg.time = t
+        cfg.enabled = True
+        await digest.set_config(chat_id, cfg)
+        await message.answer(f"☀️ Kunlik reja endi har kuni soat {t} da keladi.")
+        return
+    await message.answer("Tushunmadim. /digest on | off | now | HH:MM")
+
+
+@dp.message(Command("standup"))
+async def cmd_standup(message: Message) -> None:
+    if not _is_allowed(message.chat.id):
+        return
+    await _send_long(message, await digest.build_standup(message.chat.id))
+
+
+@dp.message(Command("week"))
+async def cmd_week(message: Message) -> None:
+    if not _is_allowed(message.chat.id):
+        return
+    await _send_long(message, await digest.build_week(message.chat.id))
+
+
+@dp.message(Command("decision"))
+async def cmd_decision(message: Message, command: CommandObject) -> None:
+    if not _is_allowed(message.chat.id):
+        return
+    text = (command.args or "").strip()
+    if not text:
+        await message.answer(
+            "Qaror matnini yozing:\n/decision Integratsiya REST orqali, Kafka keyingi bosqichda"
+        )
+        return
+    if await decisions_store.add_decision(message.chat.id, text):
+        await message.answer("💾 Qarorlar jurnaliga yozildi. (/decisions — ko'rish)")
+    else:
+        await message.answer("⚠️ Saqlab bo'lmadi, qaytadan urinib ko'ring.")
+
+
+@dp.message(Command("decisions"))
+async def cmd_decisions(message: Message) -> None:
+    if not _is_allowed(message.chat.id):
+        return
+    entries = await decisions_store.get_decisions(message.chat.id)
+    if not entries:
+        await message.answer("Qarorlar jurnali bo'sh. /decision <matn> bilan yozing.")
+        return
+    lines = "\n".join(f"{i}. {e}" for i, e in enumerate(entries, 1))
+    await _send_long(message, f"📖 Qarorlar jurnali:\n\n{lines}")
+
+
+@dp.message(Command("cleardecisions"))
+async def cmd_cleardecisions(message: Message) -> None:
+    if not _is_allowed(message.chat.id):
+        return
+    n = await decisions_store.clear_decisions(message.chat.id)
+    await message.answer(f"O'chirildi: {n} ta qaror. ✅")
+
+
+@dp.message(Command("minutes", "protokol"))
+async def cmd_minutes(message: Message, command: CommandObject) -> None:
+    chat_id = message.chat.id
+    if not _is_allowed(chat_id):
+        return
+    text = (command.args or "").strip()
+    if not text and message.reply_to_message:
+        text = (message.reply_to_message.text or message.reply_to_message.caption or "").strip()
+    if not text:
+        await message.answer(
+            "Uchrashuv yozuvlarini yuboring:\n"
+            "/minutes <uchrashuv matni yoki transkript>\n"
+            "yoki yozuvli xabarga reply qilib /minutes deb yozing."
+        )
+        return
+
+    # Same cost-protection guard as the main pipeline: this is a single-shot
+    # but large (4096-token, main-model) call — spamming /minutes shouldn't
+    # stack several of those concurrently for one chat.
+    if chat_id in _in_flight:
+        await message.answer("⏳ Oldingi so'rovingiz hali ishlanmoqda. Javobni kuting, keyin yuboring.")
+        return
+    _in_flight.add(chat_id)
+    try:
+        status = await message.answer("📝 Protokol tayyorlayapman...")
+        try:
+            data = await asyncio.wait_for(
+                minutes_mod.extract_minutes(text), timeout=settings.request_timeout
+            )
+        except asyncio.TimeoutError:
+            data = None
+        if data is None:
+            await status.edit_text("⚠️ Protokolni tuzib bo'lmadi. Matnni tekshirib, qaytadan yuboring.")
+            return
+        try:
+            await status.delete()
+        except TelegramBadRequest:
+            pass
+
+        items = data["action_items"]
+        decs = data["decisions"]
+        keyboard = None
+        if items or decs:
+            batch_id = await minutes_mod.stash_batch(chat_id, data)
+            keyboard = minutes_mod.minutes_keyboard(batch_id, len(items), len(decs))
+
+        body = minutes_mod.render_minutes(data)
+        # Keyboard must ride on the LAST chunk; _send_long doesn't support it,
+        # so send the body first, then attach buttons to a short follow-up if long.
+        if keyboard and len(body) <= TELEGRAM_LIMIT:
+            try:
+                await message.answer(body, reply_markup=keyboard)
+            except TelegramBadRequest:
+                await message.answer(body[:TELEGRAM_LIMIT], reply_markup=keyboard)
+            return
+        await _send_long(message, body)
+        if keyboard:
+            await message.answer("👇 Protokol bo'yicha amallar:", reply_markup=keyboard)
+    finally:
+        _in_flight.discard(chat_id)
+
+
+@dp.callback_query(F.data.startswith("min:"))
+async def handle_minutes_callback(callback: CallbackQuery, bot: Bot) -> None:
+    if not callback.data or not callback.message:
+        await callback.answer()
+        return
+    chat_id = callback.message.chat.id
+    if not _is_allowed(chat_id):
+        await callback.answer()
+        return
+    try:
+        _, action, batch_id = callback.data.split(":", 2)
+    except ValueError:
+        await callback.answer()
+        return
+
+    loaded = await minutes_mod.load_batch(batch_id)
+    if loaded is None or loaded[0] != chat_id:
+        await callback.answer("Bu protokol eskirgan (1 soatdan oshgan).", show_alert=True)
+        return
+    _, data = loaded
+
+    if action == "t":  # create tasks from action items — explicit user permission
+        if data.get("_tasks_added"):
+            await callback.answer("Vazifalar allaqachon qo'shilgan.", show_alert=True)
+            return
+        uid = callback.from_user.id if callback.from_user else 0
+        created = await minutes_mod.create_tasks_from_items(chat_id, uid, data)
+        data["_tasks_added"] = True
+        await minutes_mod.resave_batch(batch_id, chat_id, data)
+        await callback.answer(f"{len(created)} ta vazifa qo'shildi ✅")
+        if created:
+            lines = ["➕ Protokoldan qo'shilgan vazifalar:\n"]
+            lines.extend(task_assistant.format_task_line(t) for t in created)
+            lines.append("\n📋 Boshqarish: /tasks")
+            await bot.send_message(chat_id, "\n".join(lines))
+        return
+
+    if action == "d":  # save decisions to the decision log
+        if data.get("_decisions_saved"):
+            await callback.answer("Qarorlar allaqachon saqlangan.", show_alert=True)
+            return
+        saved = 0
+        for d in (data.get("decisions") or [])[:15]:
+            if await decisions_store.add_decision(chat_id, str(d)):
+                saved += 1
+        data["_decisions_saved"] = True
+        await minutes_mod.resave_batch(batch_id, chat_id, data)
+        await callback.answer(f"{saved} ta qaror jurnalga yozildi 💾")
+        return
+
+    await callback.answer()
+
+
 @dp.callback_query(F.data.startswith("tsk:"))
 async def handle_task_callback(callback: CallbackQuery, bot: Bot) -> None:
     if not callback.data or not callback.message:
@@ -1468,6 +1687,7 @@ async def main() -> None:
         default=DefaultBotProperties(parse_mode=None),
     )
     asyncio.create_task(task_assistant.reminder_loop(bot))
+    asyncio.create_task(digest.digest_loop(bot))
     logger.info("Starting polling…")
     await dp.start_polling(bot)
 

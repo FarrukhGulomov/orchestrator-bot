@@ -387,7 +387,14 @@ async def claude_generate_json(
 
     hybrid/openrouter → OpenRouter fast free model (routing is free)
     claude            → Claude Haiku
+
+    In hybrid mode an EXPLICIT Claude model id must go to the Claude API —
+    docgen/minutes pass model_for()'s result, which is a Claude id in hybrid;
+    sending it to OpenRouter 404s and silently degrades to openrouter/auto.
+    OpenRouter ids always contain "/" (vendor/model); Claude ids never do.
     """
+    if settings.provider == "hybrid" and model and "/" not in model:
+        return await asyncio.to_thread(_claude_json_sync, system, messages, model, max_tokens)
     if settings.provider in ("openrouter", "hybrid"):
         m = model or settings.or_fast_model
         return await asyncio.to_thread(_or_json_sync, system, messages, m, max_tokens)

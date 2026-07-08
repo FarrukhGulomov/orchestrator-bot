@@ -64,6 +64,7 @@ class Task:
     status: str = "pending"        # pending|done|cancelled
     stage: str = "primary"         # primary|final — which reminder fires next
     created_at: str = ""
+    completed_at: str = ""         # ISO8601 UTC, set when status becomes "done"
 
 
 def _now_utc() -> datetime:
@@ -248,6 +249,8 @@ async def set_status(task_id: str, status: str) -> Task | None:
     if task is None:
         return None
     task.status = status
+    if status == "done":
+        task.completed_at = _now_utc().isoformat()
     await _save(task)
     if status != "pending":
         await _unschedule(task_id)
@@ -317,3 +320,44 @@ async def advance_after_fire(task: Task) -> None:
 
     # One-off task, no more reminders queued — stays "pending" until the user
     # marks it done/cancelled, or re-schedules via snooze.
+
+
+# --------------------------------------------------------------------------
+# Query helpers for digest / standup / weekly review
+#
+# Pure filters (overdue/in_window/completed_since_list) take an
+# ALREADY-FETCHED task list so a caller building several views at once
+# (digest = overdue + today + upcoming, all from the same pending set) pays
+# for one list_tasks() round-trip instead of one per view. The async
+# *_tasks wrappers remain for callers that only need a single view.
+# --------------------------------------------------------------------------
+def overdue(pending: list[Task], now: datetime | None = None) -> list[Task]:
+    now = now or _now_utc()
+    return [t for t in pending if datetime.fromisoformat(t.due_at) < now]
+
+
+def in_window(pending: list[Task], start: datetime, end: datetime) -> list[Task]:
+    """Tasks due within [start, end) — both UTC-aware."""
+    return [t for t in pending if start <= datetime.fromisoformat(t.due_at) < end]
+
+
+def completed_since_list(done: list[Task], since: datetime) -> list[Task]:
+    """Tasks marked done at/after `since` (UTC-aware), oldest first."""
+    out = [t for t in done if t.completed_at and datetime.fromisoformat(t.completed_at) >= since]
+    out.sort(key=lambda t: t.completed_at)
+    return out
+
+
+async def overdue_tasks(chat_id: int) -> list[Task]:
+    """Pending tasks whose deadline has already passed."""
+    return overdue(await list_tasks(chat_id, {"pending"}))
+
+
+async def due_in_window(chat_id: int, start: datetime, end: datetime) -> list[Task]:
+    """Pending tasks due within [start, end) — both UTC-aware."""
+    return in_window(await list_tasks(chat_id, {"pending"}), start, end)
+
+
+async def completed_since(chat_id: int, since: datetime) -> list[Task]:
+    """Tasks marked done at/after `since` (UTC-aware), oldest first."""
+    return completed_since_list(await list_tasks(chat_id, {"done"}), since)
