@@ -111,19 +111,24 @@ async def _handle_unapproved(message: Message) -> None:
     handle = (settings.admin_username or "admin").lstrip("@")
     uid_for_seen = message.from_user.id if message.from_user else message.chat.id
 
-    # Full explanation only on the first-ever message from this user; after
-    # that, a short acknowledgment — so a real back-and-forth with the admin
-    # (asking questions while waiting for approval) doesn't repeat a wall of
-    # text every time. They can still freely message the admin either way;
-    # only the OTHER bot features stay gated until approved.
+    # Full bilingual explanation only on the first-ever message from this
+    # user; after that, a short acknowledgment — so a real back-and-forth
+    # with the admin (asking questions while waiting for approval) doesn't
+    # repeat a wall of text every time. They can still freely message the
+    # admin either way; only the OTHER bot features stay gated until approved.
     if await access_control.mark_first_contact(uid_for_seen):
         await message.answer(
-            f"🔒 Ushbu botdan foydalanish uchun admin ruxsati kerak.\n"
-            f"Ruxsat olish uchun @{handle} ga murojaat qiling.\n"
-            f"Savollaringiz bo'lsa shu yerga yozavering — xabaringiz @{handle} ga yetkaziladi."
+            f"🔒 Botdan foydalanish uchun admin (@{handle}) ruxsati kerak. "
+            f"Ruxsat berilishini kuting. Savol yoki murojaatingiz bo'lsa, shu yerga "
+            f"yozavering — xabaringiz to'g'ridan-to'g'ri adminga yetkaziladi.\n\n"
+            f"🔒 Для использования бота нужно разрешение администратора (@{handle}). "
+            f"Дождитесь одобрения. Если есть вопрос или просьба к администратору — "
+            f"просто напишите здесь, сообщение будет передано напрямую."
         )
     else:
-        await message.answer(f"✅ Xabaringiz @{handle} ga yuborildi.")
+        await message.answer(
+            f"✅ Xabaringiz @{handle} ga yuborildi. / Ваше сообщение отправлено @{handle}."
+        )
 
     admin_chat_id = await access_control.get_admin_chat_id()
     if not admin_chat_id or bot is None:
@@ -213,6 +218,10 @@ class AccessGateMiddleware(BaseMiddleware):
                     except Exception:  # noqa: BLE001
                         logger.exception("Failed to send admin-bootstrap confirmation")
             return await handler(event, data)
+
+        # Track activity for every regular (non-admin) user, approved or not,
+        # so /users shows real usage — not just pending-request traffic.
+        await access_control.record_activity(uid, uname, event.from_user.full_name)
 
         if await access_control.is_approved(uid):
             return await handler(event, data)
@@ -1691,6 +1700,37 @@ async def cmd_deny(message: Message, command: CommandObject) -> None:
     target = int(arg)
     await access_control.deny(target)
     await message.answer(f"❌ {target} rad etildi.")
+
+
+@dp.message(Command("users"))
+async def cmd_users(message: Message) -> None:
+    uid = message.from_user.id if message.from_user else 0
+    uname = message.from_user.username if message.from_user else None
+    if not access_control.is_admin(uid, uname):
+        return  # silently ignore — admin-only, don't reveal it to others
+
+    users = await access_control.list_users()
+    if not users:
+        await message.answer("Hozircha hech kim botga yozmagan.")
+        return
+
+    status_emoji = {"approved": "✅", "denied": "❌", "pending": "⏳"}
+    lines = [f"👥 Foydalanuvchilar ({len(users)} ta):\n"]
+    for u in users[:60]:
+        emoji = status_emoji.get(u.get("status"), "⏳")
+        name = u.get("full_name") or "Noma'lum"
+        uname_disp = f"@{u['username']}" if u.get("username") else "(username yo'q)"
+        last_seen = (u.get("last_seen") or "")[:16].replace("T", " ")
+        count = u.get("message_count") or "0"
+        lines.append(
+            f"{emoji} {name} {uname_disp} — ID: `{u['user_id']}` — {count} xabar"
+            + (f" — oxirgi: {last_seen}" if last_seen else "")
+        )
+    lines.append(
+        "\n⏳ kutilmoqda · ✅ ruxsat berilgan · ❌ rad etilgan\n"
+        "Ruxsat berish: /approve <id>   Bekor qilish: /deny <id>"
+    )
+    await _send_long(message, "\n".join(lines))
 
 
 @dp.callback_query(F.data.startswith("tsk:"))
