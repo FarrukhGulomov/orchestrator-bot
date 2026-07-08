@@ -197,10 +197,15 @@ async def analyze(business_connection_id: str, customer_chat_id: int, sender_nam
         f"{'Contact' if h['role'] == 'them' else 'You'}: {h['text']}" for h in history[-6:]
     )
     context = f"Recent exchange:\n{convo}\n\nContact ({sender_name})'s latest message: {latest_text}"
-    # Customer-facing content (once approved) deserves the MAIN model, not
-    # the cheap routing-tier default — language-matching and tone reliably
-    # need the stronger model, same reasoning as minutes.py/document_generation.py.
-    model, _label = model_for(get_agent("ba"), "high")
+    # This fires on EVERY incoming business message — forcing the main
+    # (Claude) model here would burn paid quota continuously just to
+    # analyze routine chat, defeating the whole point of hybrid mode. The
+    # strengthened grammar-based language rule in the prompt above is what
+    # actually fixes language-matching, not the model tier — "low" routes
+    # to the free OpenRouter model in hybrid mode (see router.model_for).
+    # Genuine specialist-quality work still goes through Claude via the
+    # separate "🧠 Jamoa bilan ishlab chiqish" button (classify() + agent).
+    model, _label = model_for(get_agent("ba"), "low")
     try:
         raw = await asyncio.wait_for(
             claude_generate_json(_COPILOT_SYSTEM, [{"role": "user", "content": context}], model=model, max_tokens=400),
