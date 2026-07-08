@@ -170,6 +170,21 @@ class Settings:
         default_factory=lambda: _int_env("REMINDER_POLL_SECONDS", 30)
     )
 
+    # --- Work-hours awareness (Business Copilot "ishdamisan?" answers) -------
+    work_start_hour: int = field(default_factory=lambda: _int_env("WORK_START_HOUR", 9))
+    work_end_hour: int = field(default_factory=lambda: _int_env("WORK_END_HOUR", 18))
+    # Weekday numbers that are work days, Mon=0..Sun=6. Default Mon-Fri.
+    work_days: set[int] = field(
+        default_factory=lambda: _csv_ints(os.getenv("WORK_DAYS", "0,1,2,3,4"))
+    )
+    # Comma-separated holidays — "MM-DD" repeats every year (fixed-date
+    # Uzbek national holidays by default); "YYYY-MM-DD" matches once (for
+    # movable ones like Ro'za/Qurbon hayit, which shift yearly — add
+    # manually each year via this env var).
+    holidays: str = field(
+        default_factory=lambda: os.getenv("HOLIDAYS", "01-01,03-08,03-21,05-09,09-01,12-08")
+    )
+
     # --- Behaviour ---------------------------------------------------------
     history_turns: int = field(
         default_factory=lambda: _int_env("HISTORY_TURNS", 10)

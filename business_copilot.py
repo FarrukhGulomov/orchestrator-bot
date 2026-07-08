@@ -34,10 +34,12 @@ import asyncio
 import json
 import logging
 from collections import deque
+from datetime import datetime, timedelta
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 import redis_client
+import tasks
 from agents import get_agent
 from config import settings
 from llm_clients import claude_generate_json
@@ -186,9 +188,46 @@ beraman"; Russian: "понял(а), обсужу с командой и скор
 answer needs the specialist team's actual input first, not a guess.
 When is_task=false, suggested_reply is the real, ready-to-send answer.
 
+If the contact asks whether you're at work / available right now
+("ishdamisan?", "на работе?", "you around?", etc.), answer HONESTLY based
+on the "Current real work status" line given in the context below — do
+NOT always claim to be at work. If the status says you're likely not at
+work, say so naturally (e.g. "hozir ishda emasman, ertaga/keyinroq javob
+beraman" / "сейчас не на работе, отвечу позже") rather than a generic
+brush-off.
+
 Keep the suggested reply natural, professional, and concise — something a
 real person would actually type, not a template or a chatbot-sounding line.
 """
+
+
+def _is_holiday(now_local: datetime) -> bool:
+    configured = {h.strip() for h in settings.holidays.split(",") if h.strip()}
+    return now_local.strftime("%m-%d") in configured or now_local.strftime("%Y-%m-%d") in configured
+
+
+def work_status(now_local: datetime | None = None) -> str:
+    """Short Uzbek description of whether the professional would realistically
+    be at work right now — grounds the AI's "ishdamisan?" replies in the
+    actual clock/calendar instead of always claiming to be at work."""
+    now_local = now_local or tasks.now_local()
+
+    if now_local.weekday() not in settings.work_days:
+        return "bugun dam olish kuni (ish kuni emas) — ishda emas"
+    if _is_holiday(now_local):
+        return "bugun bayram/dam olish kuni — ishda emas"
+
+    start = now_local.replace(hour=settings.work_start_hour, minute=0, second=0, microsecond=0)
+    end = now_local.replace(hour=settings.work_end_hour, minute=0, second=0, microsecond=0)
+    grace_end = end + timedelta(hours=1)
+
+    if now_local < start:
+        return f"ish boshlanishidan oldin (ish soat {settings.work_start_hour:02d}:00 da boshlanadi) — hali ishda emas"
+    if start <= now_local <= end:
+        return "hozir ish vaqti — ishda"
+    if end < now_local <= grace_end:
+        return "ish vaqti tugagan, lekin 1 soat ichida — hali ishda bo'lishi yoki hozirgina chiqqan bo'lishi mumkin"
+    return "ish vaqtidan 1 soatdan ko'p o'tgan — ishda emas, uyda/tashqarida bo'lishi mumkin"
 
 
 async def analyze(business_connection_id: str, customer_chat_id: int, sender_name: str, latest_text: str) -> dict | None:
@@ -196,7 +235,10 @@ async def analyze(business_connection_id: str, customer_chat_id: int, sender_nam
     convo = "\n".join(
         f"{'Contact' if h['role'] == 'them' else 'You'}: {h['text']}" for h in history[-6:]
     )
-    context = f"Recent exchange:\n{convo}\n\nContact ({sender_name})'s latest message: {latest_text}"
+    context = (
+        f"Current real work status: {work_status()}\n\n"
+        f"Recent exchange:\n{convo}\n\nContact ({sender_name})'s latest message: {latest_text}"
+    )
     # This fires on EVERY incoming business message — forcing the main
     # (Claude) model here would burn paid quota continuously just to
     # analyze routine chat, defeating the whole point of hybrid mode. The
