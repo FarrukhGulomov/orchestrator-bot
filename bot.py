@@ -88,21 +88,36 @@ dp = Dispatcher()
 TELEGRAM_LIMIT = 4096
 
 # --------------------------------------------------------------------------
-# Post-approval onboarding — collect F.I.O + phone number before an
-# approved user's messages reach the normal AI pipeline.
+# Post-approval onboarding — collect phone number before an approved user's
+# messages reach the normal AI pipeline. F.I.O is NOT asked for — Telegram
+# already gives every message a first_name/last_name (captured into
+# full_name by record_activity() on first contact), so that's used directly
+# as F.I.O. The phone number has no such shortcut: Telegram's Bot API never
+# exposes a user's phone number to a bot unless the user explicitly shares
+# it via a contact-share action, so that's the one thing still asked for.
 # --------------------------------------------------------------------------
+def _phone_request_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📱 Raqamni yuborish", request_contact=True)]],
+        resize_keyboard=True, one_time_keyboard=True,
+    )
+
+
 async def _start_onboarding(bot: Bot, target_user_id: int) -> None:
-    """Call right after approve() — kicks off the F.I.O/phone collection by
-    setting state and sending the first prompt. Shared by /approve and the
-    ✅ button so both paths behave identically."""
-    await access_control.set_onboarding_state(target_user_id, "awaiting_fio")
+    """Call right after approve() — auto-fills F.I.O from the Telegram name
+    already on file (no need to ask) and asks only for the phone number.
+    Shared by /approve and the ✅ button so both paths behave identically."""
+    full_name = await access_control.get_known_full_name(target_user_id)
+    if full_name:
+        await access_control.save_profile_field(target_user_id, "fio", full_name)
+    await access_control.set_onboarding_state(target_user_id, "awaiting_phone")
     try:
         await bot.send_message(
             target_user_id,
             "✅ Sizga botdan foydalanish uchun ruxsat berildi!\n\n"
-            "Endi bir necha ma'lumotingizni so'rayman. Iltimos, to'liq ismingizni "
-            "(F.I.O) yozib yuboring.\n\n"
-            "(Bu qadamni o'tkazib yuborish uchun /skip yozing.)",
+            "Iltimos, telefon raqamingizni yuboring — pastdagi tugmani bosing "
+            "(yoki /skip yozing).",
+            reply_markup=_phone_request_keyboard(),
         )
     except Exception:  # noqa: BLE001
         logger.exception("Failed to send onboarding prompt to user=%s", target_user_id)
@@ -126,24 +141,19 @@ async def _handle_onboarding_step(message: Message, uid: int) -> bool:
         )
         return True
 
+    # "awaiting_fio" only exists as a stale state for anyone caught mid-flow
+    # by this change (F.I.O is no longer asked for) — auto-fill from
+    # Telegram's name and fall straight into asking for the phone, ignoring
+    # whatever text they just sent rather than leaving them stuck.
     if state == "awaiting_fio":
-        fio = (message.text or "").strip()
-        if not fio:
-            await message.answer(
-                "Iltimos, to'liq ismingizni matn ko'rinishida yuboring (F.I.O), "
-                "yoki /skip yozing."
-            )
-            return True
-        await access_control.save_profile_field(uid, "fio", fio)
+        full_name = await access_control.get_known_full_name(uid)
+        if full_name:
+            await access_control.save_profile_field(uid, "fio", full_name)
         await access_control.set_onboarding_state(uid, "awaiting_phone")
-        kb = ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text="📱 Raqamni yuborish", request_contact=True)]],
-            resize_keyboard=True, one_time_keyboard=True,
-        )
         await message.answer(
-            "Rahmat! Endi telefon raqamingizni yuboring — pastdagi tugmani bosing "
+            "Iltimos, telefon raqamingizni yuboring — pastdagi tugmani bosing "
             "(yoki /skip yozing).",
-            reply_markup=kb,
+            reply_markup=_phone_request_keyboard(),
         )
         return True
 

@@ -222,6 +222,24 @@ async def save_profile_field(user_id: int, field: str, value: str) -> None:
         _users_mem.setdefault(user_id, {})[field] = value
 
 
+async def get_known_full_name(user_id: int) -> str | None:
+    """The Telegram display name record_activity() already captured for this
+    user (first message or later) — used to auto-fill F.I.O without asking,
+    since Telegram exposes this name freely but NEVER the phone number
+    (that requires the user's own explicit contact-share action, no way
+    around it via the Bot API)."""
+    client = redis_client.get_client()
+    if client is None:
+        name = _users_mem.get(user_id, {}).get("full_name")
+        return name or None
+    try:
+        name = await client.hget(_user_key(user_id), "full_name")
+        return name or None
+    except Exception:  # noqa: BLE001
+        logger.exception("Redis get_known_full_name failed")
+        return _users_mem.get(user_id, {}).get("full_name") or None
+
+
 async def queue_pending(user_chat_id: int, message_id: int) -> None:
     """Stash a request that couldn't be forwarded because the admin's
     chat_id isn't known yet — see the bootstrap-gap note in the module
