@@ -38,8 +38,10 @@ from collections import deque
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 import redis_client
+from agents import get_agent
 from config import settings
 from llm_clients import claude_generate_json
+from router import model_for
 
 logger = logging.getLogger(__name__)
 
@@ -151,9 +153,26 @@ You are a business-chat assistant helping a busy professional handle their
 personal Telegram Business conversations. You're shown the recent exchange
 with a contact and their latest message. Respond with ONLY this JSON, no
 prose, no markdown fences:
-{"analysis": "<one short line: intent/tone/urgency, in Uzbek>",
+{"analysis": "<one short line: intent/tone/urgency, in Uzbek — this is for
+  the professional's own eyes, always Uzbek regardless of the contact's
+  language>",
  "is_task": true|false,
- "suggested_reply": "<ready-to-send reply, SAME language as the contact's message>"}
+ "suggested_reply": "<ready-to-send reply — language rule below>"}
+
+LANGUAGE RULE FOR suggested_reply — this is critical, follow it strictly:
+- Detect the contact's language from the GRAMMATICAL STRUCTURE of their
+  LATEST message, not isolated words or the script alone (Cyrillic is used
+  for both Uzbek and Russian).
+- Russian grammar/connectors (e.g. "как", "у вас", "для", "мне", "нужно",
+  "сделай", "брат", "давай") -> reply in RUSSIAN.
+- Uzbek grammar/connectors (e.g. "qiling", "kerak", "menga", "bo'ladi",
+  "aka", "-da", "-ni", or their Cyrillic-Uzbek equivalents) -> reply in
+  UZBEK.
+- Purely English grammar -> reply in ENGLISH.
+- The suggested_reply's language must match the CONTACT's latest message —
+  never default to Uzbek just because the professional's own facts/notes
+  are in Uzbek, and never keep replying in whatever language the LAST
+  suggestion happened to be in if the contact just switched languages.
 
 is_task=true when the contact is asking for actual professional work to be
 DONE — build/develop something, write a document, spec out a project,
@@ -161,9 +180,10 @@ quote a price/timeline, technical requirements, code, etc. — not just a
 quick question or small talk.
 
 When is_task=true, suggested_reply must be an HONEST holding reply only
-(e.g. "tushunarli, jamoam bilan ko'rib chiqib tez orada aniq javob
-beraman") — NEVER invent a commitment, timeline, price, or scope, since a
-real answer needs the specialist team's actual input first, not a guess.
+(e.g. Uzbek: "tushunarli, jamoam bilan ko'rib chiqib tez orada aniq javob
+beraman"; Russian: "понял(а), обсужу с командой и скоро дам точный ответ")
+— NEVER invent a commitment, timeline, price, or scope, since a real
+answer needs the specialist team's actual input first, not a guess.
 When is_task=false, suggested_reply is the real, ready-to-send answer.
 
 Keep the suggested reply natural, professional, and concise — something a
@@ -177,9 +197,13 @@ async def analyze(business_connection_id: str, customer_chat_id: int, sender_nam
         f"{'Contact' if h['role'] == 'them' else 'You'}: {h['text']}" for h in history[-6:]
     )
     context = f"Recent exchange:\n{convo}\n\nContact ({sender_name})'s latest message: {latest_text}"
+    # Customer-facing content (once approved) deserves the MAIN model, not
+    # the cheap routing-tier default — language-matching and tone reliably
+    # need the stronger model, same reasoning as minutes.py/document_generation.py.
+    model, _label = model_for(get_agent("ba"), "high")
     try:
         raw = await asyncio.wait_for(
-            claude_generate_json(_COPILOT_SYSTEM, [{"role": "user", "content": context}], max_tokens=400),
+            claude_generate_json(_COPILOT_SYSTEM, [{"role": "user", "content": context}], model=model, max_tokens=400),
             timeout=settings.request_timeout,
         )
         data = json.loads(raw)
