@@ -44,7 +44,7 @@ _TRIGGER_WORDS = (
     "remind", "reminder", "todo", "to-do",
 )
 
-_PRIORITY_EMOJI = {"low": "🟢", "medium": "🟡", "high": "🟠", "urgent": "🔴"}
+PRIORITY_EMOJI = {"low": "🟢", "medium": "🟡", "high": "🟠", "urgent": "🔴"}
 _RECURRENCE_LABEL = {"none": "", "daily": " (har kuni)", "weekdays": " (ish kunlari)", "weekly": " (har hafta)"}
 
 
@@ -147,14 +147,14 @@ def format_confirmation(task: tasks.Task) -> str:
     if task.description and task.description != task.title:
         lines.append(task.description)
     lines.append(f"🕒 Muddat: {due_local.strftime('%d-%m %H:%M')}")
-    emoji = _PRIORITY_EMOJI.get(task.priority, "🟡")
+    emoji = PRIORITY_EMOJI.get(task.priority, "🟡")
     lines.append(f"🔔 Eslatma: {remind_local.strftime('%d-%m %H:%M')} dan boshlab ({emoji} {task.priority})")
     return "\n".join(lines)
 
 
 def format_reminder(task: tasks.Task, is_final: bool) -> str:
     due_local = datetime.fromisoformat(task.due_at).astimezone(tasks.TZ)
-    emoji = _PRIORITY_EMOJI.get(task.priority, "🟡")
+    emoji = PRIORITY_EMOJI.get(task.priority, "🟡")
     header = "⏰ OXIRGI ESLATMA" if is_final else "⏰ Vazifa vaqti keldi"
     lines = [f"{header} {emoji}", f"📌 {task.title}"]
     if task.description and task.description != task.title:
@@ -165,7 +165,7 @@ def format_reminder(task: tasks.Task, is_final: bool) -> str:
 
 def format_task_line(task: tasks.Task) -> str:
     due_local = datetime.fromisoformat(task.due_at).astimezone(tasks.TZ)
-    emoji = _PRIORITY_EMOJI.get(task.priority, "🟡")
+    emoji = PRIORITY_EMOJI.get(task.priority, "🟡")
     rec = _RECURRENCE_LABEL.get(task.recurrence, "")
     return f"{emoji} `{task.id}` — {task.title} — {due_local.strftime('%d-%m %H:%M')}{rec}"
 
@@ -207,12 +207,12 @@ async def reminder_loop(bot: Bot) -> None:
         await asyncio.sleep(settings.reminder_poll_seconds)
 
 
-def _is_allowed(chat_id: int) -> bool:
+def is_allowed(chat_id: int) -> bool:
     return not settings.allowed_chat_ids or chat_id in settings.allowed_chat_ids
 
 
 async def _fire(bot: Bot, task: tasks.Task) -> None:
-    if not _is_allowed(task.chat_id):
+    if not is_allowed(task.chat_id):
         # Chat was removed from ALLOWED_CHAT_IDS after this task was scheduled
         # (tasks can outlive a redeploy via Redis) — drop the reminder rather
         # than deliver to a chat that's no longer authorised.
