@@ -366,6 +366,23 @@ def _is_allowed(chat_id: int) -> bool:
     return not settings.allowed_chat_ids or chat_id in settings.allowed_chat_ids
 
 
+async def _callback_still_authorized(callback: CallbackQuery) -> bool:
+    """Defense in depth for private-chat callback buttons (tsk:/min:): the
+    AccessGateMiddleware only runs on inbound messages, so a user who was
+    approved when a button was created but has since been /deny-revoked
+    would otherwise keep working the button forever — buttons don't get
+    retroactively disabled. Re-check per-user approval at click time. Group
+    callbacks stay governed by _is_allowed only, matching the message-level
+    gate's scope (access_control doesn't apply to groups)."""
+    if not callback.message or callback.message.chat.type != "private":
+        return True
+    uid = callback.from_user.id if callback.from_user else 0
+    uname = callback.from_user.username if callback.from_user else None
+    if access_control.is_admin(uid, uname):
+        return True
+    return await access_control.is_approved(uid)
+
+
 def _should_answer(message: Message, bot_username: str) -> bool:
     if message.chat.type == "private":
         return True
@@ -1601,6 +1618,9 @@ async def handle_minutes_callback(callback: CallbackQuery, bot: Bot) -> None:
     if not _is_allowed(chat_id):
         await callback.answer()
         return
+    if not await _callback_still_authorized(callback):
+        await callback.answer("Ruxsatingiz bekor qilingan.", show_alert=True)
+        return
     try:
         _, action, batch_id = callback.data.split(":", 2)
     except ValueError:
@@ -2007,6 +2027,9 @@ async def handle_task_callback(callback: CallbackQuery, bot: Bot) -> None:
     chat_id = callback.message.chat.id
     if not _is_allowed(chat_id):
         await callback.answer()
+        return
+    if not await _callback_still_authorized(callback):
+        await callback.answer("Ruxsatingiz bekor qilingan.", show_alert=True)
         return
     try:
         _, action, task_id = callback.data.split(":", 2)
