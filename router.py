@@ -141,17 +141,20 @@ class Route:
 def model_for(agent: Agent, complexity: str) -> tuple[str, str]:
     """Return (model_id, label) based on active provider and complexity.
 
-    hybrid: low  → OpenRouter fast (free routing)
-            high → Claude Sonnet (quality agent responses)
+    hybrid: low  → OpenRouter free model (simple questions — saves Claude usage)
+            high → Claude Sonnet (quality-critical work: documents, code, analysis)
+
+    llm_clients.claude_generate() routes per-call based on the returned
+    model id's shape (an OpenRouter id always contains "/"), so an OR id
+    from here correctly reaches OpenRouter's API instead of Claude's.
     """
     if settings.provider == "openrouter":
         if complexity == "low":
             return settings.or_fast_model, settings.or_fast_model_label
         return settings.or_main_model, settings.or_main_model_label
     if settings.provider == "hybrid":
-        # Agent responses always go to Claude — OR is only used internally for routing.
         if complexity == "low":
-            return settings.claude_fast_model, settings.claude_fast_model_label
+            return settings.or_fast_model, settings.or_fast_model_label
         return settings.claude_model, settings.claude_model_label
     # claude-only
     if complexity == "low":

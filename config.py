@@ -95,12 +95,14 @@ class Settings:
     or_main_model_label: str = field(
         default_factory=lambda: os.getenv("OR_MAIN_MODEL_LABEL", "Llama 4 Maverick (free)")
     )
-    # Fast model: routing/classification, memory extraction (cheap & quick).
+    # Fast model: routing/classification, memory extraction, AND (in hybrid
+    # mode) actual answers to low-complexity/simple questions — this is the
+    # model that keeps Claude usage down, so pick a genuinely good free one.
     or_fast_model: str = field(
-        default_factory=lambda: os.getenv("OR_FAST_MODEL", "meta-llama/llama-4-maverick:free")
+        default_factory=lambda: os.getenv("OR_FAST_MODEL", "google/gemini-2.0-flash-exp:free")
     )
     or_fast_model_label: str = field(
-        default_factory=lambda: os.getenv("OR_FAST_MODEL_LABEL", "Llama 4 Maverick (free)")
+        default_factory=lambda: os.getenv("OR_FAST_MODEL_LABEL", "Gemini 2.0 Flash (free)")
     )
     # Universal fallback — OpenRouter auto-picks best available free model.
     or_auto_model: str = field(
