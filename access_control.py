@@ -34,6 +34,7 @@ in-memory fallback pattern as the rest of the codebase.
 """
 
 import logging
+from datetime import datetime, timezone
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -51,6 +52,12 @@ _RELAY_TTL_SECONDS = 60 * 60 * 24 * 7  # a relay mapping needn't outlive a week
 _PENDING_LIST = "access:pending"
 _MAX_PENDING = 500  # bound the queue in case the admin identity is never bootstrapped
 _SEEN_SET = "access:seen"
+_KNOWN_SET = "access:known"
+
+
+def _user_key(user_id: int) -> str:
+    return f"access:user:{user_id}"
+
 
 # --- in-memory fallback ---
 _approved_mem: set[int] = set()
@@ -59,6 +66,7 @@ _admin_chat_mem: int | None = None
 _pending_mem: list[tuple[int, int]] = []  # [(user_chat_id, message_id), ...]
 _relay_mem: dict[int, int] = {}  # admin-side message_id -> user chat_id
 _seen_mem: set[int] = set()
+_users_mem: dict[int, dict] = {}  # user_id -> {full_name, username, first_seen, last_seen, message_count}
 
 
 def is_admin(user_id: int, username: str | None) -> bool:
@@ -242,3 +250,80 @@ def access_keyboard(user_id: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="✅ Ruxsat berish", callback_data=f"acc:a:{user_id}"),
         InlineKeyboardButton(text="❌ Rad etish", callback_data=f"acc:r:{user_id}"),
     ]])
+
+
+# --------------------------------------------------------------------------
+# User directory — lets the admin see who has talked to the bot, when, and
+# how much, regardless of approval status (/users in bot.py).
+# --------------------------------------------------------------------------
+async def record_activity(user_id: int, username: str | None, full_name: str | None) -> None:
+    """Update (creating on first contact) this user's activity record.
+    Called on every private-chat message from a non-admin user — including
+    already-approved ones — so /users reflects real usage, not just
+    pending-request traffic."""
+    now = datetime.now(timezone.utc).isoformat()
+    client = redis_client.get_client()
+    if client is None:
+        rec = _users_mem.setdefault(user_id, {"first_seen": now, "message_count": "0"})
+        rec["username"] = username or ""
+        rec["full_name"] = full_name or ""
+        rec["last_seen"] = now
+        # Keep as str in-memory too — Redis hashes always return strings via
+        # hgetall, and list_users()/the /users display shouldn't have to
+        # care which backend served a given record.
+        rec["message_count"] = str(int(rec.get("message_count", "0")) + 1)
+        return
+    try:
+        async with client.pipeline(transaction=True) as pipe:
+            pipe.hsetnx(_user_key(user_id), "first_seen", now)
+            pipe.hset(_user_key(user_id), mapping={
+                "username": username or "", "full_name": full_name or "", "last_seen": now,
+            })
+            pipe.hincrby(_user_key(user_id), "message_count", 1)
+            pipe.sadd(_KNOWN_SET, user_id)
+            await pipe.execute()
+    except Exception:  # noqa: BLE001
+        logger.exception("Redis record_activity failed")
+        rec = _users_mem.setdefault(user_id, {"first_seen": now, "message_count": "0"})
+        rec["username"] = username or ""
+        rec["full_name"] = full_name or ""
+        rec["last_seen"] = now
+        # Keep as str in-memory too — Redis hashes always return strings via
+        # hgetall, and list_users()/the /users display shouldn't have to
+        # care which backend served a given record.
+        rec["message_count"] = str(int(rec.get("message_count", "0")) + 1)
+
+
+async def list_users() -> list[dict]:
+    """Every user who has ever messaged the bot (or been approved/denied
+    directly), newest activity first, each with a 'status' of
+    pending/approved/denied merged in."""
+    client = redis_client.get_client()
+    if client is None:
+        ids = set(_users_mem) | _approved_mem | _denied_mem
+        out = []
+        for uid in ids:
+            rec = dict(_users_mem.get(uid, {}))
+            rec["user_id"] = uid
+            rec["status"] = "approved" if uid in _approved_mem else ("denied" if uid in _denied_mem else "pending")
+            out.append(rec)
+        out.sort(key=lambda r: r.get("last_seen", ""), reverse=True)
+        return out
+    try:
+        known_raw, approved_raw, denied_raw = await client.smembers(_KNOWN_SET), \
+            await client.smembers(_APPROVED_SET), await client.smembers(_DENIED_SET)
+        approved_ids = {int(x) for x in approved_raw}
+        denied_ids = {int(x) for x in denied_raw}
+        all_ids = {int(x) for x in known_raw} | approved_ids | denied_ids
+        out = []
+        for uid in all_ids:
+            raw = await client.hgetall(_user_key(uid))
+            rec = dict(raw)
+            rec["user_id"] = uid
+            rec["status"] = "approved" if uid in approved_ids else ("denied" if uid in denied_ids else "pending")
+            out.append(rec)
+        out.sort(key=lambda r: r.get("last_seen", ""), reverse=True)
+        return out
+    except Exception:  # noqa: BLE001
+        logger.exception("Redis list_users failed")
+        return []
