@@ -54,6 +54,12 @@ _MAX_PENDING = 500  # bound the queue in case the admin identity is never bootst
 _SEEN_SET = "access:seen"
 _KNOWN_SET = "access:known"
 
+# Post-approval onboarding: collect F.I.O + phone number before the user's
+# messages reach the normal AI pipeline. States: "awaiting_fio" ->
+# "awaiting_phone" -> "done". No entry / None means no onboarding pending
+# (never approved yet, or approved before this feature existed).
+_ONBOARD_STATE_KEY = "access:onboard:state"  # hash: user_id -> state
+
 
 def _user_key(user_id: int) -> str:
     return f"access:user:{user_id}"
@@ -63,6 +69,7 @@ def _user_key(user_id: int) -> str:
 _approved_mem: set[int] = set()
 _denied_mem: set[int] = set()
 _admin_chat_mem: int | None = None
+_onboard_state_mem: dict[int, str] = {}
 _pending_mem: list[tuple[int, int]] = []  # [(user_chat_id, message_id), ...]
 _relay_mem: dict[int, int] = {}  # admin-side message_id -> user chat_id
 _seen_mem: set[int] = set()
@@ -173,6 +180,46 @@ async def deny(user_id: int) -> None:
         logger.exception("Redis deny failed")
         _denied_mem.add(user_id)
         _approved_mem.discard(user_id)
+
+
+# --------------------------------------------------------------------------
+# Post-approval onboarding: F.I.O + phone number collection
+# --------------------------------------------------------------------------
+async def set_onboarding_state(user_id: int, state: str) -> None:
+    client = redis_client.get_client()
+    if client is None:
+        _onboard_state_mem[user_id] = state
+        return
+    try:
+        await client.hset(_ONBOARD_STATE_KEY, str(user_id), state)
+    except Exception:  # noqa: BLE001
+        logger.exception("Redis set_onboarding_state failed")
+        _onboard_state_mem[user_id] = state
+
+
+async def get_onboarding_state(user_id: int) -> str | None:
+    client = redis_client.get_client()
+    if client is None:
+        return _onboard_state_mem.get(user_id)
+    try:
+        return await client.hget(_ONBOARD_STATE_KEY, str(user_id))
+    except Exception:  # noqa: BLE001
+        logger.exception("Redis get_onboarding_state failed")
+        return _onboard_state_mem.get(user_id)
+
+
+async def save_profile_field(user_id: int, field: str, value: str) -> None:
+    """Writes into the SAME per-user hash record_activity() uses, so
+    list_users() picks up fio/phone automatically with no extra round-trip."""
+    client = redis_client.get_client()
+    if client is None:
+        _users_mem.setdefault(user_id, {})[field] = value
+        return
+    try:
+        await client.hset(_user_key(user_id), field, value)
+    except Exception:  # noqa: BLE001
+        logger.exception("Redis save_profile_field failed")
+        _users_mem.setdefault(user_id, {})[field] = value
 
 
 async def queue_pending(user_chat_id: int, message_id: int) -> None:

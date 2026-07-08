@@ -47,7 +47,15 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatAction
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject
-from aiogram.types import BufferedInputFile, BusinessConnection, CallbackQuery, Message
+from aiogram.types import (
+    BufferedInputFile,
+    BusinessConnection,
+    CallbackQuery,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
 
 import access_control
 import business_copilot
@@ -78,6 +86,83 @@ logger = logging.getLogger("orchestrator")
 dp = Dispatcher()
 
 TELEGRAM_LIMIT = 4096
+
+# --------------------------------------------------------------------------
+# Post-approval onboarding — collect F.I.O + phone number before an
+# approved user's messages reach the normal AI pipeline.
+# --------------------------------------------------------------------------
+async def _start_onboarding(bot: Bot, target_user_id: int) -> None:
+    """Call right after approve() — kicks off the F.I.O/phone collection by
+    setting state and sending the first prompt. Shared by /approve and the
+    ✅ button so both paths behave identically."""
+    await access_control.set_onboarding_state(target_user_id, "awaiting_fio")
+    try:
+        await bot.send_message(
+            target_user_id,
+            "✅ Sizga botdan foydalanish uchun ruxsat berildi!\n\n"
+            "Endi bir necha ma'lumotingizni so'rayman. Iltimos, to'liq ismingizni "
+            "(F.I.O) yozib yuboring.\n\n"
+            "(Bu qadamni o'tkazib yuborish uchun /skip yozing.)",
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to send onboarding prompt to user=%s", target_user_id)
+
+
+async def _handle_onboarding_step(message: Message, uid: int) -> bool:
+    """If this approved user still has a pending onboarding step, consume
+    this message as that step's answer and return True (caller must NOT
+    fall through to the normal AI pipeline for this message). Returns False
+    if there's no onboarding pending (already done, or never started —
+    users approved before this feature existed)."""
+    state = await access_control.get_onboarding_state(uid)
+    if state not in ("awaiting_fio", "awaiting_phone"):
+        return False
+
+    if (message.text or "").strip().lower().startswith("/skip"):
+        await access_control.set_onboarding_state(uid, "done")
+        await message.answer(
+            "Yaxshi, o'tkazib yubordik. Savolingiz bo'lsa yozishingiz mumkin.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return True
+
+    if state == "awaiting_fio":
+        fio = (message.text or "").strip()
+        if not fio:
+            await message.answer(
+                "Iltimos, to'liq ismingizni matn ko'rinishida yuboring (F.I.O), "
+                "yoki /skip yozing."
+            )
+            return True
+        await access_control.save_profile_field(uid, "fio", fio)
+        await access_control.set_onboarding_state(uid, "awaiting_phone")
+        kb = ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="📱 Raqamni yuborish", request_contact=True)]],
+            resize_keyboard=True, one_time_keyboard=True,
+        )
+        await message.answer(
+            "Rahmat! Endi telefon raqamingizni yuboring — pastdagi tugmani bosing "
+            "(yoki /skip yozing).",
+            reply_markup=kb,
+        )
+        return True
+
+    if state == "awaiting_phone":
+        if message.contact and message.contact.user_id == uid:
+            await access_control.save_profile_field(uid, "phone", message.contact.phone_number)
+            await access_control.set_onboarding_state(uid, "done")
+            await message.answer(
+                "✅ Ma'lumotlaringiz saqlandi. Endi savolingizni yozishingiz mumkin.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            return True
+        await message.answer(
+            "Iltimos, pastdagi \"📱 Raqamni yuborish\" tugmasini bosing (yoki /skip yozing)."
+        )
+        return True
+
+    return False
+
 
 # --------------------------------------------------------------------------
 # Admin-approval gate (private chats only) — runs before every other handler
@@ -254,6 +339,8 @@ class AccessGateMiddleware(BaseMiddleware):
         await access_control.record_activity(uid, uname, event.from_user.full_name)
 
         if await access_control.is_approved(uid):
+            if await _handle_onboarding_step(event, uid):
+                return
             return await handler(event, data)
 
         await _handle_unapproved(event)
@@ -1690,13 +1777,7 @@ async def handle_access_callback(callback: CallbackQuery, bot: Bot) -> None:
             await callback.message.edit_text(old + "\n\n✅ RUXSAT BERILDI", reply_markup=None)
         except Exception:  # noqa: BLE001 — best-effort cosmetic edit (stale/inaccessible message, etc.)
             pass
-        try:
-            await bot.send_message(
-                target_id,
-                "✅ Sizga botdan foydalanish uchun ruxsat berildi! Endi savolingizni yozishingiz mumkin.",
-            )
-        except Exception:  # noqa: BLE001
-            logger.exception("Failed to notify approved user=%s", target_id)
+        await _start_onboarding(bot, target_id)
         return
 
     if action == "r":
@@ -1729,12 +1810,7 @@ async def cmd_approve(message: Message, command: CommandObject) -> None:
     target = int(arg)
     await access_control.approve(target)
     await message.answer(f"✅ {target} ga ruxsat berildi.")
-    try:
-        await message.bot.send_message(
-            target, "✅ Sizga botdan foydalanish uchun ruxsat berildi! Endi savolingizni yozishingiz mumkin."
-        )
-    except Exception:  # noqa: BLE001
-        logger.exception("Failed to notify approved user=%s", target)
+    await _start_onboarding(message.bot, target)
 
 
 @dp.message(Command("deny"))
@@ -1772,10 +1848,15 @@ async def cmd_users(message: Message) -> None:
         uname_disp = f"@{u['username']}" if u.get("username") else "(username yo'q)"
         last_seen = (u.get("last_seen") or "")[:16].replace("T", " ")
         count = u.get("message_count") or "0"
-        lines.append(
+        line = (
             f"{emoji} {name} {uname_disp} — ID: `{u['user_id']}` — {count} xabar"
             + (f" — oxirgi: {last_seen}" if last_seen else "")
         )
+        if u.get("fio"):
+            line += f"\n   👤 F.I.O: {u['fio']}"
+        if u.get("phone"):
+            line += f"\n   📱 {u['phone']}"
+        lines.append(line)
     lines.append(
         "\n⏳ kutilmoqda · ✅ ruxsat berilgan · ❌ rad etilgan\n"
         "Ruxsat berish: /approve <id>   Bekor qilish: /deny <id>"
