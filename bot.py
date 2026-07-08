@@ -26,6 +26,12 @@ Commands:
   /readfile — pull current file from GitHub into conversation
   /reset — clear chat history
   /status — show configuration health
+  /users — admin: see everyone who's messaged the bot, approve/deny them
+
+Business copilot (automatic, no command): if the admin connects this bot to
+their own personal chats via Telegram's Settings > Business > Chatbots,
+incoming messages there get AI-analyzed with a suggested reply sent to the
+admin's own DM with the bot — see business_copilot.py.
 
 Run:  python bot.py
 """
@@ -41,9 +47,10 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatAction
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject
-from aiogram.types import BufferedInputFile, CallbackQuery, Message
+from aiogram.types import BufferedInputFile, BusinessConnection, CallbackQuery, Message
 
 import access_control
+import business_copilot
 import decisions as decisions_store
 import digest
 import document_generation as docgen
@@ -182,6 +189,25 @@ async def _relay_admin_reply(admin_message: Message, target_chat_id: int) -> Non
         await admin_message.reply("⚠️ Yuborib bo'lmadi (foydalanuvchi botni bloklagan bo'lishi mumkin).")
 
 
+async def _relay_business_reply(admin_message: Message, relay_msg_id: int, relay: dict) -> None:
+    """Admin replied to a business-copilot notification with their OWN text
+    (instead of tapping the suggested-reply button) — send that text into
+    the connected Business chat as themselves."""
+    bot = admin_message.bot
+    text = admin_message.text or admin_message.caption
+    if not text:
+        await admin_message.reply("⚠️ Faqat matn yuborish mumkin.")
+        return
+    try:
+        await bot.send_message(relay["chat"], text, business_connection_id=relay["conn"])
+        await business_copilot.append_own_message(relay["conn"], relay["chat"], text)
+        await business_copilot.clear_relay(relay_msg_id)
+        await admin_message.reply("✅ Yuborildi.")
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to relay admin's custom business-chat reply")
+        await admin_message.reply("⚠️ Yuborib bo'lmadi.")
+
+
 class AccessGateMiddleware(BaseMiddleware):
     """Gates PRIVATE chats behind admin approval. Group access is untouched
     — it stays governed by ALLOWED_CHAT_IDS / mention-required logic below."""
@@ -201,6 +227,10 @@ class AccessGateMiddleware(BaseMiddleware):
                 target = await access_control.resolve_relay(event.reply_to_message.message_id)
                 if target is not None:
                     await _relay_admin_reply(event, target)
+                    return
+                biz_relay = await business_copilot.resolve_relay(event.reply_to_message.message_id)
+                if biz_relay is not None:
+                    await _relay_business_reply(event, event.reply_to_message.message_id, biz_relay)
                     return
 
             bot = event.bot
@@ -1731,6 +1761,146 @@ async def cmd_users(message: Message) -> None:
         "Ruxsat berish: /approve <id>   Bekor qilish: /deny <id>"
     )
     await _send_long(message, "\n".join(lines))
+
+
+# --------------------------------------------------------------------------
+# Business copilot — Telegram's native "Business > Chat automation" feature.
+# Separate update types (business_connection / business_message), unrelated
+# to the normal message flow above; see business_copilot.py for the design.
+# --------------------------------------------------------------------------
+@dp.business_connection()
+async def handle_business_connection(connection: BusinessConnection) -> None:
+    owner_id = connection.user.id
+    owner_uname = connection.user.username
+    if not access_control.is_admin(owner_id, owner_uname):
+        logger.warning(
+            "business_connection from non-admin user=%s — ignoring (only the "
+            "configured admin's Business account is supported).", owner_id,
+        )
+        return
+    await business_copilot.save_connection(connection.id, owner_id, connection.user_chat_id, connection.is_enabled)
+    logger.info(
+        "Business connection %s %s for admin=%s",
+        connection.id, "enabled" if connection.is_enabled else "disabled", owner_id,
+    )
+
+
+@dp.business_message()
+async def handle_business_message(message: Message, bot: Bot) -> None:
+    conn_id = message.business_connection_id
+    if not conn_id:
+        return
+
+    conn = await business_copilot.get_connection(conn_id)
+    if conn is None:
+        try:
+            bc = await bot.get_business_connection(conn_id)
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to fetch business connection %s", conn_id)
+            return
+        if not access_control.is_admin(bc.user.id, bc.user.username):
+            return
+        await business_copilot.save_connection(bc.id, bc.user.id, bc.user_chat_id, bc.is_enabled)
+        conn = {"owner_user_id": bc.user.id, "owner_chat_id": bc.user_chat_id, "is_enabled": bc.is_enabled}
+
+    sender = message.from_user
+    text = message.text or message.caption or "(media xabar)"
+
+    if sender and sender.id == conn["owner_user_id"]:
+        # The admin's own outgoing message in a connected chat (sent from
+        # their phone, not via this bot) — just keep it in context, don't
+        # analyze/notify about their own words.
+        await business_copilot.append_own_message(conn_id, message.chat.id, text)
+        return
+
+    if not conn.get("is_enabled", True):
+        return
+
+    sender_name = sender.full_name if sender else "Noma'lum"
+    await business_copilot.append_contact_message(conn_id, message.chat.id, text)
+
+    owner_chat_id = conn["owner_chat_id"]
+    data = await business_copilot.analyze(conn_id, message.chat.id, sender_name, text)
+    if data is None:
+        try:
+            await bot.send_message(
+                owner_chat_id,
+                f"💼 {sender_name} sizga yozdi:\n\n{text}\n\n⚠️ AI tahlili muvaffaqiyatsiz — o'zingiz javob yozing.",
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to notify admin of business message (analysis failed)")
+        return
+
+    analysis = data.get("analysis", "")
+    suggested = data.get("suggested_reply", "")
+    card = (
+        f"💼 {sender_name} sizga yozdi:\n\n\"{text}\"\n\n"
+        f"🧠 Tahlil: {analysis}\n\n"
+        f"💬 Taklif qilingan javob:\n{suggested}\n\n"
+        "Yuborish uchun tugmani bosing, yoki shu xabarga Reply qilib o'zingiz "
+        "yozgan javobni yuboring."
+    )
+    try:
+        sent = await bot.send_message(owner_chat_id, card)
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to send business-copilot notification to admin")
+        return
+
+    await business_copilot.link_relay(sent.message_id, conn_id, message.chat.id, suggested)
+    try:
+        await sent.edit_reply_markup(reply_markup=business_copilot.suggestion_keyboard(sent.message_id))
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to attach business-copilot suggestion buttons")
+
+
+@dp.callback_query(F.data.startswith("biz:"))
+async def handle_business_copilot_callback(callback: CallbackQuery, bot: Bot) -> None:
+    if not callback.data or not callback.message:
+        await callback.answer()
+        return
+    admin_uid = callback.from_user.id if callback.from_user else 0
+    admin_uname = callback.from_user.username if callback.from_user else None
+    if not access_control.is_admin(admin_uid, admin_uname):
+        await callback.answer("Faqat admin uchun.", show_alert=True)
+        return
+    try:
+        _, action, msg_id_s = callback.data.split(":", 2)
+        relay_msg_id = int(msg_id_s)
+    except ValueError:
+        await callback.answer()
+        return
+
+    relay = await business_copilot.resolve_relay(relay_msg_id)
+    if relay is None:
+        await callback.answer("Bu so'rov eskirgan.", show_alert=True)
+        return
+
+    if action == "i":
+        await business_copilot.clear_relay(relay_msg_id)
+        await callback.answer("E'tiborsiz qoldirildi")
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:  # noqa: BLE001
+            pass
+        return
+
+    if action == "s":
+        try:
+            await bot.send_message(relay["chat"], relay["reply"], business_connection_id=relay["conn"])
+            await business_copilot.append_own_message(relay["conn"], relay["chat"], relay["reply"])
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to send business-copilot suggested reply")
+            await callback.answer("⚠️ Yuborib bo'lmadi.", show_alert=True)
+            return
+        await business_copilot.clear_relay(relay_msg_id)
+        await callback.answer("Yuborildi ✅")
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:  # noqa: BLE001
+            pass
+        return
+
+    await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("tsk:"))
