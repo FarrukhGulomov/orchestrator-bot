@@ -18,9 +18,19 @@ which Telegram only allows once the bot has *received* at least one message
 from that chat) is learned automatically the first time a message from the
 admin identity arrives, and persisted from then on.
 
-Storage: Redis (approved/denied sets, learned admin chat_id, and the
-relay-message-id -> user-chat-id map used to route admin replies), with the
-same in-memory fallback pattern as the rest of the codebase.
+BOOTSTRAP GAP THIS MODULE HANDLES: if a regular user messages the bot
+BEFORE the admin has ever sent the bot a single message (so the admin's
+chat_id isn't known yet — no ADMIN_USER_ID configured), there is nowhere to
+push that user's request to. Without special handling that request would be
+silently dropped forever. Instead it's queued (queue_pending); the moment
+the admin identity is next recognized, the whole queue is flushed to them
+(see bot.py's AccessGateMiddleware) — so no early request is lost, it's
+just delayed until the admin's first message.
+
+Storage: Redis (approved/denied sets, learned admin chat_id, the
+relay-message-id -> user-chat-id map used to route admin replies, and the
+pending-request queue for the bootstrap gap above), with the same
+in-memory fallback pattern as the rest of the codebase.
 """
 
 import logging
@@ -32,18 +42,23 @@ from config import settings
 
 logger = logging.getLogger(__name__)
 
+_ADMIN_USERNAME_NORM = (settings.admin_username or "").lstrip("@").strip().lower()
+
 _APPROVED_SET = "access:approved"
 _DENIED_SET = "access:denied"
 _ADMIN_CHAT_KEY = "access:admin_chat_id"
 _RELAY_TTL_SECONDS = 60 * 60 * 24 * 7  # a relay mapping needn't outlive a week
-
-_ADMIN_USERNAME_NORM = (settings.admin_username or "").lstrip("@").strip().lower()
+_PENDING_LIST = "access:pending"
+_MAX_PENDING = 500  # bound the queue in case the admin identity is never bootstrapped
+_SEEN_SET = "access:seen"
 
 # --- in-memory fallback ---
 _approved_mem: set[int] = set()
 _denied_mem: set[int] = set()
 _admin_chat_mem: int | None = None
+_pending_mem: list[tuple[int, int]] = []  # [(user_chat_id, message_id), ...]
 _relay_mem: dict[int, int] = {}  # admin-side message_id -> user chat_id
+_seen_mem: set[int] = set()
 
 
 def is_admin(user_id: int, username: str | None) -> bool:
@@ -93,6 +108,29 @@ async def is_approved(user_id: int) -> bool:
         return user_id in _approved_mem
 
 
+async def mark_first_contact(user_id: int) -> bool:
+    """Returns True the FIRST time this unapproved user is seen, False on
+    every call after — lets the gate show the full "you need approval"
+    explanation only once, then a short acknowledgment, so a back-and-forth
+    with the admin (asking questions while waiting) doesn't repeat a wall of
+    text on every single message."""
+    client = redis_client.get_client()
+    if client is None:
+        if user_id in _seen_mem:
+            return False
+        _seen_mem.add(user_id)
+        return True
+    try:
+        added = await client.sadd(_SEEN_SET, user_id)
+        return bool(added)
+    except Exception:  # noqa: BLE001
+        logger.exception("Redis mark_first_contact failed")
+        if user_id in _seen_mem:
+            return False
+        _seen_mem.add(user_id)
+        return True
+
+
 async def approve(user_id: int) -> None:
     client = redis_client.get_client()
     if client is None:
@@ -127,6 +165,52 @@ async def deny(user_id: int) -> None:
         logger.exception("Redis deny failed")
         _denied_mem.add(user_id)
         _approved_mem.discard(user_id)
+
+
+async def queue_pending(user_chat_id: int, message_id: int) -> None:
+    """Stash a request that couldn't be forwarded because the admin's
+    chat_id isn't known yet — see the bootstrap-gap note in the module
+    docstring. Flushed by pop_all_pending() once the admin is recognized."""
+    client = redis_client.get_client()
+    entry = f"{user_chat_id}:{message_id}"
+    if client is None:
+        _pending_mem.append((user_chat_id, message_id))
+        del _pending_mem[: max(0, len(_pending_mem) - _MAX_PENDING)]
+        return
+    try:
+        async with client.pipeline(transaction=True) as pipe:
+            pipe.rpush(_PENDING_LIST, entry)
+            pipe.ltrim(_PENDING_LIST, -_MAX_PENDING, -1)
+            await pipe.execute()
+    except Exception:  # noqa: BLE001
+        logger.exception("Redis queue_pending failed")
+        _pending_mem.append((user_chat_id, message_id))
+        del _pending_mem[: max(0, len(_pending_mem) - _MAX_PENDING)]
+
+
+async def pop_all_pending() -> list[tuple[int, int]]:
+    """Return and clear every queued (user_chat_id, message_id) pair."""
+    client = redis_client.get_client()
+    if client is None:
+        out = list(_pending_mem)
+        _pending_mem.clear()
+        return out
+    try:
+        async with client.pipeline(transaction=True) as pipe:
+            pipe.lrange(_PENDING_LIST, 0, -1)
+            pipe.delete(_PENDING_LIST)
+            results = await pipe.execute()
+        out = []
+        for entry in results[0]:
+            cid_s, _, mid_s = entry.partition(":")
+            if cid_s.lstrip("-").isdigit() and mid_s.isdigit():
+                out.append((int(cid_s), int(mid_s)))
+        return out
+    except Exception:  # noqa: BLE001
+        logger.exception("Redis pop_all_pending failed")
+        out = list(_pending_mem)
+        _pending_mem.clear()
+        return out
 
 
 async def link_relay(admin_message_id: int, user_chat_id: int) -> None:
