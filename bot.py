@@ -75,56 +75,90 @@ TELEGRAM_LIMIT = 4096
 # --------------------------------------------------------------------------
 # Admin-approval gate (private chats only) — runs before every other handler
 # --------------------------------------------------------------------------
+async def _forward_request_to_admin(
+    bot: Bot, admin_chat_id: int, user_chat_id: int, message_id: int, info_text: str
+) -> None:
+    """Forward one access request to the admin (message content + an info
+    card with Approve/Reject buttons), linking both as valid relay targets
+    for the admin's native Telegram "Reply". Shared by the live path
+    (_handle_unapproved) and the queued-backlog flush (_deliver_pending_list)."""
+    fwd = None
+    try:
+        fwd = await bot.forward_message(admin_chat_id, user_chat_id, message_id)
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to forward access request (user chat=%s) to admin", user_chat_id)
+
+    try:
+        info = await bot.send_message(
+            admin_chat_id, info_text, reply_markup=access_control.access_keyboard(user_chat_id)
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to send access request card (user chat=%s) to admin", user_chat_id)
+        return
+
+    if fwd is not None:
+        await access_control.link_relay(fwd.message_id, user_chat_id)
+    await access_control.link_relay(info.message_id, user_chat_id)
+
+
 async def _handle_unapproved(message: Message) -> None:
     """An unapproved, non-admin private-chat user messaged the bot: tell them
     to contact the admin, and relay their message (with Approve/Reject
-    buttons) to the admin if the admin's chat is already known."""
+    buttons) to the admin — or, if the admin's chat isn't known YET (admin
+    hasn't bootstrapped by messaging the bot even once), queue it so it's
+    delivered the moment the admin is next recognized instead of being lost."""
     bot = message.bot
     handle = (settings.admin_username or "admin").lstrip("@")
+    uid_for_seen = message.from_user.id if message.from_user else message.chat.id
 
-    await message.answer(
-        f"🔒 Ushbu botdan foydalanish uchun admin ruxsati kerak.\n"
-        f"Ruxsat olish uchun @{handle} ga murojaat qiling.\n"
-        f"Xabaringiz allaqachon yuborildi — ruxsat berilgach xabar beramiz."
-    )
+    # Full explanation only on the first-ever message from this user; after
+    # that, a short acknowledgment — so a real back-and-forth with the admin
+    # (asking questions while waiting for approval) doesn't repeat a wall of
+    # text every time. They can still freely message the admin either way;
+    # only the OTHER bot features stay gated until approved.
+    if await access_control.mark_first_contact(uid_for_seen):
+        await message.answer(
+            f"🔒 Ushbu botdan foydalanish uchun admin ruxsati kerak.\n"
+            f"Ruxsat olish uchun @{handle} ga murojaat qiling.\n"
+            f"Savollaringiz bo'lsa shu yerga yozavering — xabaringiz @{handle} ga yetkaziladi."
+        )
+    else:
+        await message.answer(f"✅ Xabaringiz @{handle} ga yuborildi.")
 
     admin_chat_id = await access_control.get_admin_chat_id()
     if not admin_chat_id or bot is None:
-        logger.warning(
-            "Unapproved user=%s messaged but admin chat_id not yet known "
-            "(admin hasn't messaged the bot yet, or ADMIN_USERNAME/ADMIN_USER_ID is misconfigured).",
+        logger.info(
+            "Unapproved user=%s messaged before admin was recognized — queued for delivery.",
             message.from_user.id if message.from_user else "?",
         )
+        await access_control.queue_pending(message.chat.id, message.message_id)
         return
 
     user = message.from_user
     name = user.full_name if user else "Noma'lum"
     uname = f"@{user.username}" if user and user.username else "(username yo'q)"
     uid = user.id if user else 0
+    info_text = (
+        f"👤 {name} {uname} (ID: {uid}) botdan foydalanishga ruxsat so'rayapti.\n\n"
+        "Ruxsat berish uchun tugmani bosing, yoki shu xabarga (yoki yuqoridagi "
+        "forward qilingan xabarga) Reply qilib to'g'ridan-to'g'ri javob yozing."
+    )
+    await _forward_request_to_admin(bot, admin_chat_id, message.chat.id, message.message_id, info_text)
 
-    fwd = None
-    try:
-        fwd = await bot.forward_message(admin_chat_id, message.chat.id, message.message_id)
-    except Exception:  # noqa: BLE001
-        logger.exception("Failed to forward unapproved user's message to admin")
 
-    try:
-        info = await bot.send_message(
-            admin_chat_id,
-            f"👤 {name} {uname} (ID: {uid}) botdan foydalanishga ruxsat so'rayapti.\n\n"
-            "Ruxsat berish uchun tugmani bosing, yoki shu xabarga (yoki yuqoridagi "
-            "forward qilingan xabarga) Reply qilib to'g'ridan-to'g'ri javob yozing.",
-            reply_markup=access_control.access_keyboard(uid),
-        )
-    except Exception:  # noqa: BLE001
-        logger.exception("Failed to send access request card to admin")
+async def _deliver_pending_list(bot: Bot, admin_chat_id: int, pending: list[tuple[int, int]]) -> None:
+    """Flush access requests that were queued while the admin's chat_id
+    wasn't known yet. `pending` must already be popped (see
+    access_control.pop_all_pending) — this function only delivers."""
+    if not pending:
         return
-
-    # Link BOTH the forwarded message and the info card as relay targets, so
-    # the admin can hit "Reply" on either one and it still routes correctly.
-    if fwd is not None:
-        await access_control.link_relay(fwd.message_id, message.chat.id)
-    await access_control.link_relay(info.message_id, message.chat.id)
+    try:
+        await bot.send_message(admin_chat_id, f"📥 Kutib turgan {len(pending)} ta ruxsat so'rovi bor edi:")
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to send pending-backlog notice to admin")
+    for user_chat_id, message_id in pending:
+        info_text = f"👤 ID: {user_chat_id} — botdan foydalanishga ruxsat so'ragan (kutib turgan so'rov)."
+        await _forward_request_to_admin(bot, admin_chat_id, user_chat_id, message_id, info_text)
 
 
 async def _relay_admin_reply(admin_message: Message, target_chat_id: int) -> None:
@@ -155,12 +189,29 @@ class AccessGateMiddleware(BaseMiddleware):
         uname = event.from_user.username
 
         if access_control.is_admin(uid, uname):
+            previously_known = bool(await access_control.get_admin_chat_id())
             await access_control.remember_admin_chat(event.chat.id)
+
             if event.reply_to_message:
                 target = await access_control.resolve_relay(event.reply_to_message.message_id)
                 if target is not None:
                     await _relay_admin_reply(event, target)
                     return
+
+            bot = event.bot
+            if bot is not None:
+                pending = await access_control.pop_all_pending()
+                if pending:
+                    await _deliver_pending_list(bot, event.chat.id, pending)
+                elif not previously_known:
+                    try:
+                        await bot.send_message(
+                            event.chat.id,
+                            "✅ Siz admin sifatida aniqlandingiz. Endi foydalanuvchilarning "
+                            "ruxsat so'rovlari shu yerga keladi.",
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.exception("Failed to send admin-bootstrap confirmation")
             return await handler(event, data)
 
         if await access_control.is_approved(uid):
