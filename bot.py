@@ -36,13 +36,14 @@ import logging
 import re
 import time
 
-from aiogram import Bot, Dispatcher, F
+from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatAction
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
+import access_control
 import decisions as decisions_store
 import digest
 import document_generation as docgen
@@ -70,6 +71,106 @@ logger = logging.getLogger("orchestrator")
 dp = Dispatcher()
 
 TELEGRAM_LIMIT = 4096
+
+# --------------------------------------------------------------------------
+# Admin-approval gate (private chats only) — runs before every other handler
+# --------------------------------------------------------------------------
+async def _handle_unapproved(message: Message) -> None:
+    """An unapproved, non-admin private-chat user messaged the bot: tell them
+    to contact the admin, and relay their message (with Approve/Reject
+    buttons) to the admin if the admin's chat is already known."""
+    bot = message.bot
+    handle = (settings.admin_username or "admin").lstrip("@")
+
+    await message.answer(
+        f"🔒 Ushbu botdan foydalanish uchun admin ruxsati kerak.\n"
+        f"Ruxsat olish uchun @{handle} ga murojaat qiling.\n"
+        f"Xabaringiz allaqachon yuborildi — ruxsat berilgach xabar beramiz."
+    )
+
+    admin_chat_id = await access_control.get_admin_chat_id()
+    if not admin_chat_id or bot is None:
+        logger.warning(
+            "Unapproved user=%s messaged but admin chat_id not yet known "
+            "(admin hasn't messaged the bot yet, or ADMIN_USERNAME/ADMIN_USER_ID is misconfigured).",
+            message.from_user.id if message.from_user else "?",
+        )
+        return
+
+    user = message.from_user
+    name = user.full_name if user else "Noma'lum"
+    uname = f"@{user.username}" if user and user.username else "(username yo'q)"
+    uid = user.id if user else 0
+
+    fwd = None
+    try:
+        fwd = await bot.forward_message(admin_chat_id, message.chat.id, message.message_id)
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to forward unapproved user's message to admin")
+
+    try:
+        info = await bot.send_message(
+            admin_chat_id,
+            f"👤 {name} {uname} (ID: {uid}) botdan foydalanishga ruxsat so'rayapti.\n\n"
+            "Ruxsat berish uchun tugmani bosing, yoki shu xabarga (yoki yuqoridagi "
+            "forward qilingan xabarga) Reply qilib to'g'ridan-to'g'ri javob yozing.",
+            reply_markup=access_control.access_keyboard(uid),
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to send access request card to admin")
+        return
+
+    # Link BOTH the forwarded message and the info card as relay targets, so
+    # the admin can hit "Reply" on either one and it still routes correctly.
+    if fwd is not None:
+        await access_control.link_relay(fwd.message_id, message.chat.id)
+    await access_control.link_relay(info.message_id, message.chat.id)
+
+
+async def _relay_admin_reply(admin_message: Message, target_chat_id: int) -> None:
+    """Admin replied (native Telegram "Reply") to a relayed user message —
+    forward that reply back to the original user."""
+    bot = admin_message.bot
+    try:
+        if admin_message.text:
+            await bot.send_message(target_chat_id, f"💬 Admin javobi:\n\n{admin_message.text}")
+        else:
+            await bot.send_message(target_chat_id, "💬 Admin sizga javob yubordi:")
+            await bot.copy_message(target_chat_id, admin_message.chat.id, admin_message.message_id)
+        await admin_message.reply("✅ Yuborildi.")
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to relay admin reply to chat=%s", target_chat_id)
+        await admin_message.reply("⚠️ Yuborib bo'lmadi (foydalanuvchi botni bloklagan bo'lishi mumkin).")
+
+
+class AccessGateMiddleware(BaseMiddleware):
+    """Gates PRIVATE chats behind admin approval. Group access is untouched
+    — it stays governed by ALLOWED_CHAT_IDS / mention-required logic below."""
+
+    async def __call__(self, handler, event: Message, data):
+        if event.chat.type != "private" or not event.from_user:
+            return await handler(event, data)
+
+        uid = event.from_user.id
+        uname = event.from_user.username
+
+        if access_control.is_admin(uid, uname):
+            await access_control.remember_admin_chat(event.chat.id)
+            if event.reply_to_message:
+                target = await access_control.resolve_relay(event.reply_to_message.message_id)
+                if target is not None:
+                    await _relay_admin_reply(event, target)
+                    return
+            return await handler(event, data)
+
+        if await access_control.is_approved(uid):
+            return await handler(event, data)
+
+        await _handle_unapproved(event)
+        return
+
+
+dp.message.middleware(AccessGateMiddleware())
 
 # Hard cap on combined user input (typed text + quoted file/reply context)
 # before it reaches the router/agents — protects token budget and free-tier
@@ -1452,6 +1553,93 @@ async def handle_minutes_callback(callback: CallbackQuery, bot: Bot) -> None:
         return
 
     await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("acc:"))
+async def handle_access_callback(callback: CallbackQuery, bot: Bot) -> None:
+    if not callback.data or not callback.message:
+        await callback.answer()
+        return
+    admin_uid = callback.from_user.id if callback.from_user else 0
+    admin_uname = callback.from_user.username if callback.from_user else None
+    if not access_control.is_admin(admin_uid, admin_uname):
+        await callback.answer("Bu tugma faqat admin uchun.", show_alert=True)
+        return
+    try:
+        _, action, target_s = callback.data.split(":", 2)
+        target_id = int(target_s)
+    except ValueError:
+        await callback.answer()
+        return
+
+    if action == "a":
+        await access_control.approve(target_id)
+        await callback.answer("Ruxsat berildi ✅")
+        try:
+            old = callback.message.text or ""
+            await callback.message.edit_text(old + "\n\n✅ RUXSAT BERILDI", reply_markup=None)
+        except Exception:  # noqa: BLE001 — best-effort cosmetic edit (stale/inaccessible message, etc.)
+            pass
+        try:
+            await bot.send_message(
+                target_id,
+                "✅ Sizga botdan foydalanish uchun ruxsat berildi! Endi savolingizni yozishingiz mumkin.",
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to notify approved user=%s", target_id)
+        return
+
+    if action == "r":
+        await access_control.deny(target_id)
+        await callback.answer("Rad etildi")
+        try:
+            old = callback.message.text or ""
+            await callback.message.edit_text(old + "\n\n❌ RAD ETILDI", reply_markup=None)
+        except Exception:  # noqa: BLE001 — best-effort cosmetic edit (stale/inaccessible message, etc.)
+            pass
+        try:
+            await bot.send_message(target_id, "❌ Afsuski, hozircha botdan foydalanish ruxsati berilmadi.")
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to notify denied user=%s", target_id)
+        return
+
+    await callback.answer()
+
+
+@dp.message(Command("approve"))
+async def cmd_approve(message: Message, command: CommandObject) -> None:
+    uid = message.from_user.id if message.from_user else 0
+    uname = message.from_user.username if message.from_user else None
+    if not access_control.is_admin(uid, uname):
+        return  # silently ignore — don't reveal admin-only commands to others
+    arg = (command.args or "").strip().split()[0] if command.args else ""
+    if not arg.isdigit():
+        await message.answer("Foydalanuvchi ID sini yozing: /approve <user_id>")
+        return
+    target = int(arg)
+    await access_control.approve(target)
+    await message.answer(f"✅ {target} ga ruxsat berildi.")
+    try:
+        await message.bot.send_message(
+            target, "✅ Sizga botdan foydalanish uchun ruxsat berildi! Endi savolingizni yozishingiz mumkin."
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to notify approved user=%s", target)
+
+
+@dp.message(Command("deny"))
+async def cmd_deny(message: Message, command: CommandObject) -> None:
+    uid = message.from_user.id if message.from_user else 0
+    uname = message.from_user.username if message.from_user else None
+    if not access_control.is_admin(uid, uname):
+        return
+    arg = (command.args or "").strip().split()[0] if command.args else ""
+    if not arg.isdigit():
+        await message.answer("Foydalanuvchi ID sini yozing: /deny <user_id>")
+        return
+    target = int(arg)
+    await access_control.deny(target)
+    await message.answer(f"❌ {target} rad etildi.")
 
 
 @dp.callback_query(F.data.startswith("tsk:"))

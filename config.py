@@ -76,6 +76,15 @@ class Settings:
         default_factory=lambda: _csv_ints(os.getenv("ALLOWED_CHAT_IDS", ""))
     )
 
+    # --- Admin approval gate (private chats) --------------------------------
+    # A brand-new private-chat user is identified as the admin by USERNAME
+    # match first (works immediately, no setup) — but usernames can change,
+    # so once known, set ADMIN_USER_ID (numeric, from /id) for a robust,
+    # permanent identity check that doesn't depend on the username staying
+    # the same. Either one alone is enough; both together is the most robust.
+    admin_username: str = field(default_factory=lambda: os.getenv("ADMIN_USERNAME", "Farruh"))
+    admin_user_id: int = field(default_factory=lambda: _int_env("ADMIN_USER_ID", 0))
+
     # --- OpenRouter free models --------------------------------------------
     # Main model: deep analysis, agent responses, document generation.
     # meta-llama/llama-4-maverick:free — 128K context, multimodal, great quality, free.
