@@ -1863,14 +1863,24 @@ async def handle_business_message(message: Message, bot: Bot) -> None:
 
     analysis = data.get("analysis", "")
     suggested = data.get("suggested_reply", "")
+    is_task = bool(data.get("is_task", False))
     can_reply = conn.get("can_reply", True)
-    action_line = (
-        "⚠️ Ushbu ulanishda \"Javob yozish\" ruxsati yo'q — men bu javobni sizning "
-        "nomingizdan yubora olmayman. Uni o'zingiz qo'lda yuboring."
-        if not can_reply else
-        "Yuborish uchun tugmani bosing, yoki shu xabarga Reply qilib o'zingiz "
-        "yozgan javobni yuboring."
-    )
+    if not can_reply:
+        action_line = (
+            "⚠️ Ushbu ulanishda \"Javob yozish\" ruxsati yo'q — men bu javobni sizning "
+            "nomingizdan yubora olmayman. Uni o'zingiz qo'lda yuboring."
+        )
+    elif is_task:
+        action_line = (
+            "🧠 Bu jiddiy vazifaga o'xshaydi — tez javob shunchaki xabar oldi deb "
+            "bildiradi. Haqiqiy javob (BRD, texnik reja va h.k.) uchun \"Jamoa "
+            "bilan ishlab chiqish\"ni bosing."
+        )
+    else:
+        action_line = (
+            "Yuborish uchun tugmani bosing, yoki shu xabarga Reply qilib o'zingiz "
+            "yozgan javobni yuboring."
+        )
     card = (
         f"💼 {sender_name} sizga yozdi:\n\n\"{text}\"\n\n"
         f"🧠 Tahlil: {analysis}\n\n"
@@ -1885,9 +1895,9 @@ async def handle_business_message(message: Message, bot: Bot) -> None:
     if not can_reply:
         return  # nothing to link/attach — the buttons would only fail too
 
-    await business_copilot.link_relay(sent.message_id, conn_id, message.chat.id, suggested)
+    await business_copilot.link_relay(sent.message_id, conn_id, message.chat.id, suggested, text)
     try:
-        await sent.edit_reply_markup(reply_markup=business_copilot.suggestion_keyboard(sent.message_id))
+        await sent.edit_reply_markup(reply_markup=business_copilot.suggestion_keyboard(sent.message_id, is_task))
     except Exception:  # noqa: BLE001
         logger.exception("Failed to attach business-copilot suggestion buttons")
 
@@ -1938,6 +1948,51 @@ async def handle_business_copilot_callback(callback: CallbackQuery, bot: Bot) ->
             await callback.message.edit_reply_markup(reply_markup=None)
         except Exception:  # noqa: BLE001
             pass
+        return
+
+    if action == "d":  # "Jamoa bilan ishlab chiqish" — run the full agent pipeline
+        customer_text = relay.get("text") or ""
+        if not customer_text:
+            await callback.answer("Original xabar topilmadi.", show_alert=True)
+            return
+        await callback.answer("🧠 Jamoa ishlayapti, biroz kuting...")
+        try:
+            # Remove the "develop" button so a double-tap can't re-run the
+            # whole (multi-LLM-call) pipeline while the first run is still
+            # in flight or already answered; "Yuborish"/"E'tiborsiz" stay.
+            await callback.message.edit_reply_markup(
+                reply_markup=business_copilot.suggestion_keyboard(relay_msg_id, is_task=False)
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+        admin_chat_id = callback.message.chat.id
+        route = await classify(customer_text)
+        system_prompt = await _build_system_prompt(admin_chat_id, route.agent, route.request_type.addendum)
+        try:
+            body = await asyncio.wait_for(
+                _answer_with_agent(route, system_prompt, [{"role": "user", "content": customer_text}]),
+                timeout=settings.request_timeout,
+            )
+            body = (body or "").strip() or "(bo'sh javob)"
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Business-copilot team development failed")
+            await bot.send_message(admin_chat_id, f"⚠️ Jamoa javob bera olmadi: {str(exc)[:200]}")
+            return
+
+        full_text = f"🧠 {route.agent.display_name} tayyorladi:\n\n{body}"
+        if len(full_text) > TELEGRAM_LIMIT:
+            full_text = full_text[: TELEGRAM_LIMIT - 40] + "\n\n✂️ (davomi qisqartirildi)"
+        try:
+            sent = await bot.send_message(admin_chat_id, full_text)
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to send team-developed answer to admin")
+            return
+        await business_copilot.link_relay(sent.message_id, relay["conn"], relay["chat"], body, customer_text)
+        try:
+            await sent.edit_reply_markup(reply_markup=business_copilot.suggestion_keyboard(sent.message_id, is_task=False))
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to attach send buttons to team-developed answer")
         return
 
     await callback.answer()

@@ -152,7 +152,19 @@ personal Telegram Business conversations. You're shown the recent exchange
 with a contact and their latest message. Respond with ONLY this JSON, no
 prose, no markdown fences:
 {"analysis": "<one short line: intent/tone/urgency, in Uzbek>",
+ "is_task": true|false,
  "suggested_reply": "<ready-to-send reply, SAME language as the contact's message>"}
+
+is_task=true when the contact is asking for actual professional work to be
+DONE — build/develop something, write a document, spec out a project,
+quote a price/timeline, technical requirements, code, etc. — not just a
+quick question or small talk.
+
+When is_task=true, suggested_reply must be an HONEST holding reply only
+(e.g. "tushunarli, jamoam bilan ko'rib chiqib tez orada aniq javob
+beraman") — NEVER invent a commitment, timeline, price, or scope, since a
+real answer needs the specialist team's actual input first, not a guess.
+When is_task=false, suggested_reply is the real, ready-to-send answer.
 
 Keep the suggested reply natural, professional, and concise — something a
 real person would actually type, not a template or a chatbot-sounding line.
@@ -182,8 +194,14 @@ async def analyze(business_connection_id: str, customer_chat_id: int, sender_nam
 # --------------------------------------------------------------------------
 # Relay: admin-side notification message_id -> where/what to send if approved
 # --------------------------------------------------------------------------
-async def link_relay(admin_message_id: int, business_connection_id: str, customer_chat_id: int, suggested_reply: str) -> None:
-    payload = json.dumps({"conn": business_connection_id, "chat": customer_chat_id, "reply": suggested_reply[:2000]})
+async def link_relay(
+    admin_message_id: int, business_connection_id: str, customer_chat_id: int,
+    suggested_reply: str, original_text: str = "",
+) -> None:
+    payload = json.dumps({
+        "conn": business_connection_id, "chat": customer_chat_id,
+        "reply": suggested_reply[:2000], "text": original_text[:2000],
+    })
     client = redis_client.get_client()
     if client is None:
         _relay_mem[admin_message_id] = json.loads(payload)
@@ -222,8 +240,17 @@ async def clear_relay(admin_message_id: int) -> None:
         _relay_mem.pop(admin_message_id, None)
 
 
-def suggestion_keyboard(admin_message_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
+def suggestion_keyboard(admin_message_id: int, is_task: bool = False) -> InlineKeyboardMarkup:
+    rows = [[
         InlineKeyboardButton(text="✅ Yuborish", callback_data=f"biz:s:{admin_message_id}"),
         InlineKeyboardButton(text="🚫 E'tiborsiz qoldirish", callback_data=f"biz:i:{admin_message_id}"),
-    ]])
+    ]]
+    if is_task:
+        # Real work (BRD, code, a real quote) needs the specialist team, not
+        # a guessed one-line reply — this triggers the full agent pipeline,
+        # only after this explicit tap (same permission-gated pattern as
+        # everywhere else this bot executes real work).
+        rows.insert(0, [
+            InlineKeyboardButton(text="🧠 Jamoa bilan ishlab chiqish", callback_data=f"biz:d:{admin_message_id}"),
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
