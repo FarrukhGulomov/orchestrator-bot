@@ -65,6 +65,7 @@ import document_generation as docgen
 import github_integration
 import history
 import memory
+import user_profile
 import minutes as minutes_mod
 import railway_integration
 import redis_client
@@ -578,14 +579,26 @@ def _strip_mention(text: str, bot_username: str) -> str:
     return text.strip()
 
 
+USER_PROFILE_HEADER = (
+    "WHAT YOU KNOW ABOUT THIS SPECIFIC PERSON (from earlier conversations — "
+    "use it to recognize them and tailor tone/detail accordingly, but NEVER "
+    "mention out loud that you're consulting stored notes about them):\n"
+)
+
+
 async def _build_system_prompt(
-    chat_id: int, agent: Agent, addendum: str = ""
+    chat_id: int, agent: Agent, addendum: str = "", user_id: int | None = None
 ) -> str:
     facts = await memory.get_memory(chat_id)
     memory_block = (
         TEAM_MEMORY_HEADER + "\n".join(f"- {f}" for f in facts) + "\n\n" if facts else ""
     )
-    parts = [memory_block + agent.system]
+    profile_block = ""
+    if user_id is not None:
+        notes = await user_profile.get_profile(user_id)
+        if notes:
+            profile_block = USER_PROFILE_HEADER + "\n".join(f"- {n}" for n in notes) + "\n\n"
+    parts = [memory_block + profile_block + agent.system]
     if addendum:
         parts.append(addendum)
     return "\n".join(parts)
@@ -813,6 +826,12 @@ async def _process_inner(
     chat_id = message.chat.id
     await bot.send_chat_action(chat_id, ChatAction.TYPING)
 
+    # Per-user profile memory (see user_profile.py): only for private-chat,
+    # admin-approved, non-admin users, and only for substantive turns — a
+    # bare "ha"/"ok" carries no signal worth an extraction call for.
+    profile_uid = message.from_user.id if _profile_eligible(message) else None
+    profile_worth_extracting = bool(profile_uid) and len(user_text) >= 12
+
     last = await history.get_last_route(chat_id)
     route = await classify(
         user_text,
@@ -855,7 +874,9 @@ async def _process_inner(
             except TelegramBadRequest:
                 pass
 
-        body = await _run_sequential_chain(route, user_text, chat_id, progress=_chain_progress)
+        body = await _run_sequential_chain(
+            route, user_text, chat_id, progress=_chain_progress, user_id=profile_uid
+        )
         try:
             await status.delete()
         except TelegramBadRequest:
@@ -868,6 +889,8 @@ async def _process_inner(
         await _send_long(message, _header(route) + body + footer + truncation_notice, reply_mode=reply_mode)
         if route.request_type.creates_ticket:
             asyncio.create_task(_maybe_extract_memory(chat_id, user_text, body))
+        if profile_worth_extracting:
+            asyncio.create_task(_maybe_extract_user_profile(profile_uid, user_text, body))
         return
 
     logger.info(
@@ -890,7 +913,7 @@ async def _process_inner(
     if route.collaborators:
         n = 1 + len(route.collaborators)
         status = await message.answer(f"🔄 Jamoam bilan ishlayapman... ({n} mutaxassis parallel)")
-        body = await _run_collaborative_answer(route, user_text, chat_id)
+        body = await _run_collaborative_answer(route, user_text, chat_id, user_id=profile_uid)
         try:
             await status.delete()
         except TelegramBadRequest:
@@ -902,9 +925,11 @@ async def _process_inner(
         await _send_long(message, _header(route) + body + footer + truncation_notice, reply_mode=reply_mode)
         if route.request_type.creates_ticket:
             asyncio.create_task(_maybe_extract_memory(chat_id, user_text, body))
+        if profile_worth_extracting:
+            asyncio.create_task(_maybe_extract_user_profile(profile_uid, user_text, body))
         return
 
-    system_prompt = await _build_system_prompt(chat_id, route.agent, route.request_type.addendum)
+    system_prompt = await _build_system_prompt(chat_id, route.agent, route.request_type.addendum, user_id=profile_uid)
     msgs = await history.get_history(chat_id, route.agent.key) + [
         {"role": "user", "content": user_text}
     ]
@@ -942,16 +967,20 @@ async def _process_inner(
     await _send_long(message, _header(route) + body + footer + truncation_notice, reply_mode=reply_mode)
     if route.request_type.creates_ticket:
         asyncio.create_task(_maybe_extract_memory(chat_id, user_text, body))
+    if profile_worth_extracting:
+        asyncio.create_task(_maybe_extract_user_profile(profile_uid, user_text, body))
 
 
 # --------------------------------------------------------------------------
 # /kickoff — whole BA team responds together
 # --------------------------------------------------------------------------
-async def _kickoff_agent_call(agent_key: str, user_text: str, chat_id: int) -> dict:
+async def _kickoff_agent_call(
+    agent_key: str, user_text: str, chat_id: int, user_id: int | None = None
+) -> dict:
     agent: Agent = get_agent(agent_key)
     # Intentionally always the "task" addendum: kickoff/collaborative calls ask
     # each specialist for a concrete deliverable regardless of request type.
-    system_prompt = await _build_system_prompt(chat_id, agent, REQUEST_TYPES["task"].addendum)
+    system_prompt = await _build_system_prompt(chat_id, agent, REQUEST_TYPES["task"].addendum, user_id=user_id)
     model, label = model_for(agent, "high")
     try:
         body = await asyncio.wait_for(
@@ -984,11 +1013,15 @@ Make it self-contained and directly useful.
 """
 
 
-async def _run_collaborative_answer(route: Route, user_text: str, chat_id: int) -> str:
+async def _run_collaborative_answer(
+    route: Route, user_text: str, chat_id: int, user_id: int | None = None
+) -> str:
     roles = [route.agent.key] + [k for k in route.collaborators if k != route.agent.key]
     roles = list(dict.fromkeys(roles))[:4]
 
-    results = await asyncio.gather(*[_kickoff_agent_call(key, user_text, chat_id) for key in roles])
+    results = await asyncio.gather(
+        *[_kickoff_agent_call(key, user_text, chat_id, user_id=user_id) for key in roles]
+    )
 
     for r in results:
         # Collaborators keep their own contribution in their thread. The
@@ -1029,7 +1062,9 @@ async def _run_collaborative_answer(route: Route, user_text: str, chat_id: int) 
     return body
 
 
-async def _run_sequential_chain(route: Route, user_text: str, chat_id: int, progress=None) -> str:
+async def _run_sequential_chain(
+    route: Route, user_text: str, chat_id: int, progress=None, user_id: int | None = None
+) -> str:
     """Run agents in sequence, each specialist building on the previous output.
 
     `progress` is an optional async callback (done, total, agent_display_name)
@@ -1040,7 +1075,7 @@ async def _run_sequential_chain(route: Route, user_text: str, chat_id: int, prog
 
     for agent_key in chain:
         agent = get_agent(agent_key)
-        system_prompt = await _build_system_prompt(chat_id, agent, route.request_type.addendum)
+        system_prompt = await _build_system_prompt(chat_id, agent, route.request_type.addendum, user_id=user_id)
         model, _ = model_for(agent, "high")
 
         if outputs:
@@ -1103,6 +1138,51 @@ async def _maybe_extract_memory(chat_id: int, user_text: str, body: str) -> None
             await memory.add_memory(chat_id, fact)
     except Exception:
         logger.exception("Memory extraction failed (non-fatal)")
+
+
+_PROFILE_EXTRACT_SYSTEM = """
+Given this one exchange between the AI team and an individual private-chat
+user, is there ONE durable observation worth remembering about the USER
+THEMSELVES for future conversations — their role/position, technical level,
+communication style (terse vs detailed, formal vs casual), a recurring
+concern or interest area, decision-making style, or similar? This is about
+WHO THEY ARE as a person, not project facts (tracked separately elsewhere)
+and not the literal content of this one message.
+
+Do NOT record: project/company facts, a restatement of their question, or
+anything speculative, judgmental, or unprofessional about their character.
+Keep it a respectful, factual, behavioral observation.
+
+If yes: respond with ONLY that one observation, under 150 characters,
+ALWAYS in Uzbek regardless of what language the conversation was in (these
+notes are for the admin's own reading, and for the AI to reuse next time).
+If no durable observation: respond with exactly NONE.
+"""
+
+
+async def _maybe_extract_user_profile(user_id: int, user_text: str, body: str) -> None:
+    try:
+        raw = await claude_generate_fast(
+            _PROFILE_EXTRACT_SYSTEM,
+            [{"role": "user", "content": f"USER'S MESSAGE:\n{user_text}\n\nTEAM'S ANSWER:\n{body[:1500]}"}],
+            temperature=0.0,
+        )
+        note = (raw or "").strip()
+        if note and note.upper() != "NONE" and len(note) < 300:
+            await user_profile.add_profile_note(user_id, note)
+    except Exception:
+        logger.exception("User profile extraction failed (non-fatal)")
+
+
+def _profile_eligible(message: Message) -> bool:
+    """Per-user profile memory only applies to PRIVATE-chat, admin-approved,
+    non-admin users (see user_profile.py docstring) — never the admin's own
+    messages, and never groups."""
+    return (
+        message.chat.type == "private"
+        and message.from_user is not None
+        and not access_control.is_admin(message.from_user.id, message.from_user.username)
+    )
 
 
 def _kickoff_header(results: list[dict]) -> str:
@@ -1957,8 +2037,71 @@ async def cmd_users(message: Message) -> None:
         lines.append(line)
     lines.append(
         "\n⏳ kutilmoqda · ✅ ruxsat berilgan · ❌ rad etilgan\n"
-        "Ruxsat berish: /approve <id>   Bekor qilish: /deny <id>"
+        "Ruxsat berish: /approve <id>   Bekor qilish: /deny <id>   "
+        "Batafsil: /whois <id>"
     )
+    await _send_long(message, "\n".join(lines))
+
+
+@dp.message(Command("whois"))
+async def cmd_whois(message: Message, command: CommandObject) -> None:
+    """Deep-dive on ONE user: full profile — who they are, not just that
+    they exist. Complements /users (the list) with what the AI team has
+    actually learned about this specific person over time (see
+    user_profile.py) — this is the answer to "userni kimligini bilish"."""
+    uid = message.from_user.id if message.from_user else 0
+    uname = message.from_user.username if message.from_user else None
+    if not access_control.is_admin(uid, uname):
+        return
+
+    arg = (command.args or "").strip().split()[0] if command.args else ""
+    if not arg.isdigit():
+        await message.answer("Foydalanuvchi ID sini yozing: /whois <user_id>")
+        return
+    target = int(arg)
+
+    users = {u["user_id"]: u for u in await access_control.list_users()}
+    u = users.get(target)
+    if not u:
+        await message.answer(f"ID {target} bo'yicha hech qanday yozuv topilmadi.")
+        return
+
+    status_label = {"approved": "✅ ruxsat berilgan", "denied": "❌ rad etilgan", "pending": "⏳ kutilmoqda"}
+    lines = [
+        f"👤 {u.get('full_name') or 'Noma’lum'} "
+        + (f"@{u['username']}" if u.get("username") else "(username yo'q)"),
+        f"ID: `{target}`",
+        f"Holat: {status_label.get(u.get('status'), '?')}",
+    ]
+    if u.get("fio"):
+        lines.append(f"F.I.O: {u['fio']}")
+    if u.get("phone"):
+        lines.append(f"📱 Telefon: {u['phone']}")
+    if u.get("message_count"):
+        lines.append(f"Xabarlar soni: {u['message_count']}")
+    if u.get("first_seen"):
+        lines.append(f"Birinchi murojaat: {u['first_seen'][:16].replace('T', ' ')}")
+    if u.get("last_seen"):
+        lines.append(f"Oxirgi murojaat: {u['last_seen'][:16].replace('T', ' ')}")
+    via_label = {"button": "tugma", "command": "buyruq"}
+    if u.get("status") == "approved" and u.get("approved_at"):
+        lines.append(
+            f"🕐 Ruxsat berilgan: {u['approved_at'][:16].replace('T', ' ')} "
+            f"({via_label.get(u.get('approved_via'), '?')})"
+        )
+    elif u.get("status") == "denied" and u.get("denied_at"):
+        lines.append(
+            f"🕐 Rad etilgan: {u['denied_at'][:16].replace('T', ' ')} "
+            f"({via_label.get(u.get('denied_via'), '?')})"
+        )
+
+    notes = await user_profile.get_profile(target)
+    if notes:
+        lines.append("\n🧠 Jamoa bu foydalanuvchi haqida bilib olganlari:")
+        lines.extend(f"• {n}" for n in notes)
+    else:
+        lines.append("\n🧠 Bu foydalanuvchi haqida hali profil yozuvlari yo'q.")
+
     await _send_long(message, "\n".join(lines))
 
 
