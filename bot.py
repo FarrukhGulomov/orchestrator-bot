@@ -128,9 +128,11 @@ async def _notify_admin_of_phone(bot: Bot, user_id: int, fio: str | None, phone:
     if not admin_chat_id:
         return
     try:
+        # No parse_mode on purpose: fio is user-controlled free text and any
+        # markdown metacharacters in it would make Telegram reject the send.
         await bot.send_message(
             admin_chat_id,
-            f"📇 {fio or 'Noma’lum'} (ID: `{user_id}`) telefon raqamini yubordi: {phone}",
+            f"📇 {fio or 'Noma’lum'} (ID: {user_id}) telefon raqamini yubordi: {phone}",
         )
     except Exception:  # noqa: BLE001
         logger.exception("Failed to notify admin of new phone for user=%s", user_id)
@@ -285,6 +287,37 @@ async def _handle_unapproved(message: Message) -> None:
     await _forward_request_to_admin(bot, admin_chat_id, message.chat.id, message.message_id, info_text)
 
 
+async def _notify_denied(bot: Bot, target_id: int) -> None:
+    """Tell a user their access was denied/revoked — shared by the ❌ button
+    and /deny so BOTH paths inform the user (the /deny path used to stay
+    silent, leaving the user to keep messaging a bot that ignored them)."""
+    handle = (settings.admin_username or "admin").lstrip("@")
+    try:
+        await bot.send_message(
+            target_id,
+            f"❌ Afsuski, sizga botdan foydalanish ruxsati berilmadi. "
+            f"Savollaringiz bo'lsa admin (@{handle}) bilan bog'laning.\n\n"
+            f"❌ К сожалению, вам не предоставлен доступ к боту. "
+            f"По вопросам обращайтесь к администратору (@{handle}).",
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to notify denied user=%s", target_id)
+
+
+async def _handle_denied(message: Message) -> None:
+    """A DENIED user messaged again. Don't pretend their message was passed
+    on (the old flow answered 'xabaringiz adminга yuborildi' — misleading)
+    and don't spam the admin with requests they already rejected: state the
+    denial plainly with a direct contact route instead."""
+    handle = (settings.admin_username or "admin").lstrip("@")
+    await message.answer(
+        f"❌ Sizga botdan foydalanish uchun ruxsat berilmagan. "
+        f"Savollaringiz bo'lsa admin (@{handle}) bilan to'g'ridan-to'g'ri bog'laning.\n\n"
+        f"❌ Вам не предоставлен доступ к боту. По вопросам обращайтесь "
+        f"к администратору (@{handle}) напрямую."
+    )
+
+
 async def _deliver_pending_list(bot: Bot, admin_chat_id: int, pending: list[tuple[int, int]]) -> None:
     """Flush access requests that were queued while the admin's chat_id
     wasn't known yet. `pending` must already be popped (see
@@ -385,11 +418,22 @@ class AccessGateMiddleware(BaseMiddleware):
                 return
             return await handler(event, data)
 
+        if await access_control.is_denied(uid):
+            await _handle_denied(event)
+            return
+
         await _handle_unapproved(event)
         return
 
 
-dp.message.middleware(AccessGateMiddleware())
+# MUST be OUTER middleware. An inner middleware (dp.message.middleware)
+# only runs when some handler's filters match the message — and content
+# types with no registered handler (contact shares, stickers, locations…)
+# would bypass the gate entirely: an onboarding contact share got zero
+# reaction (the reported bug), and unapproved users' unmatched messages
+# were never relayed to the admin. Outer middleware runs for EVERY
+# private message before any filter, closing both holes.
+dp.message.outer_middleware(AccessGateMiddleware())
 
 # Hard cap on combined user input (typed text + quoted file/reply context)
 # before it reaches the router/agents — protects token budget and free-tier
@@ -1812,7 +1856,8 @@ async def handle_access_callback(callback: CallbackQuery, bot: Bot) -> None:
         return
 
     if action == "a":
-        await access_control.approve(target_id)
+        await access_control.approve(target_id, via="button")
+        logger.info("ACCESS AUDIT: user=%s APPROVED via button by admin=%s", target_id, admin_uid)
         await callback.answer("Ruxsat berildi ✅")
         try:
             old = callback.message.text or ""
@@ -1823,17 +1868,15 @@ async def handle_access_callback(callback: CallbackQuery, bot: Bot) -> None:
         return
 
     if action == "r":
-        await access_control.deny(target_id)
+        await access_control.deny(target_id, via="button")
+        logger.info("ACCESS AUDIT: user=%s DENIED via button by admin=%s", target_id, admin_uid)
         await callback.answer("Rad etildi")
         try:
             old = callback.message.text or ""
             await callback.message.edit_text(old + "\n\n❌ RAD ETILDI", reply_markup=None)
         except Exception:  # noqa: BLE001 — best-effort cosmetic edit (stale/inaccessible message, etc.)
             pass
-        try:
-            await bot.send_message(target_id, "❌ Afsuski, hozircha botdan foydalanish ruxsati berilmadi.")
-        except Exception:  # noqa: BLE001
-            logger.exception("Failed to notify denied user=%s", target_id)
+        await _notify_denied(bot, target_id)
         return
 
     await callback.answer()
@@ -1850,7 +1893,8 @@ async def cmd_approve(message: Message, command: CommandObject) -> None:
         await message.answer("Foydalanuvchi ID sini yozing: /approve <user_id>")
         return
     target = int(arg)
-    await access_control.approve(target)
+    await access_control.approve(target, via="command")
+    logger.info("ACCESS AUDIT: user=%s APPROVED via /approve by admin=%s", target, uid)
     await message.answer(f"✅ {target} ga ruxsat berildi.")
     await _start_onboarding(message.bot, target)
 
@@ -1866,8 +1910,10 @@ async def cmd_deny(message: Message, command: CommandObject) -> None:
         await message.answer("Foydalanuvchi ID sini yozing: /deny <user_id>")
         return
     target = int(arg)
-    await access_control.deny(target)
+    await access_control.deny(target, via="command")
+    logger.info("ACCESS AUDIT: user=%s DENIED via /deny by admin=%s", target, uid)
     await message.answer(f"❌ {target} rad etildi.")
+    await _notify_denied(message.bot, target)
 
 
 @dp.message(Command("users"))
@@ -1898,6 +1944,16 @@ async def cmd_users(message: Message) -> None:
             line += f"\n   👤 F.I.O: {u['fio']}"
         if u.get("phone"):
             line += f"\n   📱 {u['phone']}"
+        # Audit trail: when/how the decision happened ("tugma" = the inline
+        # ✅/❌ button, "buyruq" = /approve or /deny) — so an approval the
+        # admin doesn't remember making can be traced instead of debated.
+        via_label = {"button": "tugma", "command": "buyruq"}
+        if u.get("status") == "approved" and u.get("approved_at"):
+            ts = u["approved_at"][:16].replace("T", " ")
+            line += f"\n   🕐 Ruxsat: {ts} ({via_label.get(u.get('approved_via'), '?')})"
+        elif u.get("status") == "denied" and u.get("denied_at"):
+            ts = u["denied_at"][:16].replace("T", " ")
+            line += f"\n   🕐 Rad: {ts} ({via_label.get(u.get('denied_via'), '?')})"
         lines.append(line)
     lines.append(
         "\n⏳ kutilmoqda · ✅ ruxsat berilgan · ❌ rad etilgan\n"
