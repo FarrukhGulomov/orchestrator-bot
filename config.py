@@ -206,6 +206,19 @@ class Settings:
         default_factory=lambda: _int_env("PROACTIVE_COOLDOWN_SECONDS", 45)
     )
 
+    # Group mention copilot: in any group the bot is a plain member of (no
+    # admin rights needed), if someone @mentions the admin or replies to
+    # the admin's own earlier message, AI-analyze it and privately notify
+    # the admin with a suggested reply — independent of
+    # PROACTIVE_IN_GROUPS/REQUIRE_MENTION_IN_GROUPS, which are about the
+    # bot answering the GROUP directly. REQUIRES the bot's Telegram
+    # Privacy Mode to be DISABLED (BotFather -> /setprivacy -> Disable)
+    # for the group, otherwise Telegram never forwards messages that don't
+    # @mention/reply to the BOT itself, and this sees nothing.
+    watch_group_mentions: bool = field(
+        default_factory=lambda: os.getenv("WATCH_GROUP_MENTIONS", "true").lower() == "true"
+    )
+
     # --- Output metadata header --------------------------------------------
     show_metadata_header: bool = field(
         default_factory=lambda: os.getenv("SHOW_METADATA_HEADER", "false").lower() == "true"

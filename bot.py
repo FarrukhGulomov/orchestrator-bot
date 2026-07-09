@@ -33,6 +33,12 @@ their own personal chats via Telegram's Settings > Business > Chatbots,
 incoming messages there get AI-analyzed with a suggested reply sent to the
 admin's own DM with the bot — see business_copilot.py.
 
+Group mention copilot (automatic, no command): add the bot as a plain
+member to any group (no admin rights needed); if someone @mentions the
+admin or replies to the admin's own message there, it's AI-analyzed with a
+suggested reply sent privately to the admin's DM — see group_copilot.py
+(requires Telegram Privacy Mode disabled for the bot, see .env.example).
+
 Run:  python bot.py
 """
 
@@ -55,6 +61,7 @@ from aiogram.types import (
     Message,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
+    ReplyParameters,
 )
 
 import access_control
@@ -63,6 +70,7 @@ import decisions as decisions_store
 import digest
 import document_generation as docgen
 import github_integration
+import group_copilot
 import history
 import memory
 import user_profile
@@ -369,6 +377,37 @@ async def _relay_business_reply(admin_message: Message, relay_msg_id: int, relay
         await admin_message.reply(f"⚠️ Yuborib bo'lmadi: {str(exc)[:200]}")
 
 
+async def _relay_group_reply(admin_message: Message, relay_msg_id: int, relay: dict) -> None:
+    """Admin replied to a group-mention notification with their OWN text
+    (instead of tapping the suggested-reply button) — send that text into
+    the group, as a reply to the original message that addressed them."""
+    bot = admin_message.bot
+    text = admin_message.text or admin_message.caption
+    if not text:
+        await admin_message.reply("⚠️ Faqat matn yuborish mumkin.")
+        return
+    try:
+        await bot.send_message(
+            relay["chat"], text,
+            reply_parameters=ReplyParameters(message_id=relay["reply_to"]),
+        )
+    except TelegramBadRequest:
+        # Original message may have been deleted / too old to reply to —
+        # still deliver the admin's answer into the group, just not threaded.
+        try:
+            await bot.send_message(relay["chat"], text)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Failed to relay admin's custom group reply (fallback also failed)")
+            await admin_message.reply(f"⚠️ Yuborib bo'lmadi: {str(exc)[:200]}")
+            return
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to relay admin's custom group reply")
+        await admin_message.reply(f"⚠️ Yuborib bo'lmadi: {str(exc)[:200]}")
+        return
+    await group_copilot.clear_relay(relay_msg_id)
+    await admin_message.reply("✅ Guruhga yuborildi.")
+
+
 class AccessGateMiddleware(BaseMiddleware):
     """Gates PRIVATE chats behind admin approval. Group access is untouched
     — it stays governed by ALLOWED_CHAT_IDS / mention-required logic below."""
@@ -392,6 +431,10 @@ class AccessGateMiddleware(BaseMiddleware):
                 biz_relay = await business_copilot.resolve_relay(event.reply_to_message.message_id)
                 if biz_relay is not None:
                     await _relay_business_reply(event, event.reply_to_message.message_id, biz_relay)
+                    return
+                grp_relay = await group_copilot.resolve_relay(event.reply_to_message.message_id)
+                if grp_relay is not None:
+                    await _relay_group_reply(event, event.reply_to_message.message_id, grp_relay)
                     return
 
             bot = event.bot
@@ -577,6 +620,88 @@ def _strip_mention(text: str, bot_username: str) -> str:
     if bot_username:
         text = text.replace(f"@{bot_username}", "").replace(f"@{bot_username.lower()}", "")
     return text.strip()
+
+
+def _mentions_admin(message: Message) -> bool:
+    """True if this GROUP message is addressed to the ADMIN specifically —
+    they're @mentioned (or text-mentioned, which works even without a
+    public username), or the message replies to something the admin
+    themselves sent earlier in this group. Powers group_copilot.py; see
+    its docstring for the Privacy Mode prerequisite."""
+    replied = message.reply_to_message
+    if replied and replied.from_user and access_control.is_admin(
+        replied.from_user.id, replied.from_user.username
+    ):
+        return True
+
+    text = message.text or message.caption or ""
+    entities = message.entities or message.caption_entities or []
+    for ent in entities:
+        if ent.type == "mention":
+            handle = text[ent.offset: ent.offset + ent.length].lstrip("@")
+            if access_control.is_admin(0, handle):
+                return True
+        elif ent.type == "text_mention" and ent.user:
+            if access_control.is_admin(ent.user.id, ent.user.username):
+                return True
+    return False
+
+
+async def _handle_group_mention(message: Message, bot: Bot, user_text: str) -> None:
+    """A group message addressed the admin specifically — AI-analyze it
+    and privately notify the admin with a suggested reply (see
+    group_copilot.py). Never posts anything in the group on its own."""
+    admin_chat_id = await access_control.get_admin_chat_id()
+    if not admin_chat_id:
+        return  # admin not bootstrapped yet (hasn't messaged the bot even once) — nothing to notify
+
+    sender = message.from_user
+    sender_name = sender.full_name if sender else "Noma'lum"
+    group_name = message.chat.title or "Guruh"
+
+    quoted_text = ""
+    replied = message.reply_to_message
+    if replied:
+        quoted_text = (replied.text or replied.caption or "").strip()
+
+    data = await group_copilot.analyze(group_name, sender_name, quoted_text, user_text)
+    if data is None:
+        try:
+            await bot.send_message(
+                admin_chat_id,
+                f"👥 \"{group_name}\" guruhida {sender_name} sizga yozdi:\n\n{user_text}\n\n"
+                "⚠️ AI tahlili muvaffaqiyatsiz — o'zingiz javob yozing.",
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to notify admin of group mention (analysis failed)")
+        return
+
+    analysis = data.get("analysis", "")
+    suggested = data.get("suggested_reply", "")
+    is_task = bool(data.get("is_task", False))
+    action_line = (
+        "🧠 Bu jiddiy vazifaga o'xshaydi — quyidagi taklif faqat vaqtinchalik "
+        "javob, haqiqiy javobni o'zingiz yozing."
+        if is_task else
+        "Yuborish uchun tugmani bosing, yoki shu xabarga Reply qilib o'zingiz "
+        "yozgan javobni yuboring."
+    )
+    card = (
+        f"👥 \"{group_name}\" guruhida {sender_name} sizga yozdi:\n\n\"{user_text}\"\n\n"
+        f"🧠 Tahlil: {analysis}\n\n"
+        f"💬 Taklif qilingan javob:\n{suggested}\n\n{action_line}"
+    )
+    try:
+        sent = await bot.send_message(admin_chat_id, card)
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to send group-mention notification to admin")
+        return
+
+    await group_copilot.link_relay(sent.message_id, message.chat.id, message.message_id, suggested, user_text)
+    try:
+        await sent.edit_reply_markup(reply_markup=group_copilot.suggestion_keyboard(sent.message_id))
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to attach group-copilot suggestion buttons")
 
 
 USER_PROFILE_HEADER = (
@@ -2341,6 +2466,66 @@ async def handle_business_copilot_callback(callback: CallbackQuery, bot: Bot) ->
     await callback.answer()
 
 
+@dp.callback_query(F.data.startswith("grp:"))
+async def handle_group_copilot_callback(callback: CallbackQuery, bot: Bot) -> None:
+    if not callback.data or not callback.message:
+        await callback.answer()
+        return
+    admin_uid = callback.from_user.id if callback.from_user else 0
+    admin_uname = callback.from_user.username if callback.from_user else None
+    if not access_control.is_admin(admin_uid, admin_uname):
+        await callback.answer("Faqat admin uchun.", show_alert=True)
+        return
+    try:
+        _, action, msg_id_s = callback.data.split(":", 2)
+        relay_msg_id = int(msg_id_s)
+    except ValueError:
+        await callback.answer()
+        return
+
+    relay = await group_copilot.resolve_relay(relay_msg_id)
+    if relay is None:
+        await callback.answer("Bu so'rov eskirgan.", show_alert=True)
+        return
+
+    if action == "i":
+        await group_copilot.clear_relay(relay_msg_id)
+        await callback.answer("E'tiborsiz qoldirildi")
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:  # noqa: BLE001
+            pass
+        return
+
+    if action == "s":
+        try:
+            await bot.send_message(
+                relay["chat"], relay["reply"],
+                reply_parameters=ReplyParameters(message_id=relay["reply_to"]),
+            )
+        except TelegramBadRequest:
+            # Original message may have been deleted / too old to reply to.
+            try:
+                await bot.send_message(relay["chat"], relay["reply"])
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Failed to send group-copilot suggested reply (fallback also failed)")
+                await callback.answer(f"⚠️ Yuborib bo'lmadi: {str(exc)[:150]}", show_alert=True)
+                return
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Failed to send group-copilot suggested reply")
+            await callback.answer(f"⚠️ Yuborib bo'lmadi: {str(exc)[:150]}", show_alert=True)
+            return
+        await group_copilot.clear_relay(relay_msg_id)
+        await callback.answer("Guruhga yuborildi ✅")
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:  # noqa: BLE001
+            pass
+        return
+
+    await callback.answer()
+
+
 @dp.callback_query(F.data.startswith("tsk:"))
 async def handle_task_callback(callback: CallbackQuery, bot: Bot) -> None:
     if not callback.data or not callback.message:
@@ -2484,6 +2669,21 @@ async def handle_text(message: Message, bot: Bot) -> None:
                 return
         # @mention, reply-to-bot, or private chat → respond normally
         await _process(message, bot, user_text, forced_type=None)
+        return
+
+    # Group mention copilot: this message wasn't addressed to the BOT, but
+    # check whether it's addressed to the ADMIN specifically (mention/reply)
+    # — see group_copilot.py. Independent of proactive/mention-required
+    # settings below, which govern the bot answering the GROUP directly;
+    # this always notifies the admin privately instead, never the group.
+    if (
+        settings.watch_group_mentions
+        and message.chat.type != "private"
+        and message.from_user
+        and not access_control.is_admin(message.from_user.id, message.from_user.username)
+        and _mentions_admin(message)
+    ):
+        await _handle_group_mention(message, bot, user_text)
         return
 
     # Proactive group mode: analyse all messages and join in when relevant
