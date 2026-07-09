@@ -158,7 +158,14 @@ async def _handle_onboarding_step(message: Message, uid: int) -> bool:
         return True
 
     if state == "awaiting_phone":
-        if message.contact and message.contact.user_id == uid:
+        # Contact.user_id is OPTIONAL per the Bot API spec and is not always
+        # populated even for a legitimate self-share via the request_contact
+        # button (client/version-dependent) — trust it whenever it's absent,
+        # only reject an EXPLICIT mismatch (someone manually attaching a
+        # different contact card via the paperclip menu instead of tapping
+        # the button).
+        contact = message.contact
+        if contact and contact.user_id in (None, 0, uid):
             await access_control.save_profile_field(uid, "phone", message.contact.phone_number)
             await access_control.set_onboarding_state(uid, "done")
             await message.answer(
