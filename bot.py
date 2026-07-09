@@ -123,12 +123,52 @@ async def _start_onboarding(bot: Bot, target_user_id: int) -> None:
         logger.exception("Failed to send onboarding prompt to user=%s", target_user_id)
 
 
+async def _notify_admin_of_phone(bot: Bot, user_id: int, fio: str | None, phone: str) -> None:
+    admin_chat_id = await access_control.get_admin_chat_id()
+    if not admin_chat_id:
+        return
+    try:
+        await bot.send_message(
+            admin_chat_id,
+            f"📇 {fio or 'Noma’lum'} (ID: `{user_id}`) telefon raqamini yubordi: {phone}",
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to notify admin of new phone for user=%s", user_id)
+
+
 async def _handle_onboarding_step(message: Message, uid: int) -> bool:
     """If this approved user still has a pending onboarding step, consume
     this message as that step's answer and return True (caller must NOT
     fall through to the normal AI pipeline for this message). Returns False
     if there's no onboarding pending (already done, or never started —
     users approved before this feature existed)."""
+    # A contact share is unambiguous — accept it ANY time it arrives, not
+    # only while state is exactly "awaiting_phone". If the internal state
+    # ever desyncs (e.g. in-memory onboarding progress wiped by a redeploy
+    # when REDIS_URL isn't configured, or a stale reply-keyboard button
+    # tapped after the flow already moved on), a shared phone number must
+    # never be silently dropped — that was the concrete bug reported: the
+    # user shared their contact, the bot showed no reaction at all, and
+    # /users never got the number, because content_type=contact matches no
+    # other handler in this file and was falling through into the void.
+    contact = message.contact
+    # Contact.user_id is OPTIONAL per the Bot API spec and is not always
+    # populated even for a legitimate self-share via the request_contact
+    # button (client/version-dependent) — trust it whenever it's absent,
+    # only reject an EXPLICIT mismatch (someone manually attaching a
+    # different contact card via the paperclip menu instead of tapping
+    # the button).
+    if contact and contact.user_id in (None, 0, uid):
+        fio = await access_control.get_known_full_name(uid)
+        await access_control.save_profile_field(uid, "phone", contact.phone_number)
+        await access_control.set_onboarding_state(uid, "done")
+        await message.answer(
+            "✅ Ma'lumotlaringiz saqlandi. Endi savolingizni yozishingiz mumkin.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        await _notify_admin_of_phone(message.bot, uid, fio, contact.phone_number)
+        return True
+
     state = await access_control.get_onboarding_state(uid)
     if state not in ("awaiting_fio", "awaiting_phone"):
         return False
@@ -158,21 +198,6 @@ async def _handle_onboarding_step(message: Message, uid: int) -> bool:
         return True
 
     if state == "awaiting_phone":
-        # Contact.user_id is OPTIONAL per the Bot API spec and is not always
-        # populated even for a legitimate self-share via the request_contact
-        # button (client/version-dependent) — trust it whenever it's absent,
-        # only reject an EXPLICIT mismatch (someone manually attaching a
-        # different contact card via the paperclip menu instead of tapping
-        # the button).
-        contact = message.contact
-        if contact and contact.user_id in (None, 0, uid):
-            await access_control.save_profile_field(uid, "phone", message.contact.phone_number)
-            await access_control.set_onboarding_state(uid, "done")
-            await message.answer(
-                "✅ Ma'lumotlaringiz saqlandi. Endi savolingizni yozishingiz mumkin.",
-                reply_markup=ReplyKeyboardRemove(),
-            )
-            return True
         await message.answer(
             "Iltimos, pastdagi \"📱 Raqamni yuborish\" tugmasini bosing (yoki /skip yozing)."
         )
