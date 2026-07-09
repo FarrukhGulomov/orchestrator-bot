@@ -146,40 +146,69 @@ async def mark_first_contact(user_id: int) -> bool:
         return True
 
 
-async def approve(user_id: int) -> None:
+async def approve(user_id: int, via: str = "") -> None:
+    """`via` is an audit label ("button"/"command") stored alongside the
+    decision timestamp — the admin reported a user showing up approved that
+    they don't remember approving, and without when/how on record there is
+    no way to reconstruct such an event after the fact."""
+    now = datetime.now(timezone.utc).isoformat()
     client = redis_client.get_client()
     if client is None:
         _approved_mem.add(user_id)
         _denied_mem.discard(user_id)
+        rec = _users_mem.setdefault(user_id, {})
+        rec["approved_at"] = now
+        rec["approved_via"] = via or "?"
+        rec.pop("denied_at", None)
         return
     try:
         async with client.pipeline(transaction=True) as pipe:
             pipe.sadd(_APPROVED_SET, user_id)
             pipe.srem(_DENIED_SET, user_id)
+            pipe.hset(_user_key(user_id), mapping={"approved_at": now, "approved_via": via or "?"})
+            pipe.hdel(_user_key(user_id), "denied_at", "denied_via")
             await pipe.execute()
     except Exception:  # noqa: BLE001
         logger.exception("Redis approve failed")
         _approved_mem.add(user_id)
 
 
-async def deny(user_id: int) -> None:
+async def deny(user_id: int, via: str = "") -> None:
     """Mark denied AND revoke any prior approval — deny() must be able to cut
     off someone who was previously approved, not just record-keep a rejection
     for someone who was never approved in the first place."""
+    now = datetime.now(timezone.utc).isoformat()
     client = redis_client.get_client()
     if client is None:
         _denied_mem.add(user_id)
         _approved_mem.discard(user_id)
+        rec = _users_mem.setdefault(user_id, {})
+        rec["denied_at"] = now
+        rec["denied_via"] = via or "?"
+        rec.pop("approved_at", None)
         return
     try:
         async with client.pipeline(transaction=True) as pipe:
             pipe.sadd(_DENIED_SET, user_id)
             pipe.srem(_APPROVED_SET, user_id)
+            pipe.hset(_user_key(user_id), mapping={"denied_at": now, "denied_via": via or "?"})
+            pipe.hdel(_user_key(user_id), "approved_at", "approved_via")
             await pipe.execute()
     except Exception:  # noqa: BLE001
         logger.exception("Redis deny failed")
         _denied_mem.add(user_id)
         _approved_mem.discard(user_id)
+
+
+async def is_denied(user_id: int) -> bool:
+    client = redis_client.get_client()
+    if client is None:
+        return user_id in _denied_mem
+    try:
+        return bool(await client.sismember(_DENIED_SET, user_id))
+    except Exception:  # noqa: BLE001
+        logger.exception("Redis is_denied failed")
+        return user_id in _denied_mem
 
 
 # --------------------------------------------------------------------------
