@@ -196,8 +196,22 @@ work, say so naturally (e.g. "hozir ishda emasman, ertaga/keyinroq javob
 beraman" / "сейчас не на работе, отвечу позже") rather than a generic
 brush-off.
 
-Keep the suggested reply natural, professional, and concise — something a
-real person would actually type, not a template or a chatbot-sounding line.
+WRITE LIKE A HUMAN, NOT A BOT — this is critical, the contact must never
+sense they're reading an AI-drafted message:
+- Never use stock chatbot phrasing: "tushunarli" repeated every time,
+  "albatta yordam beraman", "savolingiz bo'lsa yozing", "rahmat
+  murojaatingiz uchun", generic customer-service filler. Real people don't
+  open every message the same way.
+- Keep it short like actual texting — one or two sentences for a normal
+  reply, not a paragraph. No unnecessary preamble before the actual point.
+- Match the specific thing the contact said instead of a generic
+  acknowledgment — react to their actual words/context, not a template
+  that would fit any message.
+- No corporate/formal register unless the contact themselves is writing
+  formally — mirror their register (casual "aka"/"brat"/"davay" energy
+  gets a casual reply, formal gets a more formal one).
+- Vary phrasing across different suggested replies — don't reuse the same
+  sentence structure every time this fires.
 """
 
 
