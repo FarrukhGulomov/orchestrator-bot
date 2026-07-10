@@ -244,7 +244,15 @@ def work_status(now_local: datetime | None = None) -> str:
     return "ish vaqtidan 1 soatdan ko'p o'tgan — ishda emas, uyda/tashqarida bo'lishi mumkin"
 
 
-async def analyze(business_connection_id: str, customer_chat_id: int, sender_name: str, latest_text: str) -> dict | None:
+async def analyze(
+    business_connection_id: str, customer_chat_id: int, sender_name: str, latest_text: str
+) -> tuple[dict | None, str | None]:
+    """Returns (data, error_message). error_message is a short, real
+    diagnostic (not just logged) so a failure ("model not found", "insufficient
+    balance", a timeout) is visible to the admin in the Telegram notification
+    itself instead of requiring a server-log lookup to explain "AI tahlili
+    muvaffaqiyatsiz" — that generic message alone gave no way to tell a
+    dead/deprecated free model apart from an exhausted token."""
     history = await _get_history(business_connection_id, customer_chat_id)
     convo = "\n".join(
         f"{'Contact' if h['role'] == 'them' else 'You'}: {h['text']}" for h in history[-6:]
@@ -268,12 +276,12 @@ async def analyze(business_connection_id: str, customer_chat_id: int, sender_nam
             timeout=settings.request_timeout,
         )
         data = json.loads(raw)
-    except Exception:  # noqa: BLE001
-        logger.exception("Business copilot analysis failed")
-        return None
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Business copilot analysis failed (model=%s)", model)
+        return None, str(exc)[:300]
     if not isinstance(data, dict) or not str(data.get("suggested_reply", "")).strip():
-        return None
-    return data
+        return None, "Model bo'sh yoki noto'g'ri formatdagi javob qaytardi."
+    return data, None
 
 
 # --------------------------------------------------------------------------
