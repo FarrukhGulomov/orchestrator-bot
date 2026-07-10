@@ -234,6 +234,15 @@ class Settings:
         default_factory=lambda: os.getenv("GITHUB_AUTO_PR", "false").lower() == "true"
     )
 
+    # --- Persistent storage (PostgreSQL) ------------------------------------
+    # The durable "source of truth" for relational business data: users/
+    # access-control, per-user profile notes, tasks/reminders, decision log,
+    # project memory. See db.py. Railway: Project -> + New -> Database ->
+    # Add PostgreSQL, then on this service set DATABASE_URL = ${{Postgres.DATABASE_URL}}.
+    # Falls back to Redis (if configured) then in-memory when unset — see
+    # each module's docstring for its exact fallback chain.
+    database_url: str = field(default_factory=lambda: os.getenv("DATABASE_URL", ""))
+
     # --- Persistent storage (Redis) ----------------------------------------
     redis_url: str = field(default_factory=lambda: os.getenv("REDIS_URL", ""))
     redis_history_ttl_seconds: int = field(
@@ -251,6 +260,10 @@ class Settings:
     @property
     def redis_enabled(self) -> bool:
         return bool(self.redis_url)
+
+    @property
+    def db_enabled(self) -> bool:
+        return bool(self.database_url)
 
     @property
     def railway_enabled(self) -> bool:

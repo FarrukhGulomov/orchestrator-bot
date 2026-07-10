@@ -72,6 +72,7 @@ import decisions as decisions_store
 import digest
 import document_generation as docgen
 import github_integration
+import db
 import group_copilot
 import history
 import memory
@@ -417,6 +418,21 @@ class AccessGateMiddleware(BaseMiddleware):
 
     async def __call__(self, handler, event: Message, data):
         if event.chat.type != "private" or not event.from_user:
+            return await handler(event, data)
+
+        # /id must ALWAYS work, for EVERYONE, regardless of approval state.
+        # It's the bootstrap utility: a pending user needs it to hand their
+        # numeric ID to the admin for /approve, and the admin needs it to
+        # discover their OWN numeric ID for ADMIN_USER_ID — which is a
+        # chicken-and-egg case if their Telegram account has no public
+        # @username, or one that doesn't match ADMIN_USERNAME, since is_admin()
+        # can't recognize them yet either. Without this exemption /id was
+        # silently swallowed by the unapproved-user flow (or the onboarding
+        # nag) instead of ever reaching cmd_id — this was the reported bug.
+        # Reveals nothing sensitive: Telegram already exposes chat_id to the
+        # client itself.
+        cmd = (event.text or "").split()[0].split("@")[0].lower() if event.text else ""
+        if cmd == "/id":
             return await handler(event, data)
 
         uid = event.from_user.id
@@ -1638,8 +1654,10 @@ async def cmd_status(message: Message) -> None:
         lines.append(f"**Tez model:** {settings.claude_fast_model_label}")
     else:
         lines.append("**Provider:** ❌ Sozlanmagan (OPENROUTER_API_KEY yoki ANTHROPIC_API_KEY kerak)")
+    db_status = "✅ Ulangan (users/tasks/decisions/memory)" if settings.db_enabled else "⚠️ Sozlanmagan (Redis/in-memory fallback)"
+    lines.append(f"\n**PostgreSQL:** {db_status}")
     redis_status = "✅ Persistent" if settings.redis_enabled else "⚠️ In-memory (restart da yo'oladi)"
-    lines.append(f"\n**Redis:** {redis_status}")
+    lines.append(f"**Redis:** {redis_status}")
     lines.append(f"**GitHub:** {'✅ ' + settings.github_repo if settings.github_enabled else '❌ Sozlanmagan'}")
     lines.append(f"**Railway logs:** {'✅' if settings.railway_enabled else '❌ Sozlanmagan'}")
 
@@ -2309,7 +2327,10 @@ async def cmd_stats(message: Message) -> None:
         name = u.get("full_name") or u.get("fio") or str(u["user_id"])
         lines.append(f"• {name} — {_count(u)} xabar")
     lines.append("")
-    lines.append(f"🤖 Provider: {settings.provider} · 💾 Redis: {'✅' if settings.redis_enabled else '⚠️ in-memory'}")
+    lines.append(
+        f"🤖 Provider: {settings.provider} · 🗄 PostgreSQL: {'✅' if settings.db_enabled else '⚠️'} "
+        f"· 💾 Redis: {'✅' if settings.redis_enabled else '⚠️ in-memory'}"
+    )
     await _send_long(message, "\n".join(lines))
 
 
@@ -2940,6 +2961,18 @@ async def main() -> None:
     problems = settings.validate()
     for p in problems:
         logger.warning("CONFIG: %s", p)
+
+    if settings.db_enabled:
+        if await db.init_schema():
+            logger.info("PostgreSQL: durable storage ENABLED for users/tasks/decisions/memory.")
+            await db.migrate_from_redis()
+        else:
+            logger.warning("DATABASE_URL set but PostgreSQL init failed — falling back to Redis/in-memory.")
+    else:
+        logger.info(
+            "PostgreSQL: not configured — users/tasks/decisions/memory fall back to Redis/in-memory. "
+            "Set DATABASE_URL for durable storage (strongly recommended)."
+        )
 
     if settings.redis_enabled:
         client = redis_client.get_client()
