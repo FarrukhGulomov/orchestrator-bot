@@ -2,7 +2,15 @@
 Daily task / reminder storage + the smart reminder-timing algorithm.
 
 Pure data layer — no Telegram, no LLM calls (that's task_assistant.py).
-Same Redis-backed / in-memory-fallback pattern as history.py and memory.py.
+
+STORAGE: three-tier fallback — PostgreSQL (DATABASE_URL) -> Redis
+(REDIS_URL) -> in-memory. Tasks are durable business data (reminders a
+real person is relying on to fire), so this follows the same tiering as
+access_control/user_profile/decisions/memory — see db.py's module
+docstring. The Postgres `tasks` table carries a `next_reminder_at` column
+that always holds whichever reminder timestamp (primary or final) is next
+due; this directly replaces the Redis version's separate `tasks:due` ZSET
+"schedule index" — a plain indexed WHERE clause does the same job SQL-natively.
 
 REMINDER TIMING ALGORITHM (the "kuchli algoritm" part):
 Every task gets a PRIMARY reminder — not fired at the deadline, but early
@@ -20,6 +28,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+import db
 import redis_client
 from config import settings
 
@@ -119,6 +128,12 @@ _due_mem: dict[str, float] = {}
 _index_mem: dict[int, set[str]] = {}
 
 
+async def _pg():
+    if await db.init_schema():
+        return await db.get_pool()
+    return None
+
+
 def _task_key(task_id: str) -> str:
     return f"task:{task_id}"
 
@@ -133,6 +148,44 @@ def _to_json(task: Task) -> str:
 
 def _from_json(raw: str) -> Task:
     return Task(**json.loads(raw))
+
+
+def _dt(v: str | None) -> datetime | None:
+    return datetime.fromisoformat(v) if v else None
+
+
+def _row_to_task(row) -> Task:
+    return Task(
+        id=row["id"], chat_id=row["chat_id"], user_id=row["user_id"],
+        title=row["title"], description=row["description"],
+        due_at=row["due_at"].isoformat(), remind_at=row["remind_at"].isoformat(),
+        final_remind_at=row["final_remind_at"].isoformat() if row["final_remind_at"] else None,
+        complexity=row["complexity"], priority=row["priority"], recurrence=row["recurrence"],
+        agent_key=row["agent_key"], status=row["status"], stage=row["stage"],
+        created_at=row["created_at"].isoformat() if row["created_at"] else "",
+        completed_at=row["completed_at"].isoformat() if row["completed_at"] else "",
+    )
+
+
+async def _pg_upsert(conn, task: Task, next_reminder_at: datetime | None) -> None:
+    await conn.execute(
+        """
+        INSERT INTO tasks (
+            id, chat_id, user_id, title, description, due_at, remind_at, final_remind_at,
+            next_reminder_at, complexity, priority, recurrence, agent_key, status, stage,
+            created_at, completed_at
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+        ON CONFLICT (id) DO UPDATE SET
+            title = $4, description = $5, due_at = $6, remind_at = $7, final_remind_at = $8,
+            next_reminder_at = $9, complexity = $10, priority = $11, recurrence = $12,
+            agent_key = $13, status = $14, stage = $15, completed_at = $17
+        """,
+        task.id, task.chat_id, task.user_id, task.title, task.description,
+        _dt(task.due_at), _dt(task.remind_at), _dt(task.final_remind_at),
+        next_reminder_at, task.complexity, task.priority, task.recurrence,
+        task.agent_key, task.status, task.stage,
+        _dt(task.created_at) or _now_utc(), _dt(task.completed_at),
+    )
 
 
 async def _save(task: Task) -> None:
@@ -207,12 +260,31 @@ async def create_task(
         agent_key=agent_key,
         created_at=_now_utc().isoformat(),
     )
+
+    pool = await _pg()
+    if pool is not None:
+        try:
+            async with pool.acquire() as conn:
+                await _pg_upsert(conn, task, primary)
+            return task
+        except Exception:  # noqa: BLE001
+            logger.exception("Postgres create_task failed, falling back to Redis/in-memory")
+
     await _save(task)
     await _schedule(task.id, primary)
     return task
 
 
 async def get_task(task_id: str) -> Task | None:
+    pool = await _pg()
+    if pool is not None:
+        try:
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow("SELECT * FROM tasks WHERE id = $1", task_id)
+            return _row_to_task(row) if row else None
+        except Exception:  # noqa: BLE001
+            logger.exception("Postgres get_task failed")
+            return _store.get(task_id)
     client = redis_client.get_client()
     if client is None:
         return _store.get(task_id)
@@ -226,6 +298,18 @@ async def get_task(task_id: str) -> Task | None:
 
 async def list_tasks(chat_id: int, statuses: set[str] | None = None) -> list[Task]:
     statuses = statuses or {"pending"}
+    pool = await _pg()
+    if pool is not None:
+        try:
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT * FROM tasks WHERE chat_id = $1 AND status = ANY($2::text[]) ORDER BY due_at",
+                    chat_id, list(statuses),
+                )
+            return [_row_to_task(r) for r in rows]
+        except Exception:  # noqa: BLE001
+            logger.exception("Postgres list_tasks failed")
+            return []
     client = redis_client.get_client()
     if client is None:
         ids = _index_mem.get(chat_id, set())
@@ -245,6 +329,24 @@ async def list_tasks(chat_id: int, statuses: set[str] | None = None) -> list[Tas
 
 
 async def set_status(task_id: str, status: str) -> Task | None:
+    pool = await _pg()
+    if pool is not None:
+        try:
+            completed_at = _now_utc() if status == "done" else None
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    UPDATE tasks SET status = $2, completed_at = COALESCE($3, completed_at),
+                        next_reminder_at = CASE WHEN $2 != 'pending' THEN NULL ELSE next_reminder_at END
+                    WHERE id = $1 RETURNING *
+                    """,
+                    task_id, status, completed_at,
+                )
+            return _row_to_task(row) if row else None
+        except Exception:  # noqa: BLE001
+            logger.exception("Postgres set_status failed")
+            return None
+
     task = await get_task(task_id)
     if task is None:
         return None
@@ -258,10 +360,26 @@ async def set_status(task_id: str, status: str) -> Task | None:
 
 
 async def snooze(task_id: str, minutes: int) -> Task | None:
+    when = _now_utc() + timedelta(minutes=minutes)
+    pool = await _pg()
+    if pool is not None:
+        try:
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    UPDATE tasks SET remind_at = $2, stage = 'primary', next_reminder_at = $2
+                    WHERE id = $1 RETURNING *
+                    """,
+                    task_id, when,
+                )
+            return _row_to_task(row) if row else None
+        except Exception:  # noqa: BLE001
+            logger.exception("Postgres snooze failed")
+            return None
+
     task = await get_task(task_id)
     if task is None:
         return None
-    when = _now_utc() + timedelta(minutes=minutes)
     task.remind_at = when.isoformat()
     task.stage = "primary"
     await _save(task)
@@ -273,6 +391,32 @@ async def pop_due(limit: int = 50) -> list[Task]:
     """Return tasks whose next reminder is due now, removing them from the
     schedule. Caller (task_assistant.advance_after_fire) decides whether to
     requeue a final nudge or the next recurrence."""
+    pool = await _pg()
+    if pool is not None:
+        try:
+            async with pool.acquire() as conn:
+                # FOR UPDATE SKIP LOCKED: safe even if this ever ran from more
+                # than one process — no two workers can claim the same task.
+                rows = await conn.fetch(
+                    """
+                    UPDATE tasks SET next_reminder_at = NULL
+                    WHERE id IN (
+                        SELECT id FROM tasks
+                        WHERE status = 'pending' AND next_reminder_at IS NOT NULL
+                            AND next_reminder_at <= now()
+                        ORDER BY next_reminder_at
+                        LIMIT $1
+                        FOR UPDATE SKIP LOCKED
+                    )
+                    RETURNING *
+                    """,
+                    limit,
+                )
+            return [_row_to_task(r) for r in rows]
+        except Exception:  # noqa: BLE001
+            logger.exception("Postgres pop_due failed")
+            return []
+
     now_ts = _now_utc().timestamp()
     client = redis_client.get_client()
     due_ids: list[str] = []
@@ -302,6 +446,14 @@ async def advance_after_fire(task: Task) -> None:
     reminder: the FINAL nudge, the next RECURRENCE, or nothing further."""
     if task.stage == "primary" and task.final_remind_at:
         task.stage = "final"
+        pool = await _pg()
+        if pool is not None:
+            try:
+                async with pool.acquire() as conn:
+                    await _pg_upsert(conn, task, datetime.fromisoformat(task.final_remind_at))
+                return
+            except Exception:  # noqa: BLE001
+                logger.exception("Postgres advance_after_fire (final) failed")
         await _save(task)
         await _schedule(task.id, datetime.fromisoformat(task.final_remind_at))
         return
@@ -314,12 +466,21 @@ async def advance_after_fire(task: Task) -> None:
         task.remind_at = primary.isoformat()
         task.final_remind_at = final.isoformat() if final else None
         task.stage = "primary"
+        pool = await _pg()
+        if pool is not None:
+            try:
+                async with pool.acquire() as conn:
+                    await _pg_upsert(conn, task, primary)
+                return
+            except Exception:  # noqa: BLE001
+                logger.exception("Postgres advance_after_fire (recurrence) failed")
         await _save(task)
         await _schedule(task.id, primary)
         return
 
     # One-off task, no more reminders queued — stays "pending" until the user
-    # marks it done/cancelled, or re-schedules via snooze.
+    # marks it done/cancelled, or re-schedules via snooze. (Postgres path:
+    # next_reminder_at was already cleared by pop_due()'s UPDATE.)
 
 
 # --------------------------------------------------------------------------

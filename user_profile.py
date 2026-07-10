@@ -16,13 +16,15 @@ chat_id — which happens to equal user_id in private chats too, but the
 name here is honest about what this store is actually about: a person,
 not a room).
 
-Backed by Redis when REDIS_URL is configured, with the same in-memory
-fallback pattern as the rest of the codebase. No TTL — notes are meant to
-accumulate durably until explicitly cleared.
+STORAGE: three-tier fallback — PostgreSQL (DATABASE_URL) -> Redis
+(REDIS_URL) -> in-memory. This IS durable business data (it drives what
+the AI team knows about a real customer), unlike the short-lived relay/
+history state elsewhere in the codebase — see db.py's module docstring.
 """
 
 import logging
 
+import db
 import redis_client
 
 logger = logging.getLogger(__name__)
@@ -33,13 +35,19 @@ MAX_NOTES = 30
 _store: dict[int, list[str]] = {}
 
 
+async def _pg():
+    if await db.init_schema():
+        return await db.get_pool()
+    return None
+
+
 def _words(text: str) -> set[str]:
     return {w for w in text.lower().split() if w}
 
 
 def _is_near_duplicate(note: str, existing: list[str]) -> bool:
-    """Same dedup heuristic as memory.py: exact match, or >= 80% word
-    overlap with an already-stored note — stops trivially-reworded
+    """Same dedup heuristic across all three tiers: exact match, or >= 80%
+    word overlap with an already-stored note — stops trivially-reworded
     observations piling up ("javoblarni qisqa yozadi" said five different
     ways)."""
     if note in existing:
@@ -62,6 +70,17 @@ def _key(user_id: int) -> str:
 
 
 async def get_profile(user_id: int) -> list[str]:
+    pool = await _pg()
+    if pool is not None:
+        try:
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT note FROM user_profile_notes WHERE user_id = $1 ORDER BY id", user_id,
+                )
+            return [r["note"] for r in rows]
+        except Exception:  # noqa: BLE001
+            logger.exception("Postgres get_profile failed")
+            return list(_store.get(user_id, []))
     client = redis_client.get_client()
     if client is None:
         return list(_store.get(user_id, []))
@@ -77,6 +96,35 @@ async def add_profile_note(user_id: int, note: str) -> bool:
     note = (note or "").strip()
     if not note:
         return False
+
+    pool = await _pg()
+    if pool is not None:
+        try:
+            async with pool.acquire() as conn:
+                existing = [r["note"] for r in await conn.fetch(
+                    "SELECT note FROM user_profile_notes WHERE user_id = $1 ORDER BY id", user_id,
+                )]
+                if _is_near_duplicate(note, existing):
+                    return False
+                async with conn.transaction():
+                    await conn.execute(
+                        "INSERT INTO user_profile_notes (user_id, note) VALUES ($1, $2)", user_id, note,
+                    )
+                    # Trim to MAX_NOTES, oldest first — mirrors the Redis
+                    # LTRIM(-MAX_NOTES, -1) behaviour (keep the newest N).
+                    await conn.execute(
+                        """
+                        DELETE FROM user_profile_notes WHERE id IN (
+                            SELECT id FROM user_profile_notes WHERE user_id = $1
+                            ORDER BY id DESC OFFSET $2
+                        )
+                        """,
+                        user_id, MAX_NOTES,
+                    )
+            return True
+        except Exception:  # noqa: BLE001
+            logger.exception("Postgres add_profile_note failed")
+            return False
 
     client = redis_client.get_client()
     if client is None:
@@ -104,6 +152,15 @@ async def add_profile_note(user_id: int, note: str) -> bool:
 
 async def clear_profile(user_id: int) -> int:
     """Clear all stored notes for this user. Returns how many were removed."""
+    pool = await _pg()
+    if pool is not None:
+        try:
+            async with pool.acquire() as conn:
+                result = await conn.execute("DELETE FROM user_profile_notes WHERE user_id = $1", user_id)
+            return int(result.split()[-1])
+        except Exception:  # noqa: BLE001
+            logger.exception("Postgres clear_profile failed")
+            return 0
     client = redis_client.get_client()
     if client is None:
         notes = _store.pop(user_id, [])
