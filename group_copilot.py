@@ -85,7 +85,9 @@ AI-drafted if the admin sends it as-is.
 """
 
 
-async def analyze(group_name: str, sender_name: str, quoted_text: str, latest_text: str) -> dict | None:
+async def analyze(group_name: str, sender_name: str, quoted_text: str, latest_text: str) -> tuple[dict | None, str | None]:
+    """Returns (data, error_message) — see business_copilot.analyze()'s
+    docstring for why the real error is surfaced instead of just logged."""
     context_lines = [f"Group: {group_name}"]
     if quoted_text:
         context_lines.append(f'This replies to a message you (the professional) sent earlier: "{quoted_text[:500]}"')
@@ -102,12 +104,12 @@ async def analyze(group_name: str, sender_name: str, quoted_text: str, latest_te
             timeout=settings.request_timeout,
         )
         data = json.loads(raw)
-    except Exception:  # noqa: BLE001
-        logger.exception("Group copilot analysis failed")
-        return None
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Group copilot analysis failed (model=%s)", model)
+        return None, str(exc)[:300]
     if not isinstance(data, dict) or not str(data.get("suggested_reply", "")).strip():
-        return None
-    return data
+        return None, "Model bo'sh yoki noto'g'ri formatdagi javob qaytardi."
+    return data, None
 
 
 # --------------------------------------------------------------------------

@@ -683,13 +683,15 @@ async def _handle_group_mention(message: Message, bot: Bot, user_text: str) -> N
     if replied:
         quoted_text = (replied.text or replied.caption or "").strip()
 
-    data = await group_copilot.analyze(group_name, sender_name, quoted_text, user_text)
+    data, error = await group_copilot.analyze(group_name, sender_name, quoted_text, user_text)
     if data is None:
         try:
             await bot.send_message(
                 admin_chat_id,
                 f"👥 \"{group_name}\" guruhida {sender_name} sizga yozdi:\n\n{user_text}\n\n"
-                "⚠️ AI tahlili muvaffaqiyatsiz — o'zingiz javob yozing.",
+                f"⚠️ AI tahlili muvaffaqiyatsiz — o'zingiz javob yozing.\n"
+                f"Sabab: {error or 'nomaʼlum xatolik'}\n"
+                "(Agar bu tez-tez takrorlansa, /status bilan provider holatini tekshiring.)",
             )
         except Exception:  # noqa: BLE001
             logger.exception("Failed to notify admin of group mention (analysis failed)")
@@ -2456,13 +2458,14 @@ async def handle_business_message(message: Message, bot: Bot) -> None:
     await business_copilot.append_contact_message(conn_id, message.chat.id, text)
 
     owner_chat_id = conn["owner_chat_id"]
-    data = await business_copilot.analyze(conn_id, message.chat.id, sender_name, text)
+    data, error = await business_copilot.analyze(conn_id, message.chat.id, sender_name, text)
     if data is None:
         try:
             await bot.send_message(
                 owner_chat_id,
                 f"💼 {sender_name} sizga yozdi:\n\n{text}\n\n⚠️ AI tahlili muvaffaqiyatsiz — o'zingiz javob yozing.\n"
-                "(Agar bu tez-tez takrorlansa, AI provider balansi/tokeni tugagan bo'lishi mumkin — /status bilan tekshiring.)",
+                f"Sabab: {error or 'nomaʼlum xatolik'}\n"
+                "(Agar bu tez-tez takrorlansa, /status bilan provider holatini tekshiring.)",
             )
         except Exception:  # noqa: BLE001
             logger.exception("Failed to notify admin of business message (analysis failed)")

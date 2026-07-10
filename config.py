@@ -98,15 +98,30 @@ class Settings:
     # Fast model: routing/classification, memory extraction, AND (in hybrid
     # mode) actual answers to low-complexity/simple questions — this is the
     # model that keeps Claude usage down, so pick a genuinely good free one.
+    #
+    # Default is OpenRouter's OWN "openrouter/free" router (launched Feb
+    # 2026), NOT a pinned model id. Individual free models get deprecated
+    #/retired/renamed by their providers with little notice — this bot
+    # previously pinned "google/gemini-2.0-flash-exp:free", which Google
+    # shut down (deprecated Feb 2026, fully retired Jun 2026), and every
+    # Business/Group Copilot analysis started failing with no way to tell
+    # "model is dead" apart from "token/balance ran out" from the generic
+    # error alone. openrouter/free self-selects among whatever free models
+    # are CURRENTLY live, so this specific failure mode can't recur — if
+    # you want a specific pinned model instead, set OR_FAST_MODEL explicitly.
     or_fast_model: str = field(
-        default_factory=lambda: os.getenv("OR_FAST_MODEL", "google/gemini-2.0-flash-exp:free")
+        default_factory=lambda: os.getenv("OR_FAST_MODEL", "openrouter/free")
     )
     or_fast_model_label: str = field(
-        default_factory=lambda: os.getenv("OR_FAST_MODEL_LABEL", "Gemini 2.0 Flash (free)")
+        default_factory=lambda: os.getenv("OR_FAST_MODEL_LABEL", "OpenRouter Free Router")
     )
-    # Universal fallback — OpenRouter auto-picks best available free model.
+    # Fallback when a pinned model (OR_MAIN_MODEL/OR_FAST_MODEL, if
+    # overridden away from the router default above) turns out to be
+    # unavailable — see llm_clients.py's _is_model_unavailable(). Also
+    # OpenRouter's free auto-router, so the fallback never silently starts
+    # billing paid usage.
     or_auto_model: str = field(
-        default_factory=lambda: os.getenv("OR_AUTO_MODEL", "openrouter/auto")
+        default_factory=lambda: os.getenv("OR_AUTO_MODEL", "openrouter/free")
     )
 
     # --- Claude Models (used only when Claude is the active provider) ------
