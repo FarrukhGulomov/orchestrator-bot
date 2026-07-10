@@ -419,6 +419,21 @@ class AccessGateMiddleware(BaseMiddleware):
         if event.chat.type != "private" or not event.from_user:
             return await handler(event, data)
 
+        # /id must ALWAYS work, for EVERYONE, regardless of approval state.
+        # It's the bootstrap utility: a pending user needs it to hand their
+        # numeric ID to the admin for /approve, and the admin needs it to
+        # discover their OWN numeric ID for ADMIN_USER_ID — which is a
+        # chicken-and-egg case if their Telegram account has no public
+        # @username, or one that doesn't match ADMIN_USERNAME, since is_admin()
+        # can't recognize them yet either. Without this exemption /id was
+        # silently swallowed by the unapproved-user flow (or the onboarding
+        # nag) instead of ever reaching cmd_id — this was the reported bug.
+        # Reveals nothing sensitive: Telegram already exposes chat_id to the
+        # client itself.
+        cmd = (event.text or "").split()[0].split("@")[0].lower() if event.text else ""
+        if cmd == "/id":
+            return await handler(event, data)
+
         uid = event.from_user.id
         uname = event.from_user.username
 
