@@ -20,7 +20,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 import tasks
 from agents import AGENTS
 from config import settings
-from llm_clients import claude_generate_json
+from llm_clients import claude_generate_json, parse_llm_json
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +98,7 @@ async def classify_task(user_text: str) -> dict | None:
             claude_generate_json(_CLASSIFY_SYSTEM, [{"role": "user", "content": context}], max_tokens=400),
             timeout=settings.request_timeout,
         )
-        data = json.loads(raw)
+        data = parse_llm_json(raw)
     except Exception:  # noqa: BLE001
         logger.exception("Task classification failed")
         return None

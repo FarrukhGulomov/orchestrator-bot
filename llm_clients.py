@@ -18,6 +18,7 @@ Retry logic: 3x exponential backoff (2s → 4s → 8s) on 503/429/529.
 import asyncio
 import base64
 import io
+import json
 import logging
 import time
 
@@ -366,6 +367,83 @@ def _repair_json_control_chars(raw: str) -> str:
     return "".join(out)
 
 
+def _repair_unescaped_quotes(raw: str) -> str:
+    """Second-tier repair, only tried if control-char repair alone still
+    doesn't parse: escapes a `"` that looks like it's INSIDE a string value
+    rather than closing it — e.g. suggested_reply: "u \"aka\" dedi" written
+    by the model as suggested_reply: "u "aka" dedi" (forgot to escape the
+    inner quotes). A quote is treated as a genuine closing quote only if,
+    after optional whitespace, the next character is a JSON structural one
+    (, } ] :) or end of input; otherwise it's escaped and scanning continues
+    as still-inside-the-string. Not a full JSON grammar — a heuristic that
+    recovers the common "model quoted a phrase without escaping it" case."""
+    out = []
+    in_string = False
+    escaped = False
+    n = len(raw)
+    i = 0
+    while i < n:
+        ch = raw[i]
+        if not in_string:
+            if ch == '"':
+                in_string = True
+            out.append(ch)
+            i += 1
+            continue
+        if escaped:
+            out.append(ch)
+            escaped = False
+            i += 1
+            continue
+        if ch == "\\":
+            out.append(ch)
+            escaped = True
+            i += 1
+            continue
+        if ch == '"':
+            j = i + 1
+            while j < n and raw[j] in " \t\r\n":
+                j += 1
+            if j >= n or raw[j] in ",}]:":
+                in_string = False
+                out.append(ch)
+            else:
+                out.append('\\"')
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def parse_llm_json(raw: str):
+    """Best-effort JSON parsing for LLM output that's SUPPOSED to be JSON
+    but, especially from free/weaker models routed through openrouter/free
+    (a different model on every call, with varying JSON discipline), isn't
+    always quite valid. Every caller that parses structured LLM output
+    (router, business/group copilot, minutes, docgen, task classification)
+    should use this instead of bare json.loads() for that reason.
+
+    Tries progressively more aggressive repairs and raises the ORIGINAL
+    json.JSONDecodeError (not a repair-stage one) if nothing works, so an
+    error message shown to the admin describes the real problem instead of
+    an artifact of a failed repair attempt."""
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as first_exc:
+        stage1 = _repair_json_control_chars(raw)
+        try:
+            return json.loads(stage1)
+        except json.JSONDecodeError:
+            pass
+        stage2 = _repair_unescaped_quotes(stage1)
+        try:
+            return json.loads(stage2)
+        except json.JSONDecodeError:
+            pass
+        raise first_exc
+
+
 def _or_json_sync(system: str, messages: list[dict], model: str, max_tokens: int) -> str:
     client = _get_or_client()
     full = [{"role": "system", "content": system + "\nRespond with ONLY valid JSON, no markdown, no prose."}] + messages
@@ -457,3 +535,48 @@ async def claude_generate_json(
     # common way a free/weaker model breaks otherwise-valid JSON — see
     # _repair_json_control_chars's docstring.
     return _repair_json_control_chars(raw)
+
+
+async def generate_json(
+    system: str,
+    messages: list[dict],
+    model: str | None = None,
+    max_tokens: int = 512,
+    timeout: float | None = None,
+    retries: int = 1,
+) -> dict:
+    """High-level structured-JSON helper: calls claude_generate_json, parses
+    the result with parse_llm_json() (which already repairs common
+    formatting slips — raw control chars, unescaped inner quotes), AND —
+    since openrouter/free can land on a DIFFERENT, sometimes flaky, free
+    model on every single call — retries the WHOLE round-trip (a fresh LLM
+    call, not just re-parsing the same broken text) up to `retries` extra
+    times if the response still isn't valid JSON after repair. A malformed
+    or truncated response is usually a one-off draw from the free-model
+    pool; the next call very likely lands on a model that actually follows
+    the "respond with ONLY JSON" instruction.
+
+    Raises the LAST parse error if every attempt is exhausted — callers
+    should catch and handle exactly as they would a bare claude_generate_json
+    + json.loads failure."""
+    timeout = timeout if timeout is not None else settings.request_timeout
+    last_exc: Exception | None = None
+    for attempt in range(retries + 1):
+        raw = await asyncio.wait_for(
+            claude_generate_json(system, messages, model=model, max_tokens=max_tokens),
+            timeout=timeout,
+        )
+        try:
+            data = parse_llm_json(raw)
+        except json.JSONDecodeError as exc:
+            last_exc = exc
+            logger.warning(
+                "generate_json: attempt %d/%d returned unparseable JSON (%s) — %s",
+                attempt + 1, retries + 1, exc, "retrying" if attempt < retries else "giving up",
+            )
+            continue
+        if not isinstance(data, dict):
+            last_exc = ValueError(f"expected a JSON object, got {type(data).__name__}")
+            continue
+        return data
+    raise last_exc  # type: ignore[misc]

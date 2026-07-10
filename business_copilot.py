@@ -30,7 +30,6 @@ reply context, and the relay map), with the same in-memory fallback
 pattern as the rest of the codebase.
 """
 
-import asyncio
 import json
 import logging
 from collections import deque
@@ -42,7 +41,7 @@ import redis_client
 import tasks
 from agents import get_agent
 from config import settings
-from llm_clients import claude_generate_json
+from llm_clients import generate_json
 from router import model_for
 
 logger = logging.getLogger(__name__)
@@ -271,11 +270,12 @@ async def analyze(
     # separate "🧠 Jamoa bilan ishlab chiqish" button (classify() + agent).
     model, _label = model_for(get_agent("ba"), "low")
     try:
-        raw = await asyncio.wait_for(
-            claude_generate_json(_COPILOT_SYSTEM, [{"role": "user", "content": context}], model=model, max_tokens=400),
-            timeout=settings.request_timeout,
+        # retries=1: openrouter/free can land on a different (sometimes
+        # flaky/truncation-prone) free model each call — one retry recovers
+        # the vast majority of one-off malformed/truncated responses.
+        data = await generate_json(
+            _COPILOT_SYSTEM, [{"role": "user", "content": context}], model=model, max_tokens=600, retries=1,
         )
-        data = json.loads(raw)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Business copilot analysis failed (model=%s)", model)
         return None, str(exc)[:300]

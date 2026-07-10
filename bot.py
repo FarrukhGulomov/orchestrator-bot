@@ -86,7 +86,7 @@ import tasks
 from agents import Agent, TEAM_MEMORY_HEADER, get_agent
 from config import settings
 from file_processing import SUPPORTED_SUMMARY, extract, transcribe_audio
-from llm_clients import claude_generate, claude_generate_fast, claude_generate_json
+from llm_clients import claude_generate, claude_generate_fast, claude_generate_json, parse_llm_json
 from request_types import REQUEST_TYPES, get_request_type
 from router import Route, classify, model_for
 
@@ -589,7 +589,7 @@ async def _check_group_relevance(text: str) -> bool:
             ),
             timeout=10,
         )
-        data = json.loads(raw)
+        data = parse_llm_json(raw)
         return bool(data.get("relevant", False))
     except Exception:
         return False
