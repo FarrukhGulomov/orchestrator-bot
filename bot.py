@@ -54,6 +54,8 @@ from aiogram.enums import ChatAction
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
+    BotCommand,
+    BotCommandScopeChat,
     BufferedInputFile,
     BusinessConnection,
     CallbackQuery,
@@ -73,6 +75,7 @@ import github_integration
 import group_copilot
 import history
 import memory
+import quick_actions
 import user_profile
 import minutes as minutes_mod
 import railway_integration
@@ -769,22 +772,45 @@ async def _maybe_create_tickets(route: Route, user_text: str, body: str) -> str:
     return ("\n\n" + "\n".join(lines)) if lines else ""
 
 
-async def _send_long(message: Message, text: str, reply_mode: bool = False) -> None:
+async def _send_long(message: Message, text: str, reply_mode: bool = False) -> Message | None:
     """Send a (possibly long) reply, splitting at TELEGRAM_LIMIT. If reply_mode,
-    the first chunk quotes the original message so group context is clear."""
+    the first chunk quotes the original message so group context is clear.
+    Returns the LAST sent Message — callers can attach an inline keyboard to
+    it (quick actions) via edit_reply_markup."""
     chunks = _split(text, TELEGRAM_LIMIT)
+    sent: Message | None = None
     for i, chunk in enumerate(chunks):
         use_reply = reply_mode and i == 0
         try:
             if use_reply:
-                await message.reply(chunk, parse_mode="Markdown")
+                sent = await message.reply(chunk, parse_mode="Markdown")
             else:
-                await message.answer(chunk, parse_mode="Markdown")
+                sent = await message.answer(chunk, parse_mode="Markdown")
         except TelegramBadRequest:
             if use_reply:
-                await message.reply(chunk, parse_mode=None)
+                sent = await message.reply(chunk, parse_mode=None)
             else:
-                await message.answer(chunk, parse_mode=None)
+                sent = await message.answer(chunk, parse_mode=None)
+    return sent
+
+
+# Only offer quick actions under answers with enough substance to be worth
+# turning into a document/task — short conversational replies would just
+# collect button clutter.
+_QUICK_ACTION_MIN_CHARS = 300
+
+
+async def _offer_quick_actions(message: Message, sent: Message | None, user_text: str, body: str) -> None:
+    """Attach one-tap follow-up buttons (Word/PDF, task) under a substantive
+    answer in a PRIVATE chat — see quick_actions.py. Group answers are left
+    clean, and short replies aren't worth converting."""
+    if sent is None or message.chat.type != "private" or len(body) < _QUICK_ACTION_MIN_CHARS:
+        return
+    await quick_actions.link(sent.message_id, user_text, body)
+    try:
+        await sent.edit_reply_markup(reply_markup=quick_actions.keyboard(sent.message_id))
+    except Exception:  # noqa: BLE001 — cosmetic; the answer itself already reached the user
+        logger.exception("Failed to attach quick-action buttons")
 
 
 def _split(text: str, limit: int) -> list[str]:
@@ -1011,7 +1037,8 @@ async def _process_inner(
         last_agent_key = route.execution_chain[-1]
         await history.set_last_route(chat_id, last_agent_key, route.request_type.key)
         footer = await _maybe_create_tickets(route, user_text, body)
-        await _send_long(message, _header(route) + body + footer + truncation_notice, reply_mode=reply_mode)
+        sent = await _send_long(message, _header(route) + body + footer + truncation_notice, reply_mode=reply_mode)
+        await _offer_quick_actions(message, sent, user_text, body)
         if route.request_type.creates_ticket:
             asyncio.create_task(_maybe_extract_memory(chat_id, user_text, body))
         if profile_worth_extracting:
@@ -1047,7 +1074,8 @@ async def _process_inner(
         await history.append(chat_id, route.agent.key, "assistant", body)
         await history.set_last_route(chat_id, route.agent.key, route.request_type.key)
         footer = await _maybe_create_tickets(route, user_text, body)
-        await _send_long(message, _header(route) + body + footer + truncation_notice, reply_mode=reply_mode)
+        sent = await _send_long(message, _header(route) + body + footer + truncation_notice, reply_mode=reply_mode)
+        await _offer_quick_actions(message, sent, user_text, body)
         if route.request_type.creates_ticket:
             asyncio.create_task(_maybe_extract_memory(chat_id, user_text, body))
         if profile_worth_extracting:
@@ -1089,7 +1117,8 @@ async def _process_inner(
     await history.set_last_route(chat_id, route.agent.key, route.request_type.key)
 
     footer = await _maybe_create_tickets(route, user_text, body)
-    await _send_long(message, _header(route) + body + footer + truncation_notice, reply_mode=reply_mode)
+    sent = await _send_long(message, _header(route) + body + footer + truncation_notice, reply_mode=reply_mode)
+    await _offer_quick_actions(message, sent, user_text, body)
     if route.request_type.creates_ticket:
         asyncio.create_task(_maybe_extract_memory(chat_id, user_text, body))
     if profile_worth_extracting:
@@ -2230,6 +2259,95 @@ async def cmd_whois(message: Message, command: CommandObject) -> None:
     await _send_long(message, "\n".join(lines))
 
 
+@dp.message(Command("stats"))
+async def cmd_stats(message: Message) -> None:
+    """Admin: one-screen usage overview aggregated from data the bot
+    already records (/users' per-user activity) — no new tracking."""
+    uid = message.from_user.id if message.from_user else 0
+    uname = message.from_user.username if message.from_user else None
+    if not access_control.is_admin(uid, uname):
+        return
+
+    users = await access_control.list_users()
+    if not users:
+        await message.answer("Hozircha hech qanday foydalanuvchi faoliyati yo'q.")
+        return
+
+    by_status = {"approved": 0, "denied": 0, "pending": 0}
+    total_messages = 0
+    with_phone = 0
+    for u in users:
+        by_status[u.get("status", "pending")] = by_status.get(u.get("status", "pending"), 0) + 1
+        try:
+            total_messages += int(u.get("message_count") or 0)
+        except (TypeError, ValueError):
+            pass
+        if u.get("phone"):
+            with_phone += 1
+
+    def _count(u: dict) -> int:
+        try:
+            return int(u.get("message_count") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    top = sorted(users, key=_count, reverse=True)[:5]
+    lines = [
+        "📊 Bot statistikasi\n",
+        f"👥 Jami foydalanuvchilar: {len(users)}",
+        f"✅ Ruxsat berilgan: {by_status.get('approved', 0)}",
+        f"⏳ Kutilmoqda: {by_status.get('pending', 0)}",
+        f"❌ Rad etilgan: {by_status.get('denied', 0)}",
+        f"💬 Jami xabarlar: {total_messages}",
+        f"📱 Telefon raqami bor: {with_phone}",
+        "",
+        "🏆 Eng faol foydalanuvchilar:",
+    ]
+    for u in top:
+        if _count(u) == 0:
+            continue
+        name = u.get("full_name") or u.get("fio") or str(u["user_id"])
+        lines.append(f"• {name} — {_count(u)} xabar")
+    lines.append("")
+    lines.append(f"🤖 Provider: {settings.provider} · 💾 Redis: {'✅' if settings.redis_enabled else '⚠️ in-memory'}")
+    await _send_long(message, "\n".join(lines))
+
+
+@dp.message(Command("broadcast"))
+async def cmd_broadcast(message: Message, command: CommandObject) -> None:
+    """Admin: send an announcement to every APPROVED user (bot updates,
+    downtime notices, etc.) — previously required DMing each person."""
+    uid = message.from_user.id if message.from_user else 0
+    uname = message.from_user.username if message.from_user else None
+    if not access_control.is_admin(uid, uname):
+        return
+
+    text = (command.args or "").strip()
+    if not text:
+        await message.answer(
+            "E'lon matnini yozing:\n/broadcast Bot yangilandi — endi guruh "
+            "mention'lari ham qo'llab-quvvatlanadi."
+        )
+        return
+
+    users = await access_control.list_users()
+    targets = [u["user_id"] for u in users if u.get("status") == "approved"]
+    if not targets:
+        await message.answer("Ruxsat berilgan foydalanuvchilar yo'q.")
+        return
+
+    sent_n, failed_n = 0, 0
+    for target in targets:
+        try:
+            await message.bot.send_message(target, f"📢 Admin e'loni:\n\n{text}")
+            sent_n += 1
+        except Exception:  # noqa: BLE001 — user may have blocked the bot; keep going
+            failed_n += 1
+        # Stay well under Telegram's ~30 msg/s bot-wide send limit.
+        await asyncio.sleep(0.05)
+    await message.answer(f"📢 Yuborildi: {sent_n} ta · Yetkazilmadi: {failed_n} ta")
+
+
 # --------------------------------------------------------------------------
 # Business copilot — Telegram's native "Business > Chat automation" feature.
 # Separate update types (business_connection / business_message), unrelated
@@ -2526,6 +2644,94 @@ async def handle_group_copilot_callback(callback: CallbackQuery, bot: Bot) -> No
     await callback.answer()
 
 
+@dp.callback_query(F.data.startswith("qa:"))
+async def handle_quick_action_callback(callback: CallbackQuery, bot: Bot) -> None:
+    """One-tap follow-ups under an AI answer: 📄 render it as Word/PDF, or
+    📋 turn the original request into a tracked task — see quick_actions.py."""
+    if not callback.data or not callback.message:
+        await callback.answer()
+        return
+    if not await _callback_still_authorized(callback):
+        await callback.answer("Sizda botdan foydalanish ruxsati yo'q.", show_alert=True)
+        return
+    try:
+        _, action, msg_id_s = callback.data.split(":", 2)
+        qa_msg_id = int(msg_id_s)
+    except ValueError:
+        await callback.answer()
+        return
+
+    entry = await quick_actions.resolve(qa_msg_id)
+    if entry is None:
+        await callback.answer("Bu tugma eskirgan.", show_alert=True)
+        return
+
+    # ONE-SHOT: clear + strip the buttons up front so a double-tap can't
+    # start a second document render or a duplicate task while the first
+    # is still in flight.
+    await quick_actions.clear(qa_msg_id)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:  # noqa: BLE001
+        pass
+
+    chat_id = callback.message.chat.id
+
+    if action == "d":
+        await callback.answer("📄 Hujjat tayyorlanmoqda...")
+        status = await bot.send_message(chat_id, "📄 Hujjatni tayyorlayapman...")
+        doc_prompt = (
+            f"Foydalanuvchining asl so'rovi:\n{entry['text']}\n\n"
+            f"Jamoa tayyorlagan javob — hujjatning asosiy mazmuni shu bo'lsin, "
+            f"mazmunni o'zgartirmasdan professional hujjat ko'rinishiga keltir:\n{entry['body']}"
+        )
+        try:
+            content = await asyncio.wait_for(
+                docgen.generate_proposal_content(get_agent("ba"), doc_prompt),
+                timeout=settings.request_timeout,
+            )
+            docx_bytes = docgen.render_docx(content)
+            pdf_bytes = docgen.render_pdf(content)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Quick-action document generation failed")
+            try:
+                await status.edit_text(f"⚠️ Hujjatni tayyorlashda xatolik: {str(exc)[:200]}")
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        try:
+            await status.delete()
+        except TelegramBadRequest:
+            pass
+        title = content.get("title") or "Hujjat"
+        slug = re.sub(r"[^a-zA-Z0-9]+", "_", title)[:50].strip("_") or "hujjat"
+        await bot.send_document(
+            chat_id, BufferedInputFile(docx_bytes, filename=f"{slug}.docx"), caption=f"📄 {title}"
+        )
+        await bot.send_document(chat_id, BufferedInputFile(pdf_bytes, filename=f"{slug}.pdf"))
+        return
+
+    if action == "t":
+        await callback.answer("📋 Vazifa yaratilmoqda...")
+        uid = callback.from_user.id if callback.from_user else 0
+        task = await task_assistant.build_task_from_text(chat_id, uid, entry["text"])
+        if task is None:
+            await bot.send_message(
+                chat_id,
+                "⚠️ Vazifani avtomatik aniqlab bo'lmadi. /addtask bilan qo'lda "
+                "qo'shishingiz mumkin.",
+            )
+            return
+        await bot.send_message(
+            chat_id,
+            task_assistant.format_confirmation(task),
+            reply_markup=task_assistant.confirmation_keyboard(task.id),
+        )
+        return
+
+    await callback.answer()
+
+
 @dp.callback_query(F.data.startswith("tsk:"))
 async def handle_task_callback(callback: CallbackQuery, bot: Bot) -> None:
     if not callback.data or not callback.message:
@@ -2776,10 +2982,60 @@ async def main() -> None:
         token=settings.bot_token,
         default=DefaultBotProperties(parse_mode=None),
     )
+    await _register_command_menu(bot)
     asyncio.create_task(task_assistant.reminder_loop(bot))
     asyncio.create_task(digest.digest_loop(bot))
     logger.info("Starting polling…")
     await dp.start_polling(bot)
+
+
+_USER_COMMANDS: list[tuple[str, str]] = [
+    ("start", "Bot haqida va asosiy buyruqlar"),
+    ("agents", "Barcha mutaxassislar ro'yxati"),
+    ("kickoff", "Jamoa bilan birgalikda ishlash"),
+    ("proposal", "Word + PDF hujjat tayyorlash"),
+    ("addtask", "Vazifa/eslatma qo'shish"),
+    ("tasks", "Faol vazifalar ro'yxati"),
+    ("digest", "Har kuni ertalab kun rejasi"),
+    ("standup", "Standup draft"),
+    ("week", "Haftalik hisobot"),
+    ("minutes", "Uchrashuv protokoli"),
+    ("decisions", "Qarorlar jurnali"),
+    ("remember", "Loyiha faktini yodlash"),
+    ("memory", "Yodlangan faktlar"),
+    ("reset", "Suhbatni tozalash"),
+    ("status", "Tizim holati"),
+    ("id", "Chat ID ni ko'rish"),
+]
+
+_ADMIN_COMMANDS: list[tuple[str, str]] = [
+    ("users", "Foydalanuvchilar ro'yxati"),
+    ("whois", "Bitta foydalanuvchi haqida to'liq"),
+    ("stats", "Bot statistikasi"),
+    ("broadcast", "Barcha approved userlarga e'lon"),
+    ("approve", "Foydalanuvchiga ruxsat berish"),
+    ("deny", "Ruxsatni bekor qilish"),
+]
+
+
+async def _register_command_menu(bot: Bot) -> None:
+    """Populate Telegram's command menu (the [/] button) so users discover
+    features without memorizing the /start wall of text. Admin-only commands
+    are scoped to the admin's own chat (requires ADMIN_USER_ID) so regular
+    users never see them in their menu."""
+    try:
+        await bot.set_my_commands([BotCommand(command=c, description=d) for c, d in _USER_COMMANDS])
+    except Exception:  # noqa: BLE001 — menu is cosmetic, never block startup on it
+        logger.exception("Failed to register the command menu (non-fatal)")
+        return
+    if settings.admin_user_id:
+        try:
+            await bot.set_my_commands(
+                [BotCommand(command=c, description=d) for c, d in _USER_COMMANDS + _ADMIN_COMMANDS],
+                scope=BotCommandScopeChat(chat_id=settings.admin_user_id),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to register the admin command menu (non-fatal)")
 
 
 if __name__ == "__main__":
