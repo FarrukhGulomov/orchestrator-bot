@@ -34,7 +34,7 @@ from datetime import date
 
 from agents import Agent
 from config import settings
-from llm_clients import claude_generate_json
+from llm_clients import claude_generate_json, parse_llm_json
 from router import model_for
 
 logger = logging.getLogger(__name__)
@@ -84,7 +84,7 @@ async def generate_proposal_content(agent: Agent, user_text: str) -> dict:
         max_tokens=settings.max_output_tokens,
     )
     try:
-        data = json.loads(raw)
+        data = parse_llm_json(raw)
         if not isinstance(data, dict):
             raise ValueError(f"expected JSON object, got {type(data).__name__}")
     except (json.JSONDecodeError, ValueError) as exc:

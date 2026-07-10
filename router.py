@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 
 from agents import AGENTS, DEFAULT_AGENT_KEY, Agent, get_agent
 from config import settings
-from llm_clients import claude_generate_json
+from llm_clients import claude_generate_json, parse_llm_json
 from request_types import (
     DEFAULT_REQUEST_TYPE_KEY,
     REQUEST_TYPES,
@@ -191,7 +191,7 @@ async def classify(
             _ROUTER_SYSTEM + context_hint,
             [{"role": "user", "content": user_text[:4000]}],
         )
-        data = json.loads(raw)
+        data = parse_llm_json(raw)
 
         candidate = str(data.get("agent", "")).strip().lower()
         if candidate in AGENTS:

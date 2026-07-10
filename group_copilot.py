@@ -22,7 +22,6 @@ message (reply_to_message_id) instead of a Business chat
 (business_connection_id).
 """
 
-import asyncio
 import json
 import logging
 
@@ -30,8 +29,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 import redis_client
 from agents import get_agent
-from config import settings
-from llm_clients import claude_generate_json
+from llm_clients import generate_json
 from router import model_for
 
 logger = logging.getLogger(__name__)
@@ -99,11 +97,11 @@ async def analyze(group_name: str, sender_name: str, quoted_text: str, latest_te
     # analyze() — no reason to spend paid Claude quota on a quick triage.
     model, _label = model_for(get_agent("ba"), "low")
     try:
-        raw = await asyncio.wait_for(
-            claude_generate_json(_COPILOT_SYSTEM, [{"role": "user", "content": context}], model=model, max_tokens=400),
-            timeout=settings.request_timeout,
+        # retries=1 — see business_copilot.analyze()'s comment: openrouter/free
+        # can land on a different (sometimes flaky) free model each call.
+        data = await generate_json(
+            _COPILOT_SYSTEM, [{"role": "user", "content": context}], model=model, max_tokens=600, retries=1,
         )
-        data = json.loads(raw)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Group copilot analysis failed (model=%s)", model)
         return None, str(exc)[:300]

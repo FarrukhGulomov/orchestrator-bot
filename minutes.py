@@ -22,7 +22,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 import redis_client
 import tasks
 from config import settings
-from llm_clients import claude_generate_json
+from llm_clients import claude_generate_json, parse_llm_json
 from router import model_for
 from agents import get_agent
 
@@ -74,7 +74,7 @@ async def extract_minutes(raw_text: str) -> dict | None:
             model=model,
             max_tokens=4096,
         )
-        data = json.loads(raw)
+        data = parse_llm_json(raw)
     except Exception:  # noqa: BLE001
         logger.exception("Minutes extraction failed")
         return None
