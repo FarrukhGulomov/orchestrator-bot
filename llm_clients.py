@@ -323,6 +323,49 @@ def _strip_json_fences(raw: str) -> str:
     return raw.strip()
 
 
+def _repair_json_control_chars(raw: str) -> str:
+    """Best-effort repair for the single most common way a free/weaker model
+    breaks otherwise-valid JSON: emitting a LITERAL newline/tab inside a
+    string value (e.g. a multi-line suggested_reply) instead of escaping it
+    as \\n/\\t. json.loads rejects that outright with "Unterminated string
+    starting at...", which every JSON-consuming caller (router, business/
+    group copilot, minutes, docgen) would otherwise have to catch and guess
+    about individually. Walks the text tracking whether we're inside a
+    string literal (honoring backslash-escapes and quote boundaries) and
+    re-escapes any raw control character found there — structurally valid
+    JSON is returned byte-for-byte unchanged."""
+    out = []
+    in_string = False
+    escaped = False
+    for ch in raw:
+        if not in_string:
+            if ch == '"':
+                in_string = True
+            out.append(ch)
+            continue
+        if escaped:
+            out.append(ch)
+            escaped = False
+            continue
+        if ch == "\\":
+            out.append(ch)
+            escaped = True
+            continue
+        if ch == '"':
+            in_string = False
+            out.append(ch)
+            continue
+        if ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ch == "\t":
+            out.append("\\t")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 def _or_json_sync(system: str, messages: list[dict], model: str, max_tokens: int) -> str:
     client = _get_or_client()
     full = [{"role": "system", "content": system + "\nRespond with ONLY valid JSON, no markdown, no prose."}] + messages
@@ -402,9 +445,15 @@ async def claude_generate_json(
     OpenRouter ids always contain "/" (vendor/model); Claude ids never do.
     """
     if settings.provider == "hybrid" and model and "/" not in model:
-        return await asyncio.to_thread(_claude_json_sync, system, messages, model, max_tokens)
-    if settings.provider in ("openrouter", "hybrid"):
+        raw = await asyncio.to_thread(_claude_json_sync, system, messages, model, max_tokens)
+    elif settings.provider in ("openrouter", "hybrid"):
         m = model or settings.or_fast_model
-        return await asyncio.to_thread(_or_json_sync, system, messages, m, max_tokens)
-    m = model or settings.claude_fast_model
-    return await asyncio.to_thread(_claude_json_sync, system, messages, m, max_tokens)
+        raw = await asyncio.to_thread(_or_json_sync, system, messages, m, max_tokens)
+    else:
+        m = model or settings.claude_fast_model
+        raw = await asyncio.to_thread(_claude_json_sync, system, messages, m, max_tokens)
+    # Applied unconditionally: a no-op for already-valid JSON (its string
+    # literals never contain raw control chars), and fixes the single most
+    # common way a free/weaker model breaks otherwise-valid JSON — see
+    # _repair_json_control_chars's docstring.
+    return _repair_json_control_chars(raw)
