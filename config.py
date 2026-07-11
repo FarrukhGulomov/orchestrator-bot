@@ -71,6 +71,12 @@ class Settings:
     # OPENROUTER_API_KEY is NOT set (or you explicitly prefer Claude).
     anthropic_api_key: str = field(default_factory=lambda: os.getenv("ANTHROPIC_API_KEY", ""))
 
+    # Groq — optional, powers voice-message transcription (Whisper Large v3
+    # Turbo). Free tier: 2000 requests/day, no credit card needed. Get a key
+    # at console.groq.com -> API Keys. Without it, voice messages get a
+    # friendly "not available yet" reply instead of a native transcript.
+    groq_api_key: str = field(default_factory=lambda: os.getenv("GROQ_API_KEY", ""))
+
     # --- Access control ----------------------------------------------------
     allowed_chat_ids: set[int] = field(
         default_factory=lambda: _csv_ints(os.getenv("ALLOWED_CHAT_IDS", ""))
@@ -279,6 +285,10 @@ class Settings:
     @property
     def db_enabled(self) -> bool:
         return bool(self.database_url)
+
+    @property
+    def groq_enabled(self) -> bool:
+        return bool(self.groq_api_key)
 
     @property
     def railway_enabled(self) -> bool:
