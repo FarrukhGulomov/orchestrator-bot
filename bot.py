@@ -1999,14 +1999,19 @@ async def cmd_minutes(message: Message, command: CommandObject) -> None:
     _in_flight.add(chat_id)
     try:
         status = await message.answer("📝 Protokol tayyorlayapman...")
+        # No outer wait_for: extract_minutes makes up to TWO model calls
+        # (primary + free-model fallback), each already bounded by
+        # generate_json's own request_timeout — an outer cap at ONE
+        # request_timeout would kill the fallback exactly when it's needed.
         try:
-            data = await asyncio.wait_for(
-                minutes_mod.extract_minutes(text), timeout=settings.request_timeout
-            )
+            data, error = await minutes_mod.extract_minutes(text)
         except asyncio.TimeoutError:
-            data = None
+            data, error = None, "so'rov vaqti tugadi (timeout)"
         if data is None:
-            await status.edit_text("⚠️ Protokolni tuzib bo'lmadi. Matnni tekshirib, qaytadan yuboring.")
+            await status.edit_text(
+                "⚠️ Protokolni tuzib bo'lmadi. Matnni tekshirib, qaytadan yuboring.\n"
+                f"Sabab: {error or 'nomaʼlum xatolik'}"
+            )
             return
         try:
             await status.delete()

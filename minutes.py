@@ -22,7 +22,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 import redis_client
 import tasks
 from config import settings
-from llm_clients import claude_generate_json, parse_llm_json
+from llm_clients import generate_json
 from router import model_for
 from agents import get_agent
 
@@ -58,29 +58,37 @@ RULES:
 """
 
 
-async def extract_minutes(raw_text: str) -> dict | None:
+async def extract_minutes(raw_text: str) -> tuple[dict | None, str | None]:
+    """Returns (data, error_message) — the real underlying error is surfaced
+    to the admin's Telegram message on failure (same pattern as the
+    copilots' analyze()), never just swallowed into server logs."""
     now = tasks.now_local()
     context = (
         f"CURRENT LOCAL TIME ({settings.timezone}): {now.strftime('%Y-%m-%d %H:%M')} "
         f"({now.strftime('%A')})\n\n--- MEETING NOTES ---\n{raw_text[:_MAX_INPUT_CHARS]}"
     )
+    messages = [{"role": "user", "content": context}]
     # Meeting notes deserve the MAIN model (same reasoning as document
     # generation): the routing-tier default would truncate/garble long inputs.
     model, _label = model_for(get_agent("ba"), "high")
     try:
-        raw = await claude_generate_json(
-            _EXTRACT_SYSTEM,
-            [{"role": "user", "content": context}],
-            model=model,
-            max_tokens=4096,
-        )
-        data = parse_llm_json(raw)
-    except Exception:  # noqa: BLE001
-        logger.exception("Minutes extraction failed")
-        return None
-    if not isinstance(data, dict) or not str(data.get("summary", "")).strip():
-        return None
-    return _sanitize(data)
+        data = await generate_json(_EXTRACT_SYSTEM, messages, model=model, max_tokens=4096)
+    except Exception as exc:  # noqa: BLE001
+        # In hybrid mode "high" is a Claude id — if THAT call dies (credits
+        # exhausted, auth, outage), a protocol is still far more useful from
+        # the free main model than no protocol at all. Degrade, don't fail.
+        logger.warning("Minutes extraction failed on %s (%s) — falling back to %s",
+                       model, str(exc)[:120], settings.or_main_model)
+        try:
+            data = await generate_json(
+                _EXTRACT_SYSTEM, messages, model=settings.or_main_model, max_tokens=4096, retries=1,
+            )
+        except Exception as exc2:  # noqa: BLE001
+            logger.exception("Minutes extraction failed on fallback model too")
+            return None, f"{str(exc)[:150]} / fallback: {str(exc2)[:150]}"
+    if not str(data.get("summary", "")).strip():
+        return None, "Model protokol matnini ajratib bera olmadi (summary bo'sh)."
+    return _sanitize(data), None
 
 
 def _sanitize(data: dict) -> dict:
