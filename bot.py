@@ -1662,6 +1662,7 @@ async def cmd_status(message: Message) -> None:
     lines.append(f"**Redis:** {redis_status}")
     lines.append(f"**GitHub:** {'✅ ' + settings.github_repo if settings.github_enabled else '❌ Sozlanmagan'}")
     lines.append(f"**Railway logs:** {'✅' if settings.railway_enabled else '❌ Sozlanmagan'}")
+    lines.append(f"**Ovozli xabar (Groq Whisper):** {'✅' if settings.groq_enabled else '❌ Sozlanmagan (GROQ_API_KEY kerak)'}")
 
     from agents import AGENTS
     lines.append(f"\n**Faol agentlar ({len(AGENTS)} ta):**")

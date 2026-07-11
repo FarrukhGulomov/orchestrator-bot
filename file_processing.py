@@ -30,13 +30,39 @@ Anything else is reported back to the caller as unsupported, with the list
 of formats that do work, instead of silently failing.
 """
 
+import asyncio
 import csv
 import io
 import logging
 
+from config import settings
 from llm_clients import claude_describe_file
 
 logger = logging.getLogger(__name__)
+
+_groq_client = None
+_groq_init_attempted = False
+
+
+def _get_groq_client():
+    """Lazy Groq client — reuses the openai package (already a dependency
+    for the OpenRouter integration) pointed at Groq's OpenAI-compatible
+    endpoint, same lazy-singleton pattern as llm_clients._get_or_client()."""
+    global _groq_client, _groq_init_attempted
+    if not settings.groq_enabled:
+        return None
+    if _groq_client is not None:
+        return _groq_client
+    if _groq_init_attempted:
+        return None
+    _groq_init_attempted = True
+    try:
+        from openai import OpenAI
+        _groq_client = OpenAI(api_key=settings.groq_api_key, base_url="https://api.groq.com/openai/v1")
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to initialise Groq client")
+        _groq_client = None
+    return _groq_client
 
 # Cap on extracted text fed into the routing pipeline, to keep the downstream
 # classify() + agent generation calls within a sane token/cost budget.
@@ -182,12 +208,38 @@ async def describe_pdf(data: bytes) -> str:
 
 
 async def transcribe_audio(data: bytes, filename: str) -> str:
-    # Audio transcription is not available in Claude-only mode.
-    # Return a user-friendly message instead of failing silently.
-    raise NotImplementedError(
-        "Ovozni matnga o'girish uchun qo'shimcha xizmat kerak. "
-        "Hozircha ovozli xabarlarni matn orqali yuboring."
-    )
+    """Speech-to-text via Groq's Whisper Large v3 Turbo (OpenAI-compatible
+    endpoint, free tier — see config.py's groq_api_key). Handles Telegram
+    voice notes (.ogg/opus) and any of AUDIO_EXTS; Whisper auto-detects the
+    spoken language (Uzbek, Russian, English, mixed all work) rather than
+    needing it configured up front."""
+    client = _get_groq_client()
+    if client is None:
+        # No credentials configured — a friendly, actionable message
+        # instead of a raw exception (or worse, silent failure).
+        raise NotImplementedError(
+            "Ovozni matnga o'girish uchun GROQ_API_KEY sozlanmagan. "
+            "Hozircha ovozli xabarlarni matn orqali yuboring."
+        )
+
+    def _sync_transcribe() -> str:
+        result = client.audio.transcriptions.create(
+            file=(filename, data),
+            model="whisper-large-v3-turbo",
+            response_format="text",
+        )
+        # response_format="text" returns a plain str on current SDK
+        # versions; defend against a future/older SDK returning an object
+        # with a .text attribute instead.
+        return result if isinstance(result, str) else str(getattr(result, "text", result))
+
+    try:
+        text = await asyncio.to_thread(_sync_transcribe)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Groq transcription failed")
+        raise RuntimeError(f"Groq xizmatida xatolik: {str(exc)[:200]}") from exc
+
+    return _truncate(text.strip())
 
 
 async def extract(
