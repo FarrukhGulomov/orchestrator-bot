@@ -38,6 +38,7 @@ from datetime import datetime, timedelta
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 import redis_client
+import shared_context
 import tasks
 from agents import get_agent
 from config import settings
@@ -140,10 +141,15 @@ async def _get_history(business_connection_id: str, customer_chat_id: int) -> li
 
 async def append_contact_message(business_connection_id: str, customer_chat_id: int, text: str) -> None:
     await _append_history(business_connection_id, customer_chat_id, "them", text)
+    # In a private Business chat, chat_id IS the contact's Telegram user_id
+    # — also feed the cross-channel store keyed by that same id, so the
+    # main bot chat (and Group Copilot) can see this exchange too.
+    await shared_context.append(customer_chat_id, "user", text, "business")
 
 
 async def append_own_message(business_connection_id: str, customer_chat_id: int, text: str) -> None:
     await _append_history(business_connection_id, customer_chat_id, "me", text)
+    await shared_context.append(customer_chat_id, "admin", text, "business")
 
 
 # --------------------------------------------------------------------------
@@ -194,6 +200,13 @@ NOT always claim to be at work. If the status says you're likely not at
 work, say so naturally (e.g. "hozir ishda emasman, ertaga/keyinroq javob
 beraman" / "сейчас не на работе, отвечу позже") rather than a generic
 brush-off.
+
+If context includes an "OTHER CHANNELS with this SAME person" section,
+that's this SAME contact talking to the bot directly or being discussed in
+a group elsewhere — a real commitment or fact stated there (a price, a
+deadline, "we said X") is BINDING: never suggest a reply that contradicts
+it. Never reveal that you're aware of another channel ("as I mentioned in
+the bot..." is wrong) — just be consistent, as one person naturally would.
 
 WRITE LIKE A HUMAN, NOT A BOT — this is critical, the contact must never
 sense they're reading an AI-drafted message:
@@ -256,9 +269,17 @@ async def analyze(
     convo = "\n".join(
         f"{'Contact' if h['role'] == 'them' else 'You'}: {h['text']}" for h in history[-6:]
     )
+    # This SAME person may have also messaged the bot directly, or been
+    # mentioned to the admin in a group — pull that in so the suggested
+    # reply doesn't contradict a commitment already made on another
+    # channel (see shared_context.py's module docstring).
+    other_channels = shared_context.render_for_prompt(
+        await shared_context.get_recent(customer_chat_id), exclude_channel="business",
+    )
+    other_block = f"\n\nOTHER CHANNELS with this SAME person (for consistency — do not contradict, do not mention these channels explicitly to the contact):\n{other_channels}" if other_channels else ""
     context = (
         f"Current real work status: {work_status()}\n\n"
-        f"Recent exchange:\n{convo}\n\nContact ({sender_name})'s latest message: {latest_text}"
+        f"Recent exchange:\n{convo}{other_block}\n\nContact ({sender_name})'s latest message: {latest_text}"
     )
     # This fires on EVERY incoming business message — forcing the main
     # (Claude) model here would burn paid quota continuously just to
