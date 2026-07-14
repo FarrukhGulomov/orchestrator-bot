@@ -77,6 +77,7 @@ import group_copilot
 import history
 import memory
 import quick_actions
+import shared_context
 import user_profile
 import minutes as minutes_mod
 import railway_integration
@@ -409,6 +410,8 @@ async def _relay_group_reply(admin_message: Message, relay_msg_id: int, relay: d
         await admin_message.reply(f"⚠️ Yuborib bo'lmadi: {str(exc)[:200]}")
         return
     await group_copilot.clear_relay(relay_msg_id)
+    if relay.get("sender_id"):
+        await shared_context.append(relay["sender_id"], "admin", text, "group")
     await admin_message.reply("✅ Guruhga yuborildi.")
 
 
@@ -683,7 +686,8 @@ async def _handle_group_mention(message: Message, bot: Bot, user_text: str) -> N
     if replied:
         quoted_text = (replied.text or replied.caption or "").strip()
 
-    data, error = await group_copilot.analyze(group_name, sender_name, quoted_text, user_text)
+    sender_id = sender.id if sender else None
+    data, error = await group_copilot.analyze(group_name, sender_name, quoted_text, user_text, sender_id=sender_id)
     if data is None:
         try:
             await bot.send_message(
@@ -718,7 +722,9 @@ async def _handle_group_mention(message: Message, bot: Bot, user_text: str) -> N
         logger.exception("Failed to send group-mention notification to admin")
         return
 
-    await group_copilot.link_relay(sent.message_id, message.chat.id, message.message_id, suggested, user_text)
+    await group_copilot.link_relay(
+        sent.message_id, message.chat.id, message.message_id, suggested, user_text, sender_id=sender_id,
+    )
     try:
         await sent.edit_reply_markup(reply_markup=group_copilot.suggestion_keyboard(sent.message_id))
     except Exception:  # noqa: BLE001
@@ -731,6 +737,13 @@ USER_PROFILE_HEADER = (
     "mention out loud that you're consulting stored notes about them):\n"
 )
 
+SHARED_CONTEXT_HEADER = (
+    "WHAT THE ADMIN HAS PERSONALLY TOLD THIS SAME PERSON ELSEWHERE (their own "
+    "Business chat or a group — a price, deadline, or commitment stated there "
+    "is BINDING: never contradict it. Never reveal you're aware of another "
+    "channel — just be consistent, as one team naturally would):\n"
+)
+
 
 async def _build_system_prompt(
     chat_id: int, agent: Agent, addendum: str = "", user_id: int | None = None
@@ -740,11 +753,17 @@ async def _build_system_prompt(
         TEAM_MEMORY_HEADER + "\n".join(f"- {f}" for f in facts) + "\n\n" if facts else ""
     )
     profile_block = ""
+    shared_block = ""
     if user_id is not None:
         notes = await user_profile.get_profile(user_id)
         if notes:
             profile_block = USER_PROFILE_HEADER + "\n".join(f"- {n}" for n in notes) + "\n\n"
-    parts = [memory_block + profile_block + agent.system]
+        other_channels = shared_context.render_for_prompt(
+            await shared_context.get_recent(user_id), exclude_channel="main_bot",
+        )
+        if other_channels:
+            shared_block = SHARED_CONTEXT_HEADER + other_channels + "\n\n"
+    parts = [memory_block + profile_block + shared_block + agent.system]
     if addendum:
         parts.append(addendum)
     return "\n".join(parts)
@@ -1061,6 +1080,8 @@ async def _process_inner(
             asyncio.create_task(_maybe_extract_memory(chat_id, user_text, body))
         if profile_worth_extracting:
             asyncio.create_task(_maybe_extract_user_profile(profile_uid, user_text, body))
+        if profile_uid:
+            asyncio.create_task(_log_shared_context(profile_uid, user_text, body))
         return
 
     logger.info(
@@ -1098,6 +1119,8 @@ async def _process_inner(
             asyncio.create_task(_maybe_extract_memory(chat_id, user_text, body))
         if profile_worth_extracting:
             asyncio.create_task(_maybe_extract_user_profile(profile_uid, user_text, body))
+        if profile_uid:
+            asyncio.create_task(_log_shared_context(profile_uid, user_text, body))
         return
 
     system_prompt = await _build_system_prompt(chat_id, route.agent, route.request_type.addendum, user_id=profile_uid)
@@ -1141,6 +1164,8 @@ async def _process_inner(
         asyncio.create_task(_maybe_extract_memory(chat_id, user_text, body))
     if profile_worth_extracting:
         asyncio.create_task(_maybe_extract_user_profile(profile_uid, user_text, body))
+    if profile_uid:
+        asyncio.create_task(_log_shared_context(profile_uid, user_text, body))
 
 
 # --------------------------------------------------------------------------
@@ -1330,6 +1355,16 @@ ALWAYS in Uzbek regardless of what language the conversation was in (these
 notes are for the admin's own reading, and for the AI to reuse next time).
 If no durable observation: respond with exactly NONE.
 """
+
+
+async def _log_shared_context(user_id: int, user_text: str, body: str) -> None:
+    """Feed this main-bot exchange into the cross-channel store (see
+    shared_context.py) so Business/Group Copilot suggestions for this same
+    person later stay consistent with what the bot already told them
+    directly. Verbatim, not LLM-extracted — unlike user_profile notes, this
+    needs the actual wording to be useful for consistency checks."""
+    await shared_context.append(user_id, "user", user_text, "main_bot")
+    await shared_context.append(user_id, "bot", body, "main_bot")
 
 
 async def _maybe_extract_user_profile(user_id: int, user_text: str, body: str) -> None:
@@ -2664,6 +2699,8 @@ async def handle_group_copilot_callback(callback: CallbackQuery, bot: Bot) -> No
             await callback.answer(f"⚠️ Yuborib bo'lmadi: {str(exc)[:150]}", show_alert=True)
             return
         await group_copilot.clear_relay(relay_msg_id)
+        if relay.get("sender_id"):
+            await shared_context.append(relay["sender_id"], "admin", relay["reply"], "group")
         await callback.answer("Guruhga yuborildi ✅")
         try:
             await callback.message.edit_reply_markup(reply_markup=None)

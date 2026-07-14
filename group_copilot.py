@@ -28,6 +28,7 @@ import logging
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 import redis_client
+import shared_context
 from agents import get_agent
 from llm_clients import generate_json
 from router import model_for
@@ -83,13 +84,30 @@ AI-drafted if the admin sends it as-is.
 """
 
 
-async def analyze(group_name: str, sender_name: str, quoted_text: str, latest_text: str) -> tuple[dict | None, str | None]:
+async def analyze(
+    group_name: str, sender_name: str, quoted_text: str, latest_text: str, sender_id: int | None = None,
+) -> tuple[dict | None, str | None]:
     """Returns (data, error_message) — see business_copilot.analyze()'s
     docstring for why the real error is surfaced instead of just logged."""
     context_lines = [f"Group: {group_name}"]
     if quoted_text:
         context_lines.append(f'This replies to a message you (the professional) sent earlier: "{quoted_text[:500]}"')
     context_lines.append(f"{sender_name}'s message addressed to you: {latest_text}")
+
+    # This SAME person may have also messaged the bot directly, or written
+    # to the admin's personal Business chat — pull that in for consistency
+    # (see shared_context.py's module docstring), and log this exchange too
+    # so the OTHER channels can see it.
+    if sender_id is not None:
+        await shared_context.append(sender_id, "user", latest_text, "group")
+        other_channels = shared_context.render_for_prompt(
+            await shared_context.get_recent(sender_id), exclude_channel="group",
+        )
+        if other_channels:
+            context_lines.append(
+                "\nOTHER CHANNELS with this SAME person (for consistency — do not "
+                f"contradict, do not mention these channels explicitly):\n{other_channels}"
+            )
     context = "\n".join(context_lines)
 
     # Fires only when the admin is actually addressed (not on every group
@@ -115,11 +133,11 @@ async def analyze(group_name: str, sender_name: str, quoted_text: str, latest_te
 # --------------------------------------------------------------------------
 async def link_relay(
     admin_message_id: int, group_chat_id: int, reply_to_message_id: int,
-    suggested_reply: str, original_text: str = "",
+    suggested_reply: str, original_text: str = "", sender_id: int | None = None,
 ) -> None:
     payload = json.dumps({
         "chat": group_chat_id, "reply_to": reply_to_message_id,
-        "reply": suggested_reply[:2000], "text": original_text[:2000],
+        "reply": suggested_reply[:2000], "text": original_text[:2000], "sender_id": sender_id,
     })
     client = redis_client.get_client()
     if client is None:
