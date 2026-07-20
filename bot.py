@@ -59,6 +59,8 @@ from aiogram.types import (
     BufferedInputFile,
     BusinessConnection,
     CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
@@ -179,10 +181,11 @@ async def _handle_onboarding_step(message: Message, uid: int) -> bool:
         await access_control.save_profile_field(uid, "phone", contact.phone_number)
         await access_control.set_onboarding_state(uid, "done")
         await message.answer(
-            "✅ Ma'lumotlaringiz saqlandi. Endi savolingizni yozishingiz mumkin.",
+            "✅ Ma'lumotlaringiz saqlandi.",
             reply_markup=ReplyKeyboardRemove(),
         )
         await _notify_admin_of_phone(message.bot, uid, fio, contact.phone_number)
+        await _send_welcome_tour(message)
         return True
 
     state = await access_control.get_onboarding_state(uid)
@@ -192,9 +195,10 @@ async def _handle_onboarding_step(message: Message, uid: int) -> bool:
     if (message.text or "").strip().lower().startswith("/skip"):
         await access_control.set_onboarding_state(uid, "done")
         await message.answer(
-            "Yaxshi, o'tkazib yubordik. Savolingiz bo'lsa yozishingiz mumkin.",
+            "Yaxshi, o'tkazib yubordik.",
             reply_markup=ReplyKeyboardRemove(),
         )
+        await _send_welcome_tour(message)
         return True
 
     # "awaiting_fio" only exists as a stale state for anyone caught mid-flow
@@ -220,6 +224,45 @@ async def _handle_onboarding_step(message: Message, uid: int) -> bool:
         return True
 
     return False
+
+
+# --------------------------------------------------------------------------
+# Activation: welcome tour + one-tap daily digest
+#
+# The single biggest reason a newly-approved user stops opening the bot is
+# that onboarding used to end with a bare "endi savolingizni yozing" — no
+# concrete picture of what daily value looks like, no recurring touchpoint.
+# This card fixes both: four copy-able real use cases, plus ONE TAP to turn
+# on the morning digest (the retention hook — a reason the bot messages
+# THEM every day, not the other way around).
+# --------------------------------------------------------------------------
+WELCOME_TOUR_TEXT = (
+    "🚀 Har kuni foyda beradigan 4 ta imkoniyat:\n\n"
+    "1️⃣ Savol-javob — shunchaki yozing:\n"
+    "\"Mijozlar oqimi kamaydi, sabablarini qanday tahlil qilay?\"\n\n"
+    "2️⃣ Vazifa/eslatma — oddiy tilda:\n"
+    "\"ertaga 15:00 da hisobotni topshirishim kerak\" → o'zim eslataman\n\n"
+    "3️⃣ Tayyor hujjat (Word + PDF):\n"
+    "/proposal CRM joriy etish bo'yicha taklif\n\n"
+    "4️⃣ Uchrashuv protokoli — yig'ilish yozuvini /minutes bilan yuboring → "
+    "qarorlar va vazifalar avtomatik ajratiladi\n\n"
+    "☀️ Har kuni ertalab kunlik reja (vazifalaringiz, muddatlar, eslatmalar) "
+    "olib turishni xohlaysizmi?"
+)
+
+
+def _welcome_tour_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="☀️ Ha, har kuni kelsin", callback_data="tour:d"),
+        InlineKeyboardButton(text="Hozircha kerak emas", callback_data="tour:x"),
+    ]])
+
+
+async def _send_welcome_tour(message: Message) -> None:
+    try:
+        await message.answer(WELCOME_TOUR_TEXT, reply_markup=_welcome_tour_keyboard())
+    except Exception:  # noqa: BLE001 — the tour is a bonus, never break onboarding over it
+        logger.exception("Failed to send welcome tour")
 
 
 # --------------------------------------------------------------------------
@@ -2711,6 +2754,55 @@ async def handle_group_copilot_callback(callback: CallbackQuery, bot: Bot) -> No
     await callback.answer()
 
 
+@dp.callback_query(F.data.startswith("tour:"))
+async def handle_tour_callback(callback: CallbackQuery, bot: Bot) -> None:
+    """Welcome-tour buttons: one-tap daily-digest opt-in (the retention
+    hook) or dismiss — see _send_welcome_tour."""
+    if not callback.data or not callback.message:
+        await callback.answer()
+        return
+    if not await _callback_still_authorized(callback):
+        await callback.answer("Sizda botdan foydalanish ruxsati yo'q.", show_alert=True)
+        return
+    action = callback.data.split(":", 1)[1]
+    chat_id = callback.message.chat.id
+
+    if action == "d":
+        cfg = await digest.get_config(chat_id)
+        cfg.enabled = True
+        await digest.set_config(chat_id, cfg)
+        await callback.answer("Yoqildi ☀️")
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:  # noqa: BLE001
+            pass
+        await bot.send_message(
+            chat_id,
+            f"☀️ Kunlik reja yoqildi — har kuni soat {cfg.time} da yuboraman.\n"
+            "O'zgartirish: /digest HH:MM · o'chirish: /digest off",
+        )
+        return
+
+    if action == "x":
+        await callback.answer("Xo'p. Keyin xohlasangiz: /digest on")
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:  # noqa: BLE001
+            pass
+        return
+
+    await callback.answer()
+
+
+@dp.message(Command("examples", "tour"))
+async def cmd_examples(message: Message) -> None:
+    """Re-open the welcome tour anytime — also the activation path for
+    users approved BEFORE the tour existed."""
+    if not _is_allowed(message.chat.id):
+        return
+    await _send_welcome_tour(message)
+
+
 @dp.callback_query(F.data.startswith("qa:"))
 async def handle_quick_action_callback(callback: CallbackQuery, bot: Bot) -> None:
     """One-tap follow-ups under an AI answer: 📄 render it as Word/PDF, or
@@ -3070,6 +3162,7 @@ async def main() -> None:
 
 _USER_COMMANDS: list[tuple[str, str]] = [
     ("start", "Bot haqida va asosiy buyruqlar"),
+    ("examples", "Nima qila olaman — misollar bilan"),
     ("agents", "Barcha mutaxassislar ro'yxati"),
     ("kickoff", "Jamoa bilan birgalikda ishlash"),
     ("proposal", "Word + PDF hujjat tayyorlash"),
