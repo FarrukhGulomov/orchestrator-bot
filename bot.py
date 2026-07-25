@@ -86,6 +86,7 @@ import railway_integration
 import redis_client
 import task_assistant
 import tasks
+import web_search
 from agents import Agent, TEAM_MEMORY_HEADER, get_agent
 from config import settings
 from file_processing import SUPPORTED_SUMMARY, extract, transcribe_audio
@@ -921,7 +922,7 @@ async def _send_document_deliverable(message: Message, route: Route, user_text: 
 
     try:
         content = await asyncio.wait_for(
-            docgen.generate_proposal_content(route.agent, user_text),
+            docgen.generate_proposal_content(route.agent, user_text, web_context=route.web_context),
             timeout=settings.request_timeout,
         )
         docx_bytes = docgen.render_docx(content)
@@ -1079,6 +1080,20 @@ async def _process_inner(
         await _send_capability_overview(message, bot, route, user_text)
         return
 
+    # Live web grounding: the classifier flagged this as depending on
+    # current facts (rates, weather, news, "latest") — fetch real results
+    # BEFORE any agent runs, and hang them off the route so every downstream
+    # path (single agent, collaborators, chain) picks them up via the
+    # addendum. Failure is non-fatal: the agent then answers from its own
+    # knowledge, exactly as before this feature existed.
+    if route.needs_web and web_search.enabled():
+        payload, search_err = await web_search.search(route.web_query or user_text)
+        if payload:
+            route.web_context = web_search.render_for_prompt(payload)
+            logger.info("chat=%s -> web search OK for %.60s", chat_id, route.web_query)
+        else:
+            logger.warning("chat=%s -> web search failed: %s", chat_id, search_err)
+
     if route.wants_document:
         logger.info("chat=%s -> agent=%s DOCUMENT", chat_id, route.agent.key)
         await _send_document_deliverable(message, route, user_text)
@@ -1166,7 +1181,9 @@ async def _process_inner(
             asyncio.create_task(_log_shared_context(profile_uid, user_text, body))
         return
 
-    system_prompt = await _build_system_prompt(chat_id, route.agent, route.request_type.addendum, user_id=profile_uid)
+    system_prompt = await _build_system_prompt(
+        chat_id, route.agent, route.request_type.addendum + route.web_context, user_id=profile_uid,
+    )
     msgs = await history.get_history(chat_id, route.agent.key) + [
         {"role": "user", "content": user_text}
     ]
@@ -1215,12 +1232,15 @@ async def _process_inner(
 # /kickoff — whole BA team responds together
 # --------------------------------------------------------------------------
 async def _kickoff_agent_call(
-    agent_key: str, user_text: str, chat_id: int, user_id: int | None = None
+    agent_key: str, user_text: str, chat_id: int, user_id: int | None = None,
+    web_context: str = "",
 ) -> dict:
     agent: Agent = get_agent(agent_key)
     # Intentionally always the "task" addendum: kickoff/collaborative calls ask
     # each specialist for a concrete deliverable regardless of request type.
-    system_prompt = await _build_system_prompt(chat_id, agent, REQUEST_TYPES["task"].addendum, user_id=user_id)
+    system_prompt = await _build_system_prompt(
+        chat_id, agent, REQUEST_TYPES["task"].addendum + web_context, user_id=user_id,
+    )
     model, label = model_for(agent, "high")
     try:
         body = await asyncio.wait_for(
@@ -1260,7 +1280,10 @@ async def _run_collaborative_answer(
     roles = list(dict.fromkeys(roles))[:4]
 
     results = await asyncio.gather(
-        *[_kickoff_agent_call(key, user_text, chat_id, user_id=user_id) for key in roles]
+        *[
+            _kickoff_agent_call(key, user_text, chat_id, user_id=user_id, web_context=route.web_context)
+            for key in roles
+        ]
     )
 
     for r in results:
@@ -1315,7 +1338,9 @@ async def _run_sequential_chain(
 
     for agent_key in chain:
         agent = get_agent(agent_key)
-        system_prompt = await _build_system_prompt(chat_id, agent, route.request_type.addendum, user_id=user_id)
+        system_prompt = await _build_system_prompt(
+            chat_id, agent, route.request_type.addendum + route.web_context, user_id=user_id,
+        )
         model, _ = model_for(agent, "high")
 
         if outputs:
@@ -1741,6 +1766,7 @@ async def cmd_status(message: Message) -> None:
     lines.append(f"**GitHub:** {'✅ ' + settings.github_repo if settings.github_enabled else '❌ Sozlanmagan'}")
     lines.append(f"**Railway logs:** {'✅' if settings.railway_enabled else '❌ Sozlanmagan'}")
     lines.append(f"**Ovozli xabar (Groq Whisper):** {'✅' if settings.groq_enabled else '❌ Sozlanmagan (GROQ_API_KEY kerak)'}")
+    lines.append(f"**Internetdan izlash (Tavily):** {'✅' if web_search.enabled() else '❌ Sozlanmagan (TAVILY_API_KEY kerak)'}")
 
     from agents import AGENTS
     lines.append(f"\n**Faol agentlar ({len(AGENTS)} ta):**")
@@ -2794,6 +2820,38 @@ async def handle_tour_callback(callback: CallbackQuery, bot: Bot) -> None:
     await callback.answer()
 
 
+@dp.message(Command("search", "izla"))
+async def cmd_search(message: Message, command: CommandObject) -> None:
+    """Explicit live web search. Normal messages get searched automatically
+    when the classifier decides they need current facts (see
+    router.needs_web); this is the manual override for when the user KNOWS
+    they want fresh sources."""
+    if not _is_allowed(message.chat.id):
+        return
+    query = (command.args or "").strip()
+    if not query:
+        await message.answer("Nimani izlashimni yozing:\n/search dollar kursi bugun")
+        return
+    if not web_search.enabled():
+        await message.answer(
+            "🔎 Internetdan izlash hozircha sozlanmagan.\n"
+            "Yoqish uchun: tavily.com da bepul kalit oling (oyiga 1000 so'rov, "
+            "karta shart emas) va Railway'da TAVILY_API_KEY qo'shing."
+        )
+        return
+
+    status = await message.answer("🔎 Izlayapman...")
+    payload, error = await web_search.search(query)
+    if payload is None:
+        await status.edit_text(f"⚠️ Izlab bo'lmadi.\nSabab: {error or 'nomaʼlum xatolik'}")
+        return
+    try:
+        await status.delete()
+    except TelegramBadRequest:
+        pass
+    await _send_long(message, web_search.render_for_user(payload))
+
+
 @dp.message(Command("examples", "tour"))
 async def cmd_examples(message: Message) -> None:
     """Re-open the welcome tour anytime — also the activation path for
@@ -3163,6 +3221,7 @@ async def main() -> None:
 _USER_COMMANDS: list[tuple[str, str]] = [
     ("start", "Bot haqida va asosiy buyruqlar"),
     ("examples", "Nima qila olaman — misollar bilan"),
+    ("search", "Internetdan izlash"),
     ("agents", "Barcha mutaxassislar ro'yxati"),
     ("kickoff", "Jamoa bilan birgalikda ishlash"),
     ("proposal", "Word + PDF hujjat tayyorlash"),

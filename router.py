@@ -111,6 +111,19 @@ Examples:
   - Process redesign with diagrams: ["process_analyst", "diagram", "requirements_engineer"]
   - Translation request / simple question → []
 
+8) DOES ANSWERING THIS REQUIRE CURRENT INFORMATION FROM THE INTERNET?
+Set needs_web=true when a correct answer depends on facts that change over
+time or that you cannot know from training data:
+  - prices, exchange rates, market/stock figures ("dollar kursi", "narxi qancha")
+  - weather, today's/this week's events, news, "hozir", "bugun", "oxirgi"
+  - a specific company/product/person's CURRENT state, competitor pricing
+  - library/tool versions, release notes, "eng yangi", "latest"
+  - anything the user explicitly asks you to look up / check online
+Set needs_web=false for timeless professional work: writing a BRD, designing
+a process, explaining a concept, generating SQL/code, translating,
+formatting a Jira ticket. Most requests are FALSE — only set true when
+stale information would make the answer wrong.
+
 Also write a short TITLE (max 70 chars) in the SAME language as the user's message.
 
 Respond with ONLY a JSON object, no prose:
@@ -119,9 +132,12 @@ Respond with ONLY a JSON object, no prose:
   "complexity": "low"|"high",
   "wants_document": true|false,
   "is_capability_question": true|false,
+  "needs_web": true|false,
   "collaborators": ["<0-3 agent keys>"],
   "execution_chain": ["<0-4 agent keys in sequence>"],
-  "title": "<short title>"}}
+  "title": "<short title>",
+  "web_query": "<if needs_web: a short, self-contained search query in the
+    language most likely to have good sources — otherwise empty string>"}}
 """
 
 
@@ -134,8 +150,14 @@ class Route:
     title: str
     wants_document: bool = False
     is_capability_question: bool = False
+    needs_web: bool = False
+    web_query: str = ""
     collaborators: list[str] = field(default_factory=list)
     execution_chain: list[str] = field(default_factory=list)
+    # Filled in by bot.py AFTER classification (search runs there, not here,
+    # so this module stays a pure classifier with no network side effects
+    # beyond its own LLM call). Appended to the agent's system prompt.
+    web_context: str = ""
 
 
 def model_for(agent: Agent, complexity: str) -> tuple[str, str]:
@@ -173,6 +195,8 @@ async def classify(
     complexity = "high"
     wants_document = False
     is_capability_question = False
+    needs_web = False
+    web_query = ""
     collaborators: list[str] = []
     execution_chain: list[str] = []
     title = (user_text.strip()[:70] or "Untitled")
@@ -204,6 +228,13 @@ async def classify(
         complexity = "low" if str(data.get("complexity", "")).lower() == "low" else "high"
         wants_document = bool(data.get("wants_document", False))
         is_capability_question = bool(data.get("is_capability_question", False))
+        needs_web = bool(data.get("needs_web", False))
+        # Fall back to the raw message as the query if the model flagged
+        # needs_web but gave no usable query — better an imperfect search
+        # than a flagged-but-never-executed one.
+        web_query = str(data.get("web_query", "") or "").strip()[:300]
+        if needs_web and not web_query:
+            web_query = user_text.strip()[:300]
 
         raw_collabs = data.get("collaborators", [])
         raw_chain = data.get("execution_chain", [])
@@ -247,6 +278,8 @@ async def classify(
         title=title,
         wants_document=wants_document,
         is_capability_question=is_capability_question,
+        needs_web=needs_web,
+        web_query=web_query,
         collaborators=collaborators,
         execution_chain=execution_chain,
     )

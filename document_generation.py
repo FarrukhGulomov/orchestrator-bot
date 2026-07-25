@@ -71,8 +71,12 @@ if there is genuinely nothing tabular to show.
 _FOOTER_TEXT = "Master Orchestrator AI Team tomonidan tayyorlandi"
 
 
-async def generate_proposal_content(agent: Agent, user_text: str) -> dict:
-    system_prompt = agent.system + "\n" + _SCHEMA_INSTRUCTION
+async def generate_proposal_content(agent: Agent, user_text: str, web_context: str = "") -> dict:
+    """`web_context` carries live search results when the request depends on
+    current facts (market sizes, competitor pricing) — a proposal quoting a
+    figure from the model's training cutoff is worse than one that says it
+    needs checking. See web_search.py."""
+    system_prompt = agent.system + "\n" + _SCHEMA_INSTRUCTION + web_context
     # Use the agent's own MAIN model with a full token budget — the default
     # claude_generate_json settings (fast model, 512 tokens) are for routing
     # and would truncate a real document's JSON mid-object.
