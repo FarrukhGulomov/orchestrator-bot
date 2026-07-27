@@ -453,6 +453,75 @@ async def pop_due(limit: int = 50) -> list[Task]:
     return out
 
 
+async def _advance_to_next_occurrence(task: Task) -> Task:
+    """Recompute due_at/remind_at/final_remind_at/stage for a recurring
+    task's NEXT occurrence and persist it, status left untouched by the
+    caller. Shared by advance_after_fire() (called when a reminder FIRES)
+    and complete_occurrence() (called when the user marks it done) — both
+    need the exact same "what's next" math."""
+    due = datetime.fromisoformat(task.due_at)
+    new_due = next_occurrence(due, task.recurrence)
+    primary, final = compute_reminders(new_due, task.complexity, task.priority)
+    task.due_at = new_due.isoformat()
+    task.remind_at = primary.isoformat()
+    task.final_remind_at = final.isoformat() if final else None
+    task.stage = "primary"
+
+    pool = await _pg()
+    if pool is not None:
+        try:
+            async with pool.acquire() as conn:
+                await _pg_upsert(conn, task, primary)
+            return task
+        except Exception:  # noqa: BLE001
+            logger.exception("Postgres _advance_to_next_occurrence failed")
+    await _save(task)
+    await _schedule(task.id, primary)
+    return task
+
+
+async def complete_occurrence(task_id: str) -> Task | None:
+    """Mark ONE occurrence of a task done. A one-off task (recurrence=none)
+    behaves exactly like set_status(id, 'done') — terminal. A RECURRING
+    task stays 'pending' and advances to its next occurrence instead of
+    terminating: a bare set_status('done') on a recurring task clears
+    next_reminder_at with no code path ever reviving it, so the very first
+    "✅ Bajarildi" tap on a daily/weekly/monthly reminder was silently
+    killing every future occurrence — completing today's reminder must
+    not cancel tomorrow's."""
+    task = await get_task(task_id)
+    if task is None:
+        return None
+    if task.recurrence == "none":
+        return await set_status(task_id, "done")
+    return await _advance_to_next_occurrence(task)
+
+
+async def bump_daily_streak(task_id: str) -> int:
+    """Consecutive-day counter for recurrence='daily' tasks completed via
+    complete_occurrence() — a lightweight motivational nudge for personal
+    habits ("har kuni suv ich"). Requires DATABASE_URL (kv_store); returns
+    0 when unavailable, which callers treat as "don't show a streak line"
+    rather than an error — this is a nice-to-have, not durable data."""
+    pool = await _pg()
+    if pool is None:
+        return 0
+    today = now_local().date()
+    key_streak, key_date = f"streak:{task_id}", f"streak_date:{task_id}"
+    last_date_raw = await db.kv_get(key_date)
+    raw_streak = await db.kv_get(key_streak)
+    streak = int(raw_streak) if raw_streak else 0
+    if last_date_raw == today.isoformat():
+        return streak  # already bumped today — guards a double-tap/retry
+    if last_date_raw == (today - timedelta(days=1)).isoformat():
+        streak += 1
+    else:
+        streak = 1
+    await db.kv_set(key_streak, str(streak))
+    await db.kv_set(key_date, today.isoformat())
+    return streak
+
+
 async def advance_after_fire(task: Task) -> None:
     """Call after a reminder for `task` has been sent. Schedules the next
     reminder: the FINAL nudge, the next RECURRENCE, or nothing further."""
@@ -471,23 +540,7 @@ async def advance_after_fire(task: Task) -> None:
         return
 
     if task.recurrence != "none":
-        due = datetime.fromisoformat(task.due_at)
-        new_due = next_occurrence(due, task.recurrence)
-        primary, final = compute_reminders(new_due, task.complexity, task.priority)
-        task.due_at = new_due.isoformat()
-        task.remind_at = primary.isoformat()
-        task.final_remind_at = final.isoformat() if final else None
-        task.stage = "primary"
-        pool = await _pg()
-        if pool is not None:
-            try:
-                async with pool.acquire() as conn:
-                    await _pg_upsert(conn, task, primary)
-                return
-            except Exception:  # noqa: BLE001
-                logger.exception("Postgres advance_after_fire (recurrence) failed")
-        await _save(task)
-        await _schedule(task.id, primary)
+        await _advance_to_next_occurrence(task)
         return
 
     # One-off task, no more reminders queued — stays "pending" until the user
