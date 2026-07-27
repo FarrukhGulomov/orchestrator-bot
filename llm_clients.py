@@ -1,18 +1,23 @@
 """
-Unified LLM client — OpenRouter (free), Claude (Anthropic), or Hybrid.
+Unified LLM client with multi-provider failover: Claude, ChatGPT (OpenAI),
+Gemini, Grok (xAI), DeepSeek, Kimi (Moonshot), and OpenRouter.
 
-Provider modes (auto-detected from config.settings.provider):
-  hybrid     — BOTH keys set: fast/routing → OpenRouter, main/vision → Claude
-  openrouter — Only OR key: all calls use free models
-  claude     — Only Anthropic key: all calls use Claude Sonnet/Haiku
+Every provider is fully optional (works with just one key set). For every
+call, claude_generate()/claude_generate_fast()/claude_generate_json() try
+each CONFIGURED provider in PROVIDER_PRIORITY order (see config.py) until
+one succeeds — a dead/invalid/quota-exhausted key on one provider doesn't
+stop the bot, it just falls through to the next one. See
+_generate_with_failover() / _generate_json_with_failover().
 
 Public API (provider-transparent):
-  claude_generate()      — main model: agent responses, deep analysis
-  claude_generate_fast() — fast model: routing, classification, memory
-  claude_describe_file() — vision/PDF understanding
+  claude_generate()      — main-tier model: agent responses, deep analysis
+  claude_generate_fast() — fast-tier model: routing, classification, memory
+  claude_describe_file() — vision/PDF understanding (Claude/OpenRouter only
+                            for now — see its docstring)
   claude_generate_json() — structured JSON (router, docgen)
 
-Retry logic: 3x exponential backoff (2s → 4s → 8s) on 503/429/529.
+Retry logic: 3x exponential backoff (2s → 4s → 8s) on 503/429/529 PER
+PROVIDER, before moving on to the next provider in the chain.
 """
 
 import asyncio
@@ -252,6 +257,248 @@ def _claude_vision_sync(data: bytes, mime_type: str, instruction: str) -> str:
 
 
 # --------------------------------------------------------------------------
+# Multi-provider failover (ChatGPT, Gemini, Grok, DeepSeek, Kimi, plus the
+# Claude/OpenRouter clients above) — every provider here speaks the OpenAI
+# chat.completions schema except Claude (native Anthropic API, handled
+# separately above). If one provider's key is missing, invalid, out of
+# quota, or erroring, the NEXT configured provider in PROVIDER_PRIORITY
+# answers instead — the bot keeps working as long as ONE key is still good.
+# --------------------------------------------------------------------------
+_KNOWN_PROVIDERS = ("claude", "openai", "gemini", "grok", "deepseek", "kimi", "openrouter")
+
+_COMPAT_BASE_URLS = {
+    "openai": "https://api.openai.com/v1",
+    "gemini": "https://generativelanguage.googleapis.com/v1beta/openai/",
+    "grok": "https://api.x.ai/v1",
+    "deepseek": "https://api.deepseek.com",
+    "kimi": "https://api.moonshot.ai/v1",
+}
+
+_compat_clients: dict[str, object] = {}
+
+
+def _get_compat_client(key: str, api_key: str, base_url: str):
+    if key not in _compat_clients:
+        from openai import OpenAI
+        _compat_clients[key] = OpenAI(api_key=api_key, base_url=base_url)
+    return _compat_clients[key]
+
+
+def _compat_sync(
+    key: str, base_url: str, api_key: str, model: str,
+    system: str, messages: list[dict], temperature: float, max_tokens: int,
+) -> str:
+    client = _get_compat_client(key, api_key, base_url)
+    full = [{"role": "system", "content": system}] + messages
+    last_exc: Exception | None = None
+    for attempt in range(_MAX_RETRIES):
+        try:
+            resp = client.chat.completions.create(
+                model=model, messages=full, temperature=temperature, max_tokens=max_tokens,
+            )
+            return (resp.choices[0].message.content or "").strip()
+        except Exception as exc:
+            last_exc = exc
+            if _is_retryable(exc) and attempt < _MAX_RETRIES - 1:
+                delay = _RETRY_BASE * (2 ** attempt)
+                logger.warning("%s overloaded (attempt %d), retry in %ds: %s",
+                               key, attempt + 1, delay, str(exc)[:100])
+                time.sleep(delay)
+                continue
+            raise
+    raise last_exc  # type: ignore[misc]
+
+
+def _compat_json_sync(
+    key: str, base_url: str, api_key: str, model: str,
+    system: str, messages: list[dict], max_tokens: int,
+) -> str:
+    client = _get_compat_client(key, api_key, base_url)
+    full = [{"role": "system", "content": system + "\nRespond with ONLY valid JSON, no markdown, no prose."}] + messages
+    last_exc: Exception | None = None
+    for attempt in range(_MAX_RETRIES):
+        try:
+            resp = client.chat.completions.create(
+                model=model, messages=full, temperature=0.0, max_tokens=max_tokens,
+            )
+            raw = (resp.choices[0].message.content or "").strip()
+            return _strip_json_fences(raw)
+        except Exception as exc:
+            last_exc = exc
+            if _is_retryable(exc) and attempt < _MAX_RETRIES - 1:
+                delay = _RETRY_BASE * (2 ** attempt)
+                logger.warning("%s JSON call overloaded (attempt %d), retry in %ds: %s",
+                               key, attempt + 1, delay, str(exc)[:100])
+                time.sleep(delay)
+                continue
+            raise
+    raise last_exc  # type: ignore[misc]
+
+
+def _provider_api_key(key: str) -> str:
+    return {
+        "claude": settings.anthropic_api_key,
+        "openai": settings.openai_api_key,
+        "gemini": settings.gemini_api_key,
+        "grok": settings.xai_api_key,
+        "deepseek": settings.deepseek_api_key,
+        "kimi": settings.kimi_api_key,
+        "openrouter": settings.openrouter_api_key,
+    }.get(key, "")
+
+
+def _provider_models(key: str) -> tuple[str, str, str]:
+    """(main_model, fast_model, display_label) for a provider key."""
+    return {
+        "claude": (settings.claude_model, settings.claude_fast_model, "Claude"),
+        "openai": (settings.openai_model, settings.openai_model, settings.openai_model_label),
+        "gemini": (settings.gemini_model, settings.gemini_model, settings.gemini_model_label),
+        "grok": (settings.grok_model, settings.grok_model, settings.grok_model_label),
+        "deepseek": (settings.deepseek_model, settings.deepseek_model, settings.deepseek_model_label),
+        "kimi": (settings.kimi_model, settings.kimi_model, settings.kimi_model_label),
+        "openrouter": (settings.or_main_model, settings.or_fast_model, "OpenRouter"),
+    }[key]
+
+
+def _configured_chain() -> list[str]:
+    """Provider keys in PROVIDER_PRIORITY order, filtered to ones with an
+    API key set. Any configured-but-unlisted provider (someone added a key
+    without touching PROVIDER_PRIORITY) is appended at the end so it still
+    gets used rather than silently ignored."""
+    order = [p.strip().lower() for p in settings.provider_priority.split(",") if p.strip()]
+    chain: list[str] = []
+    for key in order:
+        if key in _KNOWN_PROVIDERS and _provider_api_key(key) and key not in chain:
+            chain.append(key)
+    for key in _KNOWN_PROVIDERS:
+        if key not in chain and _provider_api_key(key):
+            chain.append(key)
+    return chain
+
+
+def provider_chain_status() -> list[tuple[str, str, bool]]:
+    """(provider_key, label, configured) for every known provider, in the
+    active PROVIDER_PRIORITY order — used by /status for diagnostics."""
+    order = [p.strip().lower() for p in settings.provider_priority.split(",") if p.strip()]
+    seen: list[str] = [k for k in order if k in _KNOWN_PROVIDERS]
+    for key in _KNOWN_PROVIDERS:
+        if key not in seen:
+            seen.append(key)
+    return [(key, _provider_models(key)[2], bool(_provider_api_key(key))) for key in seen]
+
+
+def _call_main_sync(
+    key: str, model: str, system: str, messages: list[dict], temperature: float, max_tokens: int,
+) -> str:
+    if key == "claude":
+        return _claude_sync(model, system, messages, temperature, max_tokens)
+    if key == "openrouter":
+        return _or_sync(model, system, messages, temperature, max_tokens)
+    return _compat_sync(
+        key, _COMPAT_BASE_URLS[key], _provider_api_key(key), model, system, messages, temperature, max_tokens,
+    )
+
+
+def _call_json_sync(key: str, model: str, system: str, messages: list[dict], max_tokens: int) -> str:
+    if key == "claude":
+        return _claude_json_sync(system, messages, model, max_tokens)
+    if key == "openrouter":
+        return _or_json_sync(system, messages, model, max_tokens)
+    return _compat_json_sync(
+        key, _COMPAT_BASE_URLS[key], _provider_api_key(key), model, system, messages, max_tokens,
+    )
+
+
+async def _generate_with_failover(
+    system: str, messages: list[dict], temperature: float, max_tokens: int,
+    tier: str, preferred_model: str | None = None,
+) -> str:
+    chain = _configured_chain()
+    if not chain:
+        raise RuntimeError("Hech qanday AI provider sozlanmagan (API key topilmadi).")
+
+    tried: set[str] = set()
+    last_exc: Exception | None = None
+
+    # An explicit model id (e.g. from router.model_for()) is honored as the
+    # first attempt if its provider is in the chain, before falling through
+    # to the standard priority order.
+    if preferred_model:
+        preferred_key = "openrouter" if "/" in preferred_model else "claude"
+        if preferred_key in chain:
+            try:
+                return await asyncio.to_thread(
+                    _call_main_sync, preferred_key, preferred_model, system, messages, temperature, max_tokens,
+                )
+            except Exception as exc:
+                last_exc = exc
+                logger.warning("Preferred provider '%s' failed, falling back: %s",
+                                preferred_key, str(exc)[:200])
+                tried.add(preferred_key)
+
+    for key in chain:
+        if key in tried:
+            continue
+        main_model, fast_model, _label = _provider_models(key)
+        model = main_model if tier == "main" else fast_model
+        try:
+            result = await asyncio.to_thread(
+                _call_main_sync, key, model, system, messages, temperature, max_tokens,
+            )
+            if tried:
+                logger.info("Answered via fallback provider '%s' (tier=%s)", key, tier)
+            return result
+        except Exception as exc:
+            last_exc = exc
+            logger.warning("Provider '%s' failed (tier=%s), trying next: %s", key, tier, str(exc)[:200])
+            tried.add(key)
+
+    raise last_exc  # type: ignore[misc]
+
+
+async def _generate_json_with_failover(
+    system: str, messages: list[dict], max_tokens: int,
+    tier: str, preferred_model: str | None = None,
+) -> str:
+    chain = _configured_chain()
+    if not chain:
+        raise RuntimeError("Hech qanday AI provider sozlanmagan (API key topilmadi).")
+
+    tried: set[str] = set()
+    last_exc: Exception | None = None
+
+    if preferred_model:
+        preferred_key = "openrouter" if "/" in preferred_model else "claude"
+        if preferred_key in chain:
+            try:
+                return await asyncio.to_thread(
+                    _call_json_sync, preferred_key, preferred_model, system, messages, max_tokens,
+                )
+            except Exception as exc:
+                last_exc = exc
+                logger.warning("Preferred provider '%s' failed (JSON), falling back: %s",
+                                preferred_key, str(exc)[:200])
+                tried.add(preferred_key)
+
+    for key in chain:
+        if key in tried:
+            continue
+        main_model, fast_model, _label = _provider_models(key)
+        model = main_model if tier == "main" else fast_model
+        try:
+            result = await asyncio.to_thread(_call_json_sync, key, model, system, messages, max_tokens)
+            if tried:
+                logger.info("Answered via fallback provider '%s' (tier=%s, JSON)", key, tier)
+            return result
+        except Exception as exc:
+            last_exc = exc
+            logger.warning("Provider '%s' failed (tier=%s, JSON), trying next: %s", key, tier, str(exc)[:200])
+            tried.add(key)
+
+    raise last_exc  # type: ignore[misc]
+
+
+# --------------------------------------------------------------------------
 # Public API — provider-transparent
 # --------------------------------------------------------------------------
 async def claude_generate(
@@ -262,26 +509,12 @@ async def claude_generate(
 ) -> str:
     """Main model: agent responses, deep analysis, document generation.
 
-    hybrid — routes PER CALL based on the model id's shape: an OpenRouter id
-    (always contains "/", e.g. from model_for()'s low-complexity branch —
-    simple questions, saving Claude usage) goes to OpenRouter; a bare Claude
-    id (e.g. "claude-sonnet-4-6", from high-complexity work) goes to Claude.
-    claude     → always Claude.
-    openrouter → always OpenRouter (free).
+    Tries every configured provider in PROVIDER_PRIORITY order (main-tier
+    model each) until one succeeds — see _generate_with_failover. `model`,
+    if given (e.g. from router.model_for()), is tried first.
     """
-    if settings.provider == "openrouter":
-        m = model or settings.or_main_model
-        return await asyncio.to_thread(
-            _or_sync, m, system, messages, temperature, settings.max_output_tokens
-        )
-    if settings.provider == "hybrid" and model and "/" in model:
-        return await asyncio.to_thread(
-            _or_sync, model, system, messages, temperature, settings.max_output_tokens
-        )
-    # hybrid with a Claude id (or no explicit model), or claude-only.
-    m = model or settings.claude_model
-    return await asyncio.to_thread(
-        _claude_sync, m, system, messages, temperature, settings.max_output_tokens
+    return await _generate_with_failover(
+        system, messages, temperature, settings.max_output_tokens, tier="main", preferred_model=model,
     )
 
 
@@ -292,27 +525,32 @@ async def claude_generate_fast(
 ) -> str:
     """Fast model: routing, classification, memory extraction, relevance checks.
 
-    hybrid/openrouter → OpenRouter fast free model
-    claude            → Claude Haiku
+    Same failover chain as claude_generate(), but using each provider's
+    fast/cheap model tier — quality matters less here than for real answers.
     """
-    if settings.provider in ("openrouter", "hybrid"):
-        return await asyncio.to_thread(
-            _or_sync, settings.or_fast_model, system, messages, temperature, 1024
-        )
-    return await asyncio.to_thread(
-        _claude_sync, settings.claude_fast_model, system, messages, temperature, 1024
-    )
+    return await _generate_with_failover(system, messages, temperature, 1024, tier="fast")
 
 
 async def claude_describe_file(data: bytes, mime_type: str, instruction: str) -> str:
     """Vision/PDF file understanding.
 
-    hybrid/claude → Claude (native PDF + vision, better accuracy)
+    NOTE: not yet part of the multi-provider failover chain — image/PDF
+    content-block formats differ enough across providers (Claude's native
+    blocks vs. OpenAI-style image_url vs. Gemini's own conventions) that
+    wiring all of them up is a separate piece of work. Still just Claude
+    (native, best accuracy) with an OpenRouter fallback:
+
+    claude/hybrid → Claude (native PDF + vision)
     openrouter    → OpenRouter vision model (images) + pypdf (PDFs)
     """
-    if settings.provider in ("claude", "hybrid"):
+    if settings.anthropic_api_key:
         return await asyncio.to_thread(_claude_vision_sync, data, mime_type, instruction)
-    return await asyncio.to_thread(_or_vision_sync, data, mime_type, instruction)
+    if settings.openrouter_api_key:
+        return await asyncio.to_thread(_or_vision_sync, data, mime_type, instruction)
+    raise RuntimeError(
+        "Fayl tahlili uchun ANTHROPIC_API_KEY yoki OPENROUTER_API_KEY kerak "
+        "(rasm/PDF tahlili hozircha boshqa provayderlar orqali ishlamaydi)."
+    )
 
 
 def _strip_json_fences(raw: str) -> str:
@@ -517,19 +755,12 @@ async def claude_generate_json(
     hybrid/openrouter → OpenRouter fast free model (routing is free)
     claude            → Claude Haiku
 
-    In hybrid mode an EXPLICIT Claude model id must go to the Claude API —
-    docgen/minutes pass model_for()'s result, which is a Claude id in hybrid;
-    sending it to OpenRouter 404s and silently degrades to openrouter/auto.
-    OpenRouter ids always contain "/" (vendor/model); Claude ids never do.
+    An explicit model id (docgen/minutes pass model_for()'s "high" result
+    when JSON quality matters) is tried first via the main-tier failover
+    chain; no model → fast-tier chain (router classification etc).
     """
-    if settings.provider == "hybrid" and model and "/" not in model:
-        raw = await asyncio.to_thread(_claude_json_sync, system, messages, model, max_tokens)
-    elif settings.provider in ("openrouter", "hybrid"):
-        m = model or settings.or_fast_model
-        raw = await asyncio.to_thread(_or_json_sync, system, messages, m, max_tokens)
-    else:
-        m = model or settings.claude_fast_model
-        raw = await asyncio.to_thread(_claude_json_sync, system, messages, m, max_tokens)
+    tier = "main" if model else "fast"
+    raw = await _generate_json_with_failover(system, messages, max_tokens, tier=tier, preferred_model=model)
     # Applied unconditionally: a no-op for already-valid JSON (its string
     # literals never contain raw control chars), and fixes the single most
     # common way a free/weaker model breaks otherwise-valid JSON — see

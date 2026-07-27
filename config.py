@@ -150,6 +150,64 @@ class Settings:
         default_factory=lambda: os.getenv("CLAUDE_FAST_MODEL_LABEL", "Claude Haiku 4.5")
     )
 
+    # --- Extra providers (multi-provider failover) --------------------------
+    # Each is fully optional — llm_clients.py only puts a provider in the
+    # failover chain if its key is set. Model ids are env-overridable since
+    # these vendors rename/retire models more often than this code changes.
+    openai_api_key: str = field(default_factory=lambda: os.getenv("OPENAI_API_KEY", ""))
+    openai_model: str = field(default_factory=lambda: os.getenv("OPENAI_MODEL", "gpt-4.1"))
+    openai_model_label: str = field(
+        default_factory=lambda: os.getenv("OPENAI_MODEL_LABEL", "ChatGPT (GPT-4.1)")
+    )
+
+    gemini_api_key: str = field(
+        default_factory=lambda: os.getenv("GEMINI_API_KEY", os.getenv("GOOGLE_API_KEY", ""))
+    )
+    gemini_model: str = field(default_factory=lambda: os.getenv("GEMINI_MODEL", "gemini-2.5-pro"))
+    gemini_model_label: str = field(
+        default_factory=lambda: os.getenv("GEMINI_MODEL_LABEL", "Gemini 2.5 Pro")
+    )
+
+    xai_api_key: str = field(default_factory=lambda: os.getenv("XAI_API_KEY", ""))
+    grok_model: str = field(default_factory=lambda: os.getenv("GROK_MODEL", "grok-4"))
+    grok_model_label: str = field(default_factory=lambda: os.getenv("GROK_MODEL_LABEL", "Grok 4"))
+
+    deepseek_api_key: str = field(default_factory=lambda: os.getenv("DEEPSEEK_API_KEY", ""))
+    deepseek_model: str = field(
+        default_factory=lambda: os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+    )
+    deepseek_model_label: str = field(
+        default_factory=lambda: os.getenv("DEEPSEEK_MODEL_LABEL", "DeepSeek Chat")
+    )
+
+    kimi_api_key: str = field(
+        default_factory=lambda: os.getenv("KIMI_API_KEY", os.getenv("MOONSHOT_API_KEY", ""))
+    )
+    kimi_model: str = field(
+        default_factory=lambda: os.getenv("KIMI_MODEL", "kimi-k2-0711-preview")
+    )
+    kimi_model_label: str = field(default_factory=lambda: os.getenv("KIMI_MODEL_LABEL", "Kimi K2"))
+
+    # Failover order for the main conversational path (llm_clients.py) — a
+    # comma-separated list of provider keys, tried in order, skipping any
+    # without an API key. Not the same as the legacy `provider` property
+    # below, which only ever knew about Claude/OpenRouter and still governs
+    # the cheap background-triage paths (business_copilot.py/group_copilot.py)
+    # that deliberately don't need top-tier quality.
+    provider_priority: str = field(
+        default_factory=lambda: os.getenv(
+            "PROVIDER_PRIORITY", "openai,claude,gemini,grok,deepseek,kimi,openrouter"
+        )
+    )
+
+    @property
+    def any_ai_key_set(self) -> bool:
+        return bool(
+            self.anthropic_api_key or self.openrouter_api_key or self.openai_api_key
+            or self.gemini_api_key or self.xai_api_key or self.deepseek_api_key
+            or self.kimi_api_key
+        )
+
     @property
     def provider(self) -> str:
         """Active AI provider: 'hybrid' | 'openrouter' | 'claude' | 'none'.
@@ -326,10 +384,11 @@ class Settings:
                 "BOT_TOKEN does not look like a valid Telegram bot token "
                 "(expected '<digits>:<35+ chars>' from @BotFather)."
             )
-        if self.provider == "none":
+        if not self.any_ai_key_set:
             problems.append(
-                "No AI provider configured. Set OPENROUTER_API_KEY (free) "
-                "or ANTHROPIC_API_KEY (paid), or both for hybrid mode."
+                "No AI provider configured. Set OPENROUTER_API_KEY (free), "
+                "ANTHROPIC_API_KEY (paid), or any of OPENAI_API_KEY/GEMINI_API_KEY/"
+                "XAI_API_KEY/DEEPSEEK_API_KEY/KIMI_API_KEY."
             )
         return problems
 

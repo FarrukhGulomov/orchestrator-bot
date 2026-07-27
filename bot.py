@@ -100,7 +100,13 @@ from agents import (
 )
 from config import settings
 from file_processing import SUPPORTED_SUMMARY, extract, transcribe_audio
-from llm_clients import claude_generate, claude_generate_fast, claude_generate_json, parse_llm_json
+from llm_clients import (
+    claude_generate,
+    claude_generate_fast,
+    claude_generate_json,
+    parse_llm_json,
+    provider_chain_status,
+)
 from request_types import REQUEST_TYPES, get_request_type
 from router import Route, classify, model_for
 
@@ -1837,21 +1843,24 @@ async def cmd_status(message: Message) -> None:
         return
 
     lines = ["**AI Orchestrator Status**\n"]
-    if settings.provider == "hybrid":
-        lines.append("**Provider:** ✅ Hybrid (OpenRouter + Claude)")
-        lines.append(f"**Murakkab ish (hujjat/kod/tahlil):** {settings.claude_model_label} (Claude Sonnet)")
-        lines.append(f"**Oddiy savollar + routing:** {settings.or_fast_model_label} (OpenRouter, bepul)")
-        lines.append(f"**Vision/PDF:** Claude (native tahlil)")
-    elif settings.provider == "openrouter":
-        lines.append("**Provider:** ✅ OpenRouter (bepul)")
-        lines.append(f"**Asosiy model:** {settings.or_main_model_label} (`{settings.or_main_model}`)")
-        lines.append(f"**Tez model (routing):** {settings.or_fast_model_label}")
-    elif settings.provider == "claude":
-        lines.append("**Provider:** ✅ Claude (Anthropic)")
-        lines.append(f"**Asosiy model:** {settings.claude_model_label}")
-        lines.append(f"**Tez model:** {settings.claude_fast_model_label}")
+    chain_status = provider_chain_status()
+    active_chain = [key for key, _label, ok in chain_status if ok]
+    if active_chain:
+        lines.append(f"**AI provayderlar (navbat bo'yicha, {len(active_chain)} ta faol):**")
+        for key, label, ok in chain_status:
+            mark = "✅" if ok else "⚪"
+            tag = " ← asosiy" if ok and key == active_chain[0] else ""
+            lines.append(f"  {mark} {label}{tag}")
+        lines.append(
+            "\nBiri ishlamay qolsa (kalit noto'g'ri/limit tugagan), keyingisi "
+            "avtomatik javob beradi — bot to'xtab qolmaydi."
+        )
     else:
-        lines.append("**Provider:** ❌ Sozlanmagan (OPENROUTER_API_KEY yoki ANTHROPIC_API_KEY kerak)")
+        lines.append(
+            "**Provider:** ❌ Sozlanmagan (ANTHROPIC_API_KEY, OPENAI_API_KEY, "
+            "GEMINI_API_KEY, XAI_API_KEY, DEEPSEEK_API_KEY, KIMI_API_KEY yoki "
+            "OPENROUTER_API_KEY dan birortasi kerak)"
+        )
     db_status = "✅ Ulangan (users/tasks/decisions/memory)" if settings.db_enabled else "⚠️ Sozlanmagan (Redis/in-memory fallback)"
     lines.append(f"\n**PostgreSQL:** {db_status}")
     redis_status = "✅ Persistent" if settings.redis_enabled else "⚠️ In-memory (restart da yo'oladi)"
@@ -2567,8 +2576,10 @@ async def cmd_stats(message: Message) -> None:
         name = u.get("full_name") or u.get("fio") or str(u["user_id"])
         lines.append(f"• {name} — {_count(u)} xabar")
     lines.append("")
+    active_providers = [key for key, _label, ok in provider_chain_status() if ok]
     lines.append(
-        f"🤖 Provider: {settings.provider} · 🗄 PostgreSQL: {'✅' if settings.db_enabled else '⚠️'} "
+        f"🤖 AI: {'>'.join(active_providers) if active_providers else '❌'} "
+        f"· 🗄 PostgreSQL: {'✅' if settings.db_enabled else '⚠️'} "
         f"· 💾 Redis: {'✅' if settings.redis_enabled else '⚠️ in-memory'}"
     )
     await _send_long(message, "\n".join(lines))
@@ -3523,19 +3534,14 @@ async def main() -> None:
     else:
         logger.info("Redis: in-memory only (lost on restart). Set REDIS_URL to persist.")
 
-    if settings.provider == "hybrid":
-        logger.info(
-            "Provider: HYBRID — complex work=%s | simple questions/routing=%s (free) | vision=Claude",
-            settings.claude_model, settings.or_fast_model,
-        )
-    elif settings.provider == "openrouter":
-        logger.info("Provider: OpenRouter (free) — main=%s fast=%s",
-                    settings.or_main_model, settings.or_fast_model)
-    elif settings.provider == "claude":
-        logger.info("Provider: Claude (Anthropic) — main=%s fast=%s",
-                    settings.claude_model, settings.claude_fast_model)
+    active_chain = [key for key, _label, ok in provider_chain_status() if ok]
+    if active_chain:
+        logger.info("AI provider failover chain: %s", " -> ".join(active_chain))
     else:
-        logger.warning("No AI provider configured! Set OPENROUTER_API_KEY or ANTHROPIC_API_KEY.")
+        logger.warning(
+            "No AI provider configured! Set ANTHROPIC_API_KEY, OPENAI_API_KEY, "
+            "GEMINI_API_KEY, XAI_API_KEY, DEEPSEEK_API_KEY, KIMI_API_KEY, or OPENROUTER_API_KEY."
+        )
 
     if settings.github_enabled:
         logger.info("GitHub: repo=%s auto_pr=%s", settings.github_repo, settings.github_auto_pr)
