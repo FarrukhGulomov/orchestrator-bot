@@ -77,6 +77,12 @@ class Settings:
     # friendly "not available yet" reply instead of a native transcript.
     groq_api_key: str = field(default_factory=lambda: os.getenv("GROQ_API_KEY", ""))
 
+    # Tavily — optional, powers live web search (see web_search.py) so
+    # time-sensitive questions (rates, weather, news, competitor info) are
+    # answered from the present instead of the model's training cutoff.
+    # Free tier: 1000 searches/month, no credit card. Key: tavily.com.
+    tavily_api_key: str = field(default_factory=lambda: os.getenv("TAVILY_API_KEY", ""))
+
     # --- Access control ----------------------------------------------------
     allowed_chat_ids: set[int] = field(
         default_factory=lambda: _csv_ints(os.getenv("ALLOWED_CHAT_IDS", ""))
