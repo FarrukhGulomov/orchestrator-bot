@@ -47,6 +47,7 @@ import json
 import logging
 import re
 import time
+from datetime import datetime
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -3276,10 +3277,26 @@ async def handle_task_callback(callback: CallbackQuery, bot: Bot) -> None:
         return
 
     if action == "d":  # done
-        await tasks.set_status(task_id, "done")
+        updated = await tasks.complete_occurrence(task_id)
         await callback.answer("Bajarildi deb belgilandi ✅")
+        if updated is not None and task.recurrence != "none" and updated.status == "pending":
+            # Recurring task: this occurrence is done but the reminder LIVES
+            # ON for next time — must not read as "finished" the way a
+            # one-off task's done-click does.
+            streak_note = ""
+            if task.recurrence == "daily":
+                streak = await tasks.bump_daily_streak(task_id)
+                if streak >= 2:
+                    streak_note = f" 🔥 {streak} kunlik seriya!"
+            next_due = datetime.fromisoformat(updated.due_at).astimezone(tasks.TZ)
+            text = (
+                f"✅ Bajarildi: {task.title}{streak_note}\n"
+                f"🔁 Keyingisi: {next_due.strftime('%d-%m %H:%M')}"
+            )
+        else:
+            text = f"✅ Bajarildi: {task.title}"
         try:
-            await callback.message.edit_text(f"✅ Bajarildi: {task.title}", reply_markup=None)
+            await callback.message.edit_text(text, reply_markup=None)
         except Exception:  # noqa: BLE001 — best-effort cosmetic edit (stale/inaccessible message, etc.)
             pass
         return
