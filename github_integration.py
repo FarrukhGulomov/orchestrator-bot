@@ -31,6 +31,15 @@ logger = logging.getLogger(__name__)
 API = "https://api.github.com"
 _TIMEOUT = 20
 
+# Set whenever a create_issue/create_implementation_pr call fails, so bot.py
+# can surface *why* to the admin in Telegram instead of the failure only
+# ever showing up in Railway logs nobody's watching.
+_last_error: str = ""
+
+
+def last_error() -> str:
+    return _last_error
+
 
 def _headers() -> dict:
     return {
@@ -47,6 +56,7 @@ def _slug(text: str, max_len: int = 40) -> str:
 
 # --- Issues ------------------------------------------------------------------
 def _create_issue_sync(title: str, body: str, labels: list[str]) -> str | None:
+    global _last_error
     url = f"{API}/repos/{settings.github_repo}/issues"
     payload: dict = {"title": title[:250], "body": body}
     if labels:
@@ -60,17 +70,21 @@ def _create_issue_sync(title: str, body: str, labels: list[str]) -> str | None:
         resp = requests.post(url, json=payload, headers=_headers(), timeout=_TIMEOUT)
 
     if resp.status_code >= 300:
+        _last_error = f"{resp.status_code} {resp.text[:200]}"
         logger.warning("GitHub issue creation failed: %s %s", resp.status_code, resp.text[:300])
         return None
+    _last_error = ""
     return resp.json().get("html_url")
 
 
 async def create_issue(title: str, body: str, labels: list[str]) -> str | None:
     if not settings.github_enabled:
         return None
+    global _last_error
     try:
         return await asyncio.to_thread(_create_issue_sync, title, body, labels)
-    except Exception:
+    except Exception as exc:
+        _last_error = f"{type(exc).__name__}: {exc}"[:200]
         logger.exception("GitHub issue creation raised")
         return None
 
@@ -113,6 +127,7 @@ def _get_file_sha(path: str, branch: str) -> str | None:
 def _create_pr_sync(
     title: str, body: str, files: dict[str, str], labels: list[str]
 ) -> str | None:
+    global _last_error
     owner_repo = settings.github_repo
     base = settings.github_default_branch
     headers = _headers()
@@ -121,6 +136,7 @@ def _create_pr_sync(
         f"{API}/repos/{owner_repo}/git/ref/heads/{base}", headers=headers, timeout=_TIMEOUT
     )
     if base_ref.status_code >= 300:
+        _last_error = f"base branch '{base}': {base_ref.status_code} {base_ref.text[:200]}"
         logger.warning("Cannot read base branch '%s': %s", base, base_ref.text[:300])
         return None
     base_sha = base_ref.json()["object"]["sha"]
@@ -133,6 +149,7 @@ def _create_pr_sync(
         timeout=_TIMEOUT,
     )
     if create_ref.status_code >= 300:
+        _last_error = f"create branch: {create_ref.status_code} {create_ref.text[:200]}"
         logger.warning("Cannot create branch '%s': %s", branch, create_ref.text[:300])
         return None
 
@@ -168,8 +185,10 @@ def _create_pr_sync(
         timeout=_TIMEOUT,
     )
     if pr_resp.status_code >= 300:
+        _last_error = f"open PR: {pr_resp.status_code} {pr_resp.text[:200]}"
         logger.warning("Cannot open PR from '%s': %s", branch, pr_resp.text[:300])
         return None
+    _last_error = ""
 
     pr = pr_resp.json()
     pr_url = pr.get("html_url")
@@ -189,9 +208,11 @@ async def create_implementation_pr(
 ) -> str | None:
     if not settings.github_enabled or not settings.github_auto_pr or not files:
         return None
+    global _last_error
     try:
         return await asyncio.to_thread(_create_pr_sync, title, body, files, labels)
-    except Exception:
+    except Exception as exc:
+        _last_error = f"{type(exc).__name__}: {exc}"[:200]
         logger.exception("GitHub PR creation raised")
         return None
 

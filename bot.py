@@ -905,6 +905,12 @@ async def _maybe_create_tickets(route: Route, user_text: str, body: str) -> str:
         lines.append(f"📋 Issue: {issue_url}")
     if pr_url:
         lines.append(f"🔀 Draft PR: {pr_url}")
+    if not issue_url and not pr_url:
+        # It was configured and should have worked — say why instead of
+        # going quiet, so a broken token doesn't look like "nothing to file".
+        err = github_integration.last_error()
+        if err:
+            lines.append(f"⚠️ GitHub'ga yozib bo'lmadi: {err}")
     return ("\n\n" + "\n".join(lines)) if lines else ""
 
 
@@ -1591,6 +1597,10 @@ async def cmd_kickoff(message: Message, bot: Bot, command: CommandObject) -> Non
         issue_url = await github_integration.create_issue(title, issue_body, labels)
         if issue_url:
             footer = f"\n\n📋 Issue: {issue_url}"
+        else:
+            err = github_integration.last_error()
+            if err:
+                footer = f"\n\n⚠️ GitHub'ga yozib bo'lmadi: {err}"
 
     await _send_long(message, "".join(parts) + footer)
 
