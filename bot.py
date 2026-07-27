@@ -258,7 +258,8 @@ WELCOME_TOUR_TEXT = (
     "4️⃣ Uchrashuv protokoli — yig'ilish yozuvini /minutes bilan yuboring → "
     "qarorlar va vazifalar avtomatik ajratiladi\n\n"
     "5️⃣ Xarajat hisobi — \"taksiga 30 ming\" deb yozing → yozib boraman, "
-    "/xarajatlar bilan oylik hisobot\n\n"
+    "/xarajatlar bilan oylik hisobot. /byudjet 3 mln bilan chegara qo'ying — "
+    "80% va 100% da o'zim ogohlantiraman\n\n"
     "☀️ Har kuni ertalab kunlik reja (vazifalaringiz, muddatlar, eslatmalar) "
     "olib turishni xohlaysizmi?"
 )
@@ -2918,6 +2919,9 @@ async def _try_log_expense(message: Message, uid: int, chat_id: int, text: str) 
         ),
         parse_mode="Markdown",
     )
+    alert = await expenses.check_budget_alert(uid)
+    if alert:
+        await message.answer(alert)
     return True
 
 
@@ -2983,6 +2987,48 @@ async def cmd_delete_expense(message: Message, command: CommandObject) -> None:
         await message.answer("🗑 O'chirildi.")
     else:
         await message.answer("Bunday yozuv topilmadi (yoki u sizniki emas).")
+
+
+@dp.message(Command("byudjet", "budget"))
+async def cmd_budget(message: Message, command: CommandObject) -> None:
+    """Set or view a monthly spending limit. Alerts fire automatically from
+    the expense-capture path (_try_log_expense) once 80%/100% is crossed."""
+    chat_id = message.chat.id
+    if not _is_allowed(chat_id):
+        return
+    if not expenses.available():
+        await message.answer(
+            "💸 Byudjet uchun PostgreSQL kerak — Railway'da DATABASE_URL qo'shing."
+        )
+        return
+    uid = message.from_user.id if message.from_user else 0
+    arg = (command.args or "").strip()
+    if arg:
+        amount = expenses.parse_amount_shorthand(arg)
+        if not amount:
+            await message.answer("Byudjet miqdorini yozing, masalan: /byudjet 3 mln")
+            return
+        await expenses.set_budget(uid, amount)
+        await message.answer(f"✅ Oylik byudjet o'rnatildi: {expenses.fmt_amount(amount, 'UZS')}")
+        return
+    budget = await expenses.get_budget(uid)
+    if not budget:
+        await message.answer(
+            "Oylik byudjet o'rnatilmagan.\nMasalan: /byudjet 3 mln — 80% va 100% da ogohlantiraman."
+        )
+        return
+    spent = await expenses.month_to_date_uzs_total(uid)
+    pct = int(spent / budget * 100) if budget else 0
+    remaining = budget - spent
+    lines = [
+        f"💰 Oylik byudjet: {expenses.fmt_amount(budget, 'UZS')}",
+        f"💸 Sarflandi: {expenses.fmt_amount(spent, 'UZS')} ({pct}%)",
+    ]
+    if remaining >= 0:
+        lines.append(f"✅ Qoldi: {expenses.fmt_amount(remaining, 'UZS')}")
+    else:
+        lines.append(f"🔴 Oshib ketdi: {expenses.fmt_amount(-remaining, 'UZS')}")
+    await message.answer("\n".join(lines))
 
 
 @dp.message(Command("search", "izla"))
@@ -3402,6 +3448,7 @@ _USER_COMMANDS: list[tuple[str, str]] = [
     ("search", "Internetdan izlash"),
     ("xarajat", "Xarajat yozish"),
     ("xarajatlar", "Xarajatlar hisoboti"),
+    ("byudjet", "Oylik byudjet o'rnatish/ko'rish"),
     ("agents", "Barcha mutaxassislar ro'yxati"),
     ("kickoff", "Jamoa bilan birgalikda ishlash"),
     ("proposal", "Word + PDF hujjat tayyorlash"),

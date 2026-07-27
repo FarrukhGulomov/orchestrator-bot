@@ -25,6 +25,7 @@ module because it is a fraction of their size.
 """
 
 import logging
+import re
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 
@@ -147,6 +148,31 @@ async def extract(text: str) -> dict | None:
     }
 
 
+_SHORTHAND_NUM_RE = re.compile(r"(\d[\d\s]*(?:[.,]\d+)?)")
+
+
+def parse_amount_shorthand(text: str) -> Decimal | None:
+    """Deterministic (no LLM call) amount parser for shorthand like '3 mln',
+    '30 ming', '3000000', '3 000 000'. Used where a bare number is expected
+    on its own (e.g. /byudjet) — an LLM round-trip would be wasteful for
+    something this mechanical, and less reliable than a direct parse."""
+    low = (text or "").lower()
+    m = _SHORTHAND_NUM_RE.search(low)
+    if not m:
+        return None
+    raw = m.group(1).strip().replace(" ", "").replace(",", ".")
+    try:
+        num = Decimal(raw)
+    except InvalidOperation:
+        return None
+    tail = low[m.end():m.end() + 15]
+    if "mln" in tail or "million" in tail or "млн" in tail or "миллион" in tail:
+        num *= 1_000_000
+    elif "ming" in tail or "минг" in tail or "тыс" in tail:
+        num *= 1_000
+    return num if num > 0 else None
+
+
 # --------------------------------------------------------------------------
 # Data layer
 # --------------------------------------------------------------------------
@@ -259,6 +285,83 @@ def render_confirmation(amount: Decimal, currency: str, category: str, note: str
     if note:
         line += f" ({note})"
     return line + f"\n_O'chirish: /xarajatochir {expense_id}_"
+
+
+# --------------------------------------------------------------------------
+# Monthly budget + proactive alerts
+#
+# A single overall monthly limit per user (not per-category — a category
+# breakdown is for the report, a limit is a simple "am I okay?" signal, and
+# a per-category budget UI is a lot of surface for a marginal gain here).
+# Stored in kv_store since it is exactly one scalar per user, not a table.
+# UZS only: the categories/report already treat UZS as the default currency
+# and mixing currencies into one limit comparison would be meaningless.
+# --------------------------------------------------------------------------
+_ALERT_THRESHOLDS = (100, 80)  # checked highest-first so a big jump alerts once, at the higher milestone
+
+
+def _budget_key(user_id: int) -> str:
+    return f"budget:{user_id}"
+
+
+def _alert_key(user_id: int, month_label: str) -> str:
+    return f"budget_alert:{user_id}:{month_label}"
+
+
+async def get_budget(user_id: int) -> Decimal | None:
+    raw = await db.kv_get(_budget_key(user_id))
+    if not raw:
+        return None
+    try:
+        return Decimal(raw)
+    except InvalidOperation:
+        return None
+
+
+async def set_budget(user_id: int, amount: Decimal) -> None:
+    await db.kv_set(_budget_key(user_id), str(amount))
+
+
+async def month_to_date_uzs_total(user_id: int) -> Decimal:
+    since, until, _ = period_bounds("oy")
+    data = await summary(user_id, since, until)
+    if not data:
+        return Decimal(0)
+    total = Decimal(0)
+    for row in data["by_category"]:
+        if row["currency"] == "UZS":
+            total += Decimal(row["total"])
+    return total
+
+
+async def check_budget_alert(user_id: int) -> str | None:
+    """Call after logging an expense. Returns an alert message the FIRST
+    time this calendar month that spend crosses 80%/100% of the budget, and
+    None every other time — so a user who logs 10 expenses past the limit
+    gets nudged once, not 10 times."""
+    budget = await get_budget(user_id)
+    if not budget or budget <= 0:
+        return None
+    spent = await month_to_date_uzs_total(user_id)
+    pct = int(spent / budget * 100)
+
+    month_label = tasks.now_local().strftime("%Y-%m")
+    alert_raw = await db.kv_get(_alert_key(user_id, month_label))
+    already_notified = int(alert_raw) if alert_raw else 0
+
+    for threshold in _ALERT_THRESHOLDS:
+        if pct >= threshold and already_notified < threshold:
+            await db.kv_set(_alert_key(user_id, month_label), str(threshold))
+            if threshold >= 100:
+                return (
+                    f"🔴 Bu oy byudjetdan oshib ketdingiz: {fmt_amount(spent, 'UZS')} / "
+                    f"{fmt_amount(budget, 'UZS')} ({pct}%)."
+                )
+            return (
+                f"🟠 Bu oy byudjetning {pct}% i sarflandi: {fmt_amount(spent, 'UZS')} / "
+                f"{fmt_amount(budget, 'UZS')}."
+            )
+    return None
 
 
 def render_summary(data: dict, label: str) -> str:
