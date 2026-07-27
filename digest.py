@@ -23,6 +23,7 @@ from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot
 
+import expenses
 import redis_client
 import tasks
 import task_assistant
@@ -164,6 +165,17 @@ async def build_digest(chat_id: int) -> str:
         lines.extend(_fmt(t, with_date=True) for t in upcoming[:5])
     if done_yesterday:
         lines.append(f"\n✅ Kecha bajarildi: {len(done_yesterday)} ta")
+
+    if expenses.available():
+        budget = await expenses.get_budget(chat_id)
+        if budget:
+            spent = await expenses.month_to_date_uzs_total(chat_id)
+            pct = int(spent / budget * 100)
+            emoji = "🔴" if pct >= 100 else "🟠" if pct >= 80 else "💰"
+            lines.append(
+                f"\n{emoji} Byudjet: {expenses.fmt_amount(spent, 'UZS')} / "
+                f"{expenses.fmt_amount(budget, 'UZS')} ({pct}%)"
+            )
 
     if not (overdue or today or upcoming):
         lines.append("\nBugunga rejalashtirilgan vazifa yo'q. /addtask bilan qo'shishingiz mumkin.")
