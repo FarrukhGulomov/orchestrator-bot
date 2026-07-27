@@ -42,15 +42,55 @@ _TRIGGER_WORDS = (
     "напомни", "напоминание", "задача", "напоминай",
     # English
     "remind", "reminder", "todo", "to-do",
+    # Payment / document deadline phrasing — a FUTURE obligation ("ijara
+    # puli 5-avgustgacha to'lash kerak", "litsenziya muddati tugaydi") is
+    # a reminder just as much as an explicit "eslat", but the user never
+    # says the word "eslat" when mentioning one. Listed separately from
+    # the money words in expenses.py, which only fire on ALREADY-spent
+    # money — see the ordering note where this module is called in bot.py.
+    "muddat", "tugaydi", "tugashi", "amal qiladi", "to'lash kerak",
+    "to'lashim kerak", "to'lanishi kerak", "to'lov qilish kerak",
+    "муддат", "тугайди", "тугаши", "тўлаш керак", "тўлашим керак",
+    "obuna", "обуна", "ijara", "ижара", "litsenziya", "лицензия",
+    "shartnoma", "шартнома", "sug'urta", "суғурта",
+    "срок", "истекает", "истекать", "оплатить до", "аренда", "подписка",
+    "deadline", "due date", "expire", "expires", "expiry", "renewal",
 )
 
-PRIORITY_EMOJI = {"low": "🟢", "medium": "🟡", "high": "🟠", "urgent": "🔴"}
-_RECURRENCE_LABEL = {"none": "", "daily": " (har kuni)", "weekdays": " (ish kunlari)", "weekly": " (har hafta)"}
+# "kerak"/"need to"-style obligation words are FAR too common in ordinary
+# messages to trigger on their own ("yordam kerak" = "need help" is not a
+# task). But combined with a date/time signal, "<vaqt> ... kerak" is exactly
+# how a deadline is naturally phrased ("ertaga 15:00 da hisobotni
+# topshirishim kerak" — the bot's OWN /examples card promises this gets
+# auto-detected, so this pairing is what actually makes that true).
+_OBLIGATION_WORDS = (
+    "kerak", "керак", "нужно", "надо", "need to", "have to", "must ",
+)
+_TIME_SIGNAL_WORDS = (
+    "bugun", "ertaga", "indinga", "soat", "kuni", "kungacha", "gacha",
+    "haftaga", "oyiga", "yiliga",
+    "бугун", "эртага", "индинга", "соат", "кунгача", "гача",
+    "завтра", "сегодня", "через", "до ",
+    "today", "tomorrow",
+)
 
 
 def looks_like_task(text: str) -> bool:
     low = text.lower()
-    return any(w in low for w in _TRIGGER_WORDS)
+    if any(w in low for w in _TRIGGER_WORDS):
+        return True
+    has_obligation = any(w in low for w in _OBLIGATION_WORDS)
+    if not has_obligation:
+        return False
+    has_time_signal = any(ch.isdigit() for ch in low) or any(w in low for w in _TIME_SIGNAL_WORDS)
+    return has_time_signal
+
+
+PRIORITY_EMOJI = {"low": "🟢", "medium": "🟡", "high": "🟠", "urgent": "🔴"}
+_RECURRENCE_LABEL = {
+    "none": "", "daily": " (har kuni)", "weekdays": " (ish kunlari)",
+    "weekly": " (har hafta)", "monthly": " (har oy)",
+}
 
 
 _CLASSIFY_SYSTEM = f"""
@@ -64,23 +104,36 @@ Respond with ONLY this JSON, no prose:
   "due_in_minutes": <integer minutes from NOW until the deadline/reminder time>,
   "complexity": "low"|"medium"|"high",
   "priority": "low"|"medium"|"high"|"urgent",
-  "recurrence": "none"|"daily"|"weekdays"|"weekly",
+  "recurrence": "none"|"daily"|"weekdays"|"weekly"|"monthly",
   "suggested_agent": "<one of: {", ".join(AGENTS.keys())}, or null>"}}
 
 RULES:
-- is_task=true only if the user clearly wants something remembered/scheduled/reminded
-  ("eslat", "eslatib tur", "vazifa qo'sh", "remind me", "напомни", a task with a
-  time, or a recurring routine like "har kuni soat 9da"). Ordinary questions or
-  requests for immediate help are NOT tasks — is_task=false for those.
-- due_in_minutes: resolve relative time expressions ("bugun soat 15:00", "ertaga",
-  "2 soatdan keyin", "har kuni 9:00") against the CURRENT LOCAL TIME given below.
-  If NO time is mentioned at all, default to 180 (3 hours from now).
+- is_task=true when the user either (a) clearly wants something remembered/
+  scheduled/reminded ("eslat", "eslatib tur", "vazifa qo'sh", "remind me",
+  "напомни", a recurring routine like "har kuni soat 9da"), OR (b) mentions a
+  FUTURE payment/document/subscription deadline they still need to act on —
+  rent, a bill, a loan installment, a subscription renewal, a license or
+  contract expiry ("ijara puli 5-avgustgacha to'lash kerak", "litsenziya
+  muddati 1-sentabrda tugaydi", "obunani yangilash kerak"). Ordinary
+  questions, price questions, and requests for immediate help are NOT tasks.
+  Money the user says they ALREADY spent ("taksiga 30 ming ketdi") is NOT a
+  task either — that is an expense record, a different feature; is_task=false
+  for it so it can be captured there instead.
+- due_in_minutes: resolve relative time expressions ("bugun soat 15:00",
+  "ertaga", "2 soatdan keyin", "har kuni 9:00") against the CURRENT LOCAL TIME
+  given below. If a calendar date is mentioned but no clock time (typical for
+  payment deadlines, e.g. "5-avgustgacha"), use 09:00 local time on that date.
+  If NO time or date is mentioned at all, default to 180 (3 hours from now).
 - complexity: estimate how much focused work the task itself needs (low = quick
   5-20 min item, medium = ~1-2 hours, high = 3+ hours / multi-step deliverable).
 - priority: how important/urgent it reads as (deadlines, "muhim", "urgent", "zudlik
-  bilan" -> high/urgent; casual reminders -> low/medium).
+  bilan" -> high/urgent; casual reminders -> low/medium). A financial or legal
+  deadline (rent, loan, license, contract) defaults to "high" — missing it has
+  a real cost — unless the user's own words signal otherwise.
 - recurrence: "daily" for "har kuni"/"every day", "weekdays" for "ish kunlari",
-  "weekly" for "har hafta", else "none".
+  "weekly" for "har hafta", "monthly" for "har oy"/"every month"/a recurring
+  bill or rent with no explicit period stated (rent and subscriptions are
+  monthly by default), else "none".
 - suggested_agent: which specialist would help EXECUTE this task if the user later
   asks for help (e.g. "SQL hisobot tayyorlash" -> data_analyst). null if it's a
   purely personal reminder with no specialist angle.

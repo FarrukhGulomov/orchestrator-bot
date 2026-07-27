@@ -18,12 +18,15 @@ enough to actually START and FINISH the estimated work, scaled by how
 complex the task is (low/medium/high -> ~20/90/240 minutes of raw effort,
 plus a 30% safety buffer). High/urgent-priority tasks additionally get a
 FINAL nudge shortly before the deadline as a last call. Recurring tasks
-(daily/weekdays/weekly) reschedule themselves after each firing.
+(daily/weekdays/weekly/monthly) reschedule themselves after each firing —
+"monthly" exists specifically for rent/subscription/utility-bill reminders,
+which are the most common recurring REAL-WORLD deadline shape.
 """
 
 import json
 import logging
 import uuid
+from calendar import monthrange
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -41,7 +44,7 @@ except Exception:  # noqa: BLE001 — bad/missing tz data must not crash startup
     TZ = ZoneInfo("Asia/Tashkent")
 
 STATUSES = {"pending", "done", "cancelled"}
-RECURRENCES = {"none", "daily", "weekdays", "weekly"}
+RECURRENCES = {"none", "daily", "weekdays", "weekly", "monthly"}
 PRIORITIES = {"low", "medium", "high", "urgent"}
 COMPLEXITIES = {"low", "medium", "high"}
 
@@ -108,6 +111,15 @@ def next_occurrence(due_at: datetime, recurrence: str) -> datetime:
         return due_at + timedelta(days=1)
     if recurrence == "weekly":
         return due_at + timedelta(weeks=1)
+    if recurrence == "monthly":
+        # Calendar-month add on the USER'S local date (a rent due "on the
+        # 5th" must stay the 5th local, not drift with a fixed-days count),
+        # clamped to the target month's real length (31 Jan -> 28/29 Feb).
+        local = due_at.astimezone(TZ)
+        year = local.year + (1 if local.month == 12 else 0)
+        month = 1 if local.month == 12 else local.month + 1
+        day = min(local.day, monthrange(year, month)[1])
+        return local.replace(year=year, month=month, day=day).astimezone(timezone.utc)
     if recurrence == "weekdays":
         nxt = due_at + timedelta(days=1)
         # Skip Sat/Sun by the USER'S local calendar date, not UTC — due_at is
