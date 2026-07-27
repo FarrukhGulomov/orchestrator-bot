@@ -615,6 +615,9 @@ AGENT_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
         ("scoring", "kredit skoring, PD/LGD/EAD, fraud"),
         ("insurance", "kredit sug'urtasi, polis, premiya hisobi"),
     ]),
+    ("Shaxsiy hayot", [
+        ("personal_assistant", "sog'liq, shaxsiy moliya, kunlik reja, hayotiy maslahat"),
+    ]),
 ]
 
 _RELEVANCE_SYSTEM = """

@@ -71,6 +71,11 @@ Banking domain:
 - integration          : REST/SOAP/Kafka/ESB integration design, OpenAPI spec, event-driven architecture
 - scoring              : credit scorecard, decision rules, PD/LGD/EAD, fraud detection, IFRS 9
 - insurance            : credit life insurance, premium calculation, policy lifecycle, claims processing
+Personal life (NOT work — route here whenever the message is about the
+user's own life rather than their professional BA/IT/banking work):
+- personal_assistant   : health & lifestyle, personal finance/budgeting/saving,
+  daily planning & habits, motivation, relationships/family, any general
+  life advice or decision that isn't a business/technical deliverable
 
 2) WHAT KIND OF REQUEST:
 - idea        : conceptual suggestion, high-level proposal, brainstorm
