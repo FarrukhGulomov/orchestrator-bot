@@ -17,6 +17,79 @@ class Agent:
 
 
 # ---------------------------------------------------------------------------
+# Personas: a human name + emoji per specialist.
+#
+# WHY: "Senior Business Analyst javob berdi" reads like software; "Nodira
+# javob berdi" reads like a colleague — and in a group chat it turns 26
+# roles into a visible TEAM without needing 26 separate Telegram bots (one
+# bot token can only ever have one name/avatar, so signing the message is
+# the only way to get per-agent identity out of a single bot).
+#
+# Names are also ADDRESSABLE: "Nodira, buni ko'rib chiq" routes straight to
+# that specialist, no command needed (see bot.py's _agent_from_name_prefix).
+# So they're chosen to be short, distinct, and easy to type — and to avoid
+# colliding with real people in this deployment (the admin and their known
+# contacts), since a collision would misroute a message that merely
+# MENTIONS someone by name.
+# ---------------------------------------------------------------------------
+AGENT_PERSONAS: dict[str, tuple[str, str]] = {
+    # BA & Analysis
+    "ba": ("Nodira", "👩‍💼"),
+    "data_analyst": ("Sardor", "📊"),
+    "bi_analyst": ("Kamola", "📈"),
+    "process_analyst": ("Bekzod", "🔄"),
+    "financial_analyst": ("Dilnoza", "💰"),
+    "market_analyst": ("Jasur", "🎯"),
+    "requirements_engineer": ("Malika", "📋"),
+    "data_governance": ("Rustam", "🔐"),
+    # Product & Delivery
+    "pm": ("Aziza", "🚀"),
+    "system_analyst": ("Timur", "🏗"),
+    "qa": ("Gulnora", "🧪"),
+    "project_manager": ("Shuhrat", "📅"),
+    "tech_consultant": ("Davron", "💡"),
+    # Engineering
+    "backend": ("Otabek", "⚙️"),
+    "frontend": ("Zilola", "🎨"),
+    "devops": ("Anvar", "☁️"),
+    "product_designer": ("Madina", "✏️"),
+    # Specialists
+    "translator": ("Laylo", "🌐"),
+    "diagram": ("Umid", "📐"),
+    "technical_analyst": ("Sanjar", "🔍"),
+    "jira": ("Nigora", "🎫"),
+    # Banking domain
+    "credit_conveyor": ("Elyor", "🏦"),
+    "core_banking": ("Zafar", "💳"),
+    "integration": ("Bobur", "🔌"),
+    "scoring": ("Nilufar", "📉"),
+    "insurance": ("Shahnoza", "☂️"),
+}
+
+
+def persona(agent_key: str) -> tuple[str, str]:
+    """(name, emoji) for an agent key. Falls back to the key itself so a
+    newly added agent without a persona still renders sensibly."""
+    return AGENT_PERSONAS.get(agent_key, (agent_key.replace("_", " ").title(), "🤖"))
+
+
+def agent_label(agent: "Agent") -> str:
+    """'👩‍💼 Nodira · Senior Business Analyst' — the one place this string is
+    built, so signatures, /agents listings and chain headers never drift."""
+    name, emoji = persona(agent.key)
+    return f"{emoji} {name} · {agent.display_name}"
+
+
+def agent_key_by_name(name: str) -> str | None:
+    """Reverse lookup for name-addressing ('Nodira, ...' -> 'ba')."""
+    target = (name or "").strip().lower()
+    for key, (person, _emoji) in AGENT_PERSONAS.items():
+        if person.lower() == target:
+            return key
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Shared rules injected into every persona
 # ---------------------------------------------------------------------------
 _COMMON = """
