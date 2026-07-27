@@ -87,7 +87,14 @@ import redis_client
 import task_assistant
 import tasks
 import web_search
-from agents import Agent, TEAM_MEMORY_HEADER, get_agent
+from agents import (
+    Agent,
+    TEAM_MEMORY_HEADER,
+    agent_key_by_name,
+    agent_label,
+    get_agent,
+    persona,
+)
 from config import settings
 from file_processing import SUPPORTED_SUMMARY, extract, transcribe_audio
 from llm_clients import claude_generate, claude_generate_fast, claude_generate_json, parse_llm_json
@@ -824,6 +831,46 @@ def _header(route: Route) -> str:
     )
 
 
+def _signature(agent: Agent, others: list[str] | None = None) -> str:
+    """Who is speaking — '👩‍💼 Nodira · Senior Business Analyst'. Distinct from
+    _header (a debug metadata line, off by default): this is the persona
+    identity that makes the roster feel like a team, on by default.
+
+    `others` names the specialists who also contributed to a synthesized
+    answer, so a panel reply doesn't misrepresent itself as one person's
+    work."""
+    if not settings.show_agent_signature:
+        return ""
+    line = agent_label(agent)
+    if others:
+        names = ", ".join(persona(k)[0] for k in others)
+        line += f" (+ {names})"
+    return f"{line}\n\n"
+
+
+def _agent_from_name_prefix(text: str) -> tuple[str | None, str]:
+    """Address a specialist by name: 'Nodira, buni ko'rib chiq' ->
+    ('ba', 'buni ko'rib chiq'). Returns (agent_key_or_None, remaining_text).
+
+    Deterministic and free — no extra LLM call — and it beats the
+    classifier when the user has explicitly named who they want. Only the
+    FIRST token is considered, so a message that merely mentions the name
+    later ("...buni Nodira aytdi") routes normally."""
+    stripped = (text or "").lstrip()
+    if not stripped:
+        return None, text
+    first, _, rest = stripped.partition(" ")
+    # Tolerate "Nodira," / "Nodira:" / "@Nodira" — the natural ways people
+    # address someone in chat.
+    candidate = first.strip(",:;!?").lstrip("@")
+    key = agent_key_by_name(candidate)
+    if not key:
+        return None, text
+    remaining = rest.strip()
+    # "Nodira" alone is a greeting, not a task — don't strip it to nothing.
+    return (key, remaining) if remaining else (key, text)
+
+
 async def _answer_with_agent(route: Route, system_prompt: str, messages: list[dict]) -> str:
     """All agents use Claude — model choice (Sonnet vs Haiku) is in route.model."""
     return await claude_generate(system_prompt, messages, model=route.model)
@@ -1064,12 +1111,28 @@ async def _process_inner(
     profile_uid = message.from_user.id if _profile_eligible(message) else None
     profile_worth_extracting = bool(profile_uid) and len(user_text) >= 12
 
+    # Explicit name-addressing wins over the classifier: if the user wrote
+    # "Nodira, ..." they've already chosen the specialist, so don't let a
+    # probabilistic router override them (see _agent_from_name_prefix).
+    named_key, stripped_text = _agent_from_name_prefix(user_text)
+    if named_key:
+        user_text = stripped_text
+
     last = await history.get_last_route(chat_id)
     route = await classify(
         user_text,
-        last_agent=last[0] if last else None,
+        last_agent=named_key or (last[0] if last else None),
         last_type=last[1] if last else None,
     )
+    if named_key:
+        route.agent = get_agent(named_key)
+        # route.model is left as classified: model_for() picks purely on
+        # complexity, not on which agent answers, so the classifier's
+        # choice is still the right one for this request.
+        # A named specialist answers personally — a chain/panel would put
+        # other voices in front of the one the user actually asked for.
+        route.execution_chain = []
+        route.collaborators = []
     if forced_type:
         route.request_type = get_request_type(forced_type)
     if forced_document:
@@ -1171,7 +1234,11 @@ async def _process_inner(
         await history.append(chat_id, route.agent.key, "assistant", body)
         await history.set_last_route(chat_id, route.agent.key, route.request_type.key)
         footer = await _maybe_create_tickets(route, user_text, body)
-        sent = await _send_long(message, _header(route) + body + footer + truncation_notice, reply_mode=reply_mode)
+        sent = await _send_long(
+            message,
+            _header(route) + _signature(route.agent, route.collaborators) + body + footer + truncation_notice,
+            reply_mode=reply_mode,
+        )
         await _offer_quick_actions(message, sent, user_text, body)
         if route.request_type.creates_ticket:
             asyncio.create_task(_maybe_extract_memory(chat_id, user_text, body))
@@ -1218,7 +1285,11 @@ async def _process_inner(
     await history.set_last_route(chat_id, route.agent.key, route.request_type.key)
 
     footer = await _maybe_create_tickets(route, user_text, body)
-    sent = await _send_long(message, _header(route) + body + footer + truncation_notice, reply_mode=reply_mode)
+    sent = await _send_long(
+        message,
+        _header(route) + _signature(route.agent) + body + footer + truncation_notice,
+        reply_mode=reply_mode,
+    )
     await _offer_quick_actions(message, sent, user_text, body)
     if route.request_type.creates_ticket:
         asyncio.create_task(_maybe_extract_memory(chat_id, user_text, body))
@@ -1365,7 +1436,7 @@ async def _run_sequential_chain(
             logger.exception("Sequential chain agent=%s failed", agent_key)
             body = f"⚠️ {agent.display_name}: {exc}"
 
-        outputs.append((agent.display_name, body))
+        outputs.append((agent_label(agent), body))
         await history.append(chat_id, agent_key, "user", user_text)
         await history.append(chat_id, agent_key, "assistant", body)
 
@@ -1683,7 +1754,7 @@ async def cmd_agents(message: Message) -> None:
             if agent is None:
                 continue
             listed.add(key)
-            rows.append(f"• {agent.display_name} — {blurb}")
+            rows.append(f"• {agent_label(agent)} — {blurb}")
         if rows:
             lines.append(f"\n**{group_name}:**")
             lines.extend(rows)
@@ -1691,9 +1762,10 @@ async def cmd_agents(message: Message) -> None:
     extra = [a for k, a in AGENTS.items() if k not in listed]
     if extra:
         lines.append("\n**Boshqa:**")
-        lines.extend(f"• {a.display_name}" for a in extra)
+        lines.extend(f"• {agent_label(a)}" for a in extra)
     lines.append(
-        "\nShunchaki savolingizni yozing — o'zim to'g'ri mutaxassisga yo'naltiraman."
+        "\nShunchaki savolingizni yozing — o'zim to'g'ri mutaxassisga yo'naltiraman.\n"
+        "Yoki to'g'ridan-to'g'ri ismi bilan murojaat qiling: \"Nodira, talablarni yozib ber\"."
     )
     await _send_long(message, "\n".join(lines))
 
@@ -1772,11 +1844,13 @@ async def cmd_status(message: Message) -> None:
     lines.append(f"\n**Faol agentlar ({len(AGENTS)} ta):**")
     listed: set[str] = set()
     for group_name, members in AGENT_GROUPS:
-        names = [AGENTS[k].display_name for k, _ in members if k in AGENTS]
+        # Persona names only — the compact comma list would be unreadable
+        # with full role titles; /agents shows name + role + blurb.
+        names = [persona(k)[0] for k, _ in members if k in AGENTS]
         listed.update(k for k, _ in members if k in AGENTS)
         if names:
             lines.append(f"  _{group_name}:_ " + ", ".join(names))
-    extra_names = [a.display_name for k, a in AGENTS.items() if k not in listed]
+    extra_names = [persona(k)[0] for k, _a in AGENTS.items() if k not in listed]
     if extra_names:
         lines.append("  _Boshqa:_ " + ", ".join(extra_names))
     lines.append("\nTo'liq ro'yxat va tavsiflar: /agents")

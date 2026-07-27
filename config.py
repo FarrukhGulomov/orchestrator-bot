@@ -246,6 +246,14 @@ class Settings:
         default_factory=lambda: os.getenv("WATCH_GROUP_MENTIONS", "true").lower() == "true"
     )
 
+    # Sign each reply with the answering specialist's name+emoji ("👩‍💼 Nodira
+    # · Senior Business Analyst"). Turns the agent roster into a visible team
+    # — the only way to get per-agent identity from a single bot token, since
+    # Telegram ties one name/avatar to one bot. Set false for bare answers.
+    show_agent_signature: bool = field(
+        default_factory=lambda: os.getenv("SHOW_AGENT_SIGNATURE", "true").lower() == "true"
+    )
+
     # --- Output metadata header --------------------------------------------
     show_metadata_header: bool = field(
         default_factory=lambda: os.getenv("SHOW_METADATA_HEADER", "false").lower() == "true"
