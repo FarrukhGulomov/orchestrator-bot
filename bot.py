@@ -72,6 +72,7 @@ import access_control
 import business_copilot
 import decisions as decisions_store
 import digest
+import expenses
 import document_generation as docgen
 import github_integration
 import db
@@ -245,7 +246,7 @@ async def _handle_onboarding_step(message: Message, uid: int) -> bool:
 # THEM every day, not the other way around).
 # --------------------------------------------------------------------------
 WELCOME_TOUR_TEXT = (
-    "🚀 Har kuni foyda beradigan 4 ta imkoniyat:\n\n"
+    "🚀 Har kuni foyda beradigan imkoniyatlar:\n\n"
     "1️⃣ Savol-javob — shunchaki yozing:\n"
     "\"Mijozlar oqimi kamaydi, sabablarini qanday tahlil qilay?\"\n\n"
     "2️⃣ Vazifa/eslatma — oddiy tilda:\n"
@@ -254,6 +255,8 @@ WELCOME_TOUR_TEXT = (
     "/proposal CRM joriy etish bo'yicha taklif\n\n"
     "4️⃣ Uchrashuv protokoli — yig'ilish yozuvini /minutes bilan yuboring → "
     "qarorlar va vazifalar avtomatik ajratiladi\n\n"
+    "5️⃣ Xarajat hisobi — \"taksiga 30 ming\" deb yozing → yozib boraman, "
+    "/xarajatlar bilan oylik hisobot\n\n"
     "☀️ Har kuni ertalab kunlik reja (vazifalaringiz, muddatlar, eslatmalar) "
     "olib turishni xohlaysizmi?"
 )
@@ -2894,6 +2897,92 @@ async def handle_tour_callback(callback: CallbackQuery, bot: Bot) -> None:
     await callback.answer()
 
 
+async def _try_log_expense(message: Message, uid: int, chat_id: int, text: str) -> bool:
+    """Parse and store a spend mention. Returns True if it was recorded (so
+    the caller skips the normal AI pipeline). Any failure returns False and
+    the message is answered normally — a missed capture is a small loss, a
+    hijacked conversation is a big one."""
+    parsed = await expenses.extract(text)
+    if not parsed:
+        return False
+    expense_id = await expenses.add(
+        uid, chat_id, parsed["amount"], parsed["currency"], parsed["category"], parsed["note"],
+    )
+    if expense_id is None:
+        return False
+    await message.answer(
+        expenses.render_confirmation(
+            parsed["amount"], parsed["currency"], parsed["category"], parsed["note"], expense_id,
+        ),
+        parse_mode="Markdown",
+    )
+    return True
+
+
+@dp.message(Command("xarajat", "expense"))
+async def cmd_expense(message: Message, command: CommandObject) -> None:
+    """Explicit expense entry — the same parser as the automatic capture,
+    for when the user wants to be sure it's recorded as a spend."""
+    chat_id = message.chat.id
+    if not _is_allowed(chat_id):
+        return
+    if not expenses.available():
+        await message.answer(
+            "💸 Xarajat hisobi uchun PostgreSQL kerak (moliyaviy yozuvlar "
+            "restartda yo'qolmasligi uchun).\nRailway'da DATABASE_URL qo'shing."
+        )
+        return
+    text = (command.args or "").strip()
+    if not text:
+        await message.answer(
+            "Xarajatni yozing:\n/xarajat taksiga 30 ming\n\n"
+            "Yoki shunchaki oddiy xabar sifatida yozavering — o'zim tushunaman.\n"
+            "Hisobot: /xarajatlar"
+        )
+        return
+    uid = message.from_user.id if message.from_user else 0
+    if not await _try_log_expense(message, uid, chat_id, text):
+        await message.answer(
+            "Buni xarajat sifatida tushunolmadim. Masalan: /xarajat obed 45 ming"
+        )
+
+
+@dp.message(Command("xarajatlar", "expenses"))
+async def cmd_expenses(message: Message, command: CommandObject) -> None:
+    chat_id = message.chat.id
+    if not _is_allowed(chat_id):
+        return
+    if not expenses.available():
+        await message.answer(
+            "💸 Xarajat hisobi uchun PostgreSQL kerak — Railway'da DATABASE_URL qo'shing."
+        )
+        return
+    period = (command.args or "").strip().lower() or "oy"
+    since, until, label = expenses.period_bounds(period)
+    uid = message.from_user.id if message.from_user else 0
+    data = await expenses.summary(uid, since, until)
+    if data is None:
+        await message.answer("⚠️ Hisobotni olishda xatolik. Keyinroq urinib ko'ring.")
+        return
+    await _send_long(message, expenses.render_summary(data, label))
+
+
+@dp.message(Command("xarajatochir", "delexpense"))
+async def cmd_delete_expense(message: Message, command: CommandObject) -> None:
+    chat_id = message.chat.id
+    if not _is_allowed(chat_id):
+        return
+    arg = (command.args or "").strip().split()[0] if command.args else ""
+    if not arg.isdigit():
+        await message.answer("O'chirish uchun ID yozing: /xarajatochir 42\n(ID lar /xarajatlar da)")
+        return
+    uid = message.from_user.id if message.from_user else 0
+    if await expenses.delete(uid, int(arg)):
+        await message.answer("🗑 O'chirildi.")
+    else:
+        await message.answer("Bunday yozuv topilmadi (yoki u sizniki emas).")
+
+
 @dp.message(Command("search", "izla"))
 async def cmd_search(message: Message, command: CommandObject) -> None:
     """Explicit live web search. Normal messages get searched automatically
@@ -3164,6 +3253,19 @@ async def handle_text(message: Message, bot: Bot) -> None:
                     reply_markup=task_assistant.confirmation_keyboard(task.id),
                 )
                 return
+        # Natural-language expense capture ("taksiga 30 ming"). Runs AFTER
+        # task detection on purpose: "ertaga 500 ming to'lashim kerak" is a
+        # future obligation (a task), not money already spent — and the
+        # extractor is instructed to reject planned payments too, so the two
+        # can't both claim the same message.
+        if (
+            message.chat.type == "private"
+            and expenses.available()
+            and expenses.looks_like_expense(user_text)
+        ):
+            uid = message.from_user.id if message.from_user else 0
+            if await _try_log_expense(message, uid, chat_id, user_text):
+                return
         # @mention, reply-to-bot, or private chat → respond normally
         await _process(message, bot, user_text, forced_type=None)
         return
@@ -3296,6 +3398,8 @@ _USER_COMMANDS: list[tuple[str, str]] = [
     ("start", "Bot haqida va asosiy buyruqlar"),
     ("examples", "Nima qila olaman — misollar bilan"),
     ("search", "Internetdan izlash"),
+    ("xarajat", "Xarajat yozish"),
+    ("xarajatlar", "Xarajatlar hisoboti"),
     ("agents", "Barcha mutaxassislar ro'yxati"),
     ("kickoff", "Jamoa bilan birgalikda ishlash"),
     ("proposal", "Word + PDF hujjat tayyorlash"),
