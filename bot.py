@@ -72,6 +72,7 @@ import access_control
 import business_copilot
 import decisions as decisions_store
 import digest
+import monthly_report
 import expenses
 import document_generation as docgen
 import github_integration
@@ -2123,6 +2124,39 @@ async def cmd_week(message: Message) -> None:
     await _send_long(message, await digest.build_week(message.chat.id))
 
 
+@dp.message(Command("hisobot", "report"))
+async def cmd_report(message: Message) -> None:
+    """Downloadable Word+PDF monthly snapshot: open/completed tasks,
+    decisions, and expense-by-category totals. Deterministic — no LLM
+    call, reuses document_generation's renderer with a hand-built content
+    dict instead of an LLM-generated one (same pattern as /week's
+    from-the-store-not-the-model philosophy)."""
+    chat_id = message.chat.id
+    if not _is_allowed(chat_id):
+        return
+    uid = message.from_user.id if message.from_user else 0
+    status = await message.answer("📄 Oylik hisobotni tayyorlayapman...")
+    try:
+        content = await monthly_report.build_report_content(chat_id, uid)
+        docx_bytes = docgen.render_docx(content)
+        pdf_bytes = docgen.render_pdf(content)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Monthly report generation failed")
+        await status.edit_text(f"⚠️ Hisobotni tayyorlashda xatolik: {exc}")
+        return
+    try:
+        await status.delete()
+    except TelegramBadRequest:
+        pass
+    title = content.get("title") or "Hisobot"
+    slug = re.sub(r"[^a-zA-Z0-9]+", "_", title)[:50].strip("_") or "hisobot"
+    await message.answer_document(
+        BufferedInputFile(docx_bytes, filename=f"{slug}.docx"),
+        caption=f"📄 {title}\n\n{content.get('intro', '')}"[:1000],
+    )
+    await message.answer_document(BufferedInputFile(pdf_bytes, filename=f"{slug}.pdf"))
+
+
 @dp.message(Command("decision"))
 async def cmd_decision(message: Message, command: CommandObject) -> None:
     if not _is_allowed(message.chat.id):
@@ -3500,6 +3534,7 @@ _USER_COMMANDS: list[tuple[str, str]] = [
     ("xarajatlar", "Xarajatlar hisoboti"),
     ("byudjet", "Oylik byudjet o'rnatish/ko'rish"),
     ("qidir", "Vazifa/qaror/xotira/xarajat qidirish"),
+    ("hisobot", "Oylik hisobot (Word + PDF)"),
     ("agents", "Barcha mutaxassislar ro'yxati"),
     ("kickoff", "Jamoa bilan birgalikda ishlash"),
     ("proposal", "Word + PDF hujjat tayyorlash"),
