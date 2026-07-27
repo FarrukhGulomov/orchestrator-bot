@@ -132,6 +132,19 @@ CREATE TABLE IF NOT EXISTS decisions (
 );
 CREATE INDEX IF NOT EXISTS idx_decisions_chat ON decisions (chat_id, id);
 
+CREATE TABLE IF NOT EXISTS expenses (
+    id         SERIAL PRIMARY KEY,
+    user_id    BIGINT NOT NULL,
+    chat_id    BIGINT NOT NULL,
+    amount     NUMERIC(14, 2) NOT NULL,
+    currency   TEXT NOT NULL DEFAULT 'UZS',
+    category   TEXT NOT NULL DEFAULT 'boshqa',
+    note       TEXT NOT NULL DEFAULT '',
+    spent_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_expenses_user_date ON expenses (user_id, spent_at DESC);
+
 CREATE TABLE IF NOT EXISTS memory_facts (
     id         SERIAL PRIMARY KEY,
     chat_id    BIGINT NOT NULL,
