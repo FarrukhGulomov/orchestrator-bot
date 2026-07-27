@@ -3031,6 +3031,56 @@ async def cmd_budget(message: Message, command: CommandObject) -> None:
     await message.answer("\n".join(lines))
 
 
+@dp.message(Command("qidir", "find"))
+async def cmd_find(message: Message, command: CommandObject) -> None:
+    """Substring search across everything this chat has ACCUMULATED —
+    vazifalar, qarorlar, xotira, xarajatlar — one place to find something
+    already stored instead of scrolling chat history. Distinct from
+    /search|/izla, which fetches fresh facts from the live internet."""
+    chat_id = message.chat.id
+    if not _is_allowed(chat_id):
+        return
+    query = (command.args or "").strip()
+    if not query:
+        await message.answer("Nimani qidirayotganingizni yozing:\n/qidir ijara")
+        return
+    low = query.lower()
+    uid = message.from_user.id if message.from_user else 0
+    sections: list[str] = []
+
+    all_tasks = await tasks.list_tasks(chat_id, {"pending", "done", "cancelled"})
+    task_hits = [
+        t for t in all_tasks
+        if low in t.title.lower() or low in t.description.lower()
+    ][:8]
+    if task_hits:
+        sections.append("📋 Vazifalar:\n" + "\n".join(task_assistant.format_task_line(t) for t in task_hits))
+
+    dec_hits = [d for d in await decisions_store.get_decisions(chat_id) if low in d.lower()][:8]
+    if dec_hits:
+        sections.append("📖 Qarorlar:\n" + "\n".join(f"• {d}" for d in dec_hits))
+
+    mem_hits = [m for m in await memory.get_memory(chat_id) if low in m.lower()][:8]
+    if mem_hits:
+        sections.append("🧠 Xotira:\n" + "\n".join(f"• {m}" for m in mem_hits))
+
+    if expenses.available():
+        exp_hits = await expenses.search_notes(uid, query)
+        if exp_hits:
+            exp_lines = [
+                f"`{r['id']}` {r['spent_at'].astimezone(tasks.TZ).strftime('%d-%m')} · "
+                f"{expenses.fmt_amount(r['amount'], r['currency'])} · {r['category']}"
+                + (f" ({r['note']})" if r["note"] else "")
+                for r in exp_hits
+            ]
+            sections.append("💸 Xarajatlar:\n" + "\n".join(exp_lines))
+
+    if not sections:
+        await message.answer(f"🔎 \"{query}\" bo'yicha hech narsa topilmadi.")
+        return
+    await _send_long(message, f"🔎 \"{query}\" bo'yicha natijalar:\n\n" + "\n\n".join(sections))
+
+
 @dp.message(Command("search", "izla"))
 async def cmd_search(message: Message, command: CommandObject) -> None:
     """Explicit live web search. Normal messages get searched automatically
@@ -3449,6 +3499,7 @@ _USER_COMMANDS: list[tuple[str, str]] = [
     ("xarajat", "Xarajat yozish"),
     ("xarajatlar", "Xarajatlar hisoboti"),
     ("byudjet", "Oylik byudjet o'rnatish/ko'rish"),
+    ("qidir", "Vazifa/qaror/xotira/xarajat qidirish"),
     ("agents", "Barcha mutaxassislar ro'yxati"),
     ("kickoff", "Jamoa bilan birgalikda ishlash"),
     ("proposal", "Word + PDF hujjat tayyorlash"),

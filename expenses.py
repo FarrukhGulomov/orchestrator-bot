@@ -219,6 +219,29 @@ async def delete(user_id: int, expense_id: int) -> bool:
         return False
 
 
+async def search_notes(user_id: int, query: str, limit: int = 8) -> list[dict]:
+    """Substring search over a user's own expense notes/categories — backs
+    the cross-feature /qidir command. Scoped by user_id like delete()."""
+    pool = await _pool()
+    if pool is None or not query.strip():
+        return []
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, amount, currency, category, note, spent_at
+                FROM expenses
+                WHERE user_id = $1 AND (note ILIKE $2 OR category ILIKE $2)
+                ORDER BY spent_at DESC LIMIT $3
+                """,
+                user_id, f"%{query.strip()}%", limit,
+            )
+        return [dict(r) for r in rows]
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to search expenses for user=%s", user_id)
+        return []
+
+
 async def summary(user_id: int, since: datetime, until: datetime) -> dict | None:
     """Totals per (currency, category) plus the most recent entries."""
     pool = await _pool()
