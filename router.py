@@ -274,7 +274,16 @@ async def classify(
         )
 
     agent = get_agent(agent_key)
-    model, label = model_for(agent, complexity)
+    # Always answer with the strongest configured model (Claude Sonnet in
+    # hybrid/claude mode) regardless of the classifier's complexity guess —
+    # the free-tier OpenRouter model was landing weak, generic answers on
+    # real questions (advice, analysis) that the classifier judged "low"
+    # complexity but that still deserved a real answer. Costs more per
+    # reply; that trade-off was requested explicitly. The "low" branch in
+    # model_for() still exists and is used deliberately elsewhere (see
+    # business_copilot.py / group_copilot.py) for high-frequency background
+    # triage where a weaker model is an acceptable, intentional trade-off.
+    model, label = model_for(agent, "high")
     return Route(
         agent=agent,
         model=model,
