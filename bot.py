@@ -1980,11 +1980,12 @@ async def cmd_proposal(message: Message, bot: Bot, command: CommandObject) -> No
     await _process(message, bot, command.args, forced_type=None, forced_document=True)
 
 
-@dp.message(Command("logs"))
-async def cmd_logs(message: Message, bot: Bot) -> None:
-    chat_id = message.chat.id
-    if not _is_allowed(chat_id):
-        return
+async def _fetch_and_analyze_logs(
+    message: Message, chat_id: int, fetch_logs, kind_label: str, task_hint: str,
+) -> None:
+    """Shared by /logs (runtime output) and /buildlogs (pip/apt install
+    output) — same fetch-analyze-reply shape, different Railway log stream
+    and a different analysis prompt for what "wrong" looks like in each."""
     if not settings.railway_enabled:
         await message.answer(
             "Railway integratsiyasi sozlanmagan.\n"
@@ -1992,18 +1993,18 @@ async def cmd_logs(message: Message, bot: Bot) -> None:
         )
         return
 
-    status_msg = await message.answer("📜 Server loglarini olyapman...")
+    status_msg = await message.answer(f"📜 {kind_label}ni olyapman...")
     deployment = await railway_integration.get_latest_deployment()
     if not deployment:
         await status_msg.edit_text("⚠️ Railway'dan ma'lumot olib bo'lmadi.")
         return
 
-    logs = await railway_integration.get_recent_logs(limit=300)
+    logs = await fetch_logs(limit=300)
     if logs is None:
-        await status_msg.edit_text("⚠️ Loglarni olib bo'lmadi.")
+        await status_msg.edit_text(f"⚠️ {kind_label}ni olib bo'lmadi.")
         return
     if not logs:
-        await status_msg.edit_text(f"Deployment status: {deployment.get('status')}. Loglar bo'sh.")
+        await status_msg.edit_text(f"Deployment status: {deployment.get('status')}. {kind_label} bo'sh.")
         return
 
     log_text = "\n".join(
@@ -2011,22 +2012,18 @@ async def cmd_logs(message: Message, bot: Bot) -> None:
     )[:12000]
 
     agent = get_agent("tech_consultant")
-    system_prompt = await _build_system_prompt(
-        chat_id, agent,
-        "VAZIFA: quyidagi production server loglarini tahlil qiling. "
-        "Xatolar bormi? Har birining sababi va tuzatish yo'lini ko'rsating.",
-    )
+    system_prompt = await _build_system_prompt(chat_id, agent, task_hint)
     try:
         analysis = await asyncio.wait_for(
             claude_generate(
                 system_prompt,
-                [{"role": "user", "content": f"Status: {deployment.get('status')}\n\nLoglar:\n{log_text}"}],
+                [{"role": "user", "content": f"Status: {deployment.get('status')}\n\n{kind_label}:\n{log_text}"}],
             ),
             timeout=settings.request_timeout,
         )
     except Exception as exc:
         logger.exception("Log analysis failed")
-        await status_msg.edit_text(f"⚠️ Loglarni tahlil qilishda xatolik: {exc}")
+        await status_msg.edit_text(f"⚠️ Tahlil qilishda xatolik: {exc}")
         return
 
     try:
@@ -2035,6 +2032,35 @@ async def cmd_logs(message: Message, bot: Bot) -> None:
         pass
 
     await _send_long(message, f"Status: {deployment.get('status')}\n\n{analysis}")
+
+
+@dp.message(Command("logs"))
+async def cmd_logs(message: Message, bot: Bot) -> None:
+    chat_id = message.chat.id
+    if not _is_allowed(chat_id):
+        return
+    await _fetch_and_analyze_logs(
+        message, chat_id, railway_integration.get_recent_logs, "Server loglari",
+        "VAZIFA: quyidagi production server (runtime) loglarini tahlil qiling. "
+        "Xatolar bormi? Har birining sababi va tuzatish yo'lini ko'rsating.",
+    )
+
+
+@dp.message(Command("buildlogs"))
+async def cmd_build_logs(message: Message, bot: Bot) -> None:
+    """Deploy-time pip/apt install output — distinct from /logs (the running
+    process's own output), see railway_integration.get_build_logs. Use this
+    to check whether a system dependency (e.g. ffmpeg for /uchrashuv)
+    actually installed during the last build."""
+    chat_id = message.chat.id
+    if not _is_allowed(chat_id):
+        return
+    await _fetch_and_analyze_logs(
+        message, chat_id, railway_integration.get_build_logs, "Build loglari",
+        "VAZIFA: quyidagi Railway BUILD (deploy) loglarini tahlil qiling — "
+        "pip/apt o'rnatish qadamlari muvaffaqiyatli o'tdimi? Qaysi paket "
+        "o'rnatilmadi yoki xato berdi, sababi va tuzatish yo'lini ko'rsating.",
+    )
 
 
 @dp.message(Command("readfile"))

@@ -63,6 +63,21 @@ query DeploymentLogs($deploymentId: String!, $limit: Int) {
 }
 """
 
+# Separate from deploymentLogs above: this is the pip/apt/build-step output
+# (was `apt-get install` or `pip install` in the image actually run, did it
+# succeed) — deploymentLogs is the RUNNING process's stdout/stderr and won't
+# show a build failure at all. Same "not live-tested" caveat as the rest of
+# this module (see its docstring).
+_BUILD_LOGS_QUERY = """
+query BuildLogs($deploymentId: String!, $limit: Int) {
+  buildLogs(deploymentId: $deploymentId, limit: $limit) {
+    timestamp
+    message
+    severity
+  }
+}
+"""
+
 
 def _headers() -> dict:
     return {
@@ -128,3 +143,22 @@ async def get_recent_logs(limit: int = 300) -> list[dict] | None:
     if not data:
         return None
     return data.get("deploymentLogs") or []
+
+
+async def get_build_logs(limit: int = 300) -> list[dict] | None:
+    """Returns build-step log entries (apt/pip install output, etc.) for the
+    latest deployment — use this, not get_recent_logs, to see why a system
+    dependency (ffmpeg, a pip package) didn't end up in the running image."""
+    if not settings.railway_enabled:
+        return None
+    deployment = await get_latest_deployment()
+    if not deployment:
+        return None
+    data = await asyncio.to_thread(
+        _gql_sync,
+        _BUILD_LOGS_QUERY,
+        {"deploymentId": deployment["id"], "limit": limit},
+    )
+    if not data:
+        return None
+    return data.get("buildLogs") or []
