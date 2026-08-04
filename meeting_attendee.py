@@ -50,6 +50,8 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 
+from aiogram.types import BufferedInputFile
+
 import db
 import file_processing
 import minutes as minutes_mod
@@ -315,6 +317,7 @@ async def _run_session(session: MeetingSession, bot) -> None:
                 session.status = "failed"
                 session.error = "Uchrashuvga qo'shila olmadim (interfeys elementlari topilmadi yoki host qabul qilmadi)."
                 await _notify(bot, chat_id, f"⚠️ {session.error}")
+                await _send_debug_screenshot(bot, chat_id, page, "Qo'shilishga urinilgan payt sahifa shunday ko'rinardi:")
                 return
 
             # --- Mandatory disclosure gate --------------------------------
@@ -327,6 +330,7 @@ async def _run_session(session: MeetingSession, bot) -> None:
                     "Chatga ochiq e'lon yubora olmadim — shu sabab ovoz yozib olishni "
                     "BOSHLAMADIM (yashirin yozib olish yo'q)."
                 )
+                await _send_debug_screenshot(bot, chat_id, page, "Chatga e'lon yozishga urinilgan payt sahifa shunday ko'rinardi:")
                 await _leave(page, session.platform)
                 await _notify(bot, chat_id, f"⚠️ {session.error}")
                 return
@@ -393,6 +397,18 @@ async def _notify(bot, chat_id: int, text: str) -> None:
         await bot.send_message(chat_id, text)
     except Exception:  # noqa: BLE001
         logger.exception("Failed to notify chat=%s about meeting session progress", chat_id)
+
+
+async def _send_debug_screenshot(bot, chat_id: int, page, caption: str) -> None:
+    """Best-effort — sent on join/announce failure so a selector break can
+    actually be diagnosed (what did the page look like?) instead of just
+    guessed at from a generic error message. Never raises: a page that's
+    already closed or a screenshot timeout must not mask the real error."""
+    try:
+        data = await page.screenshot(type="png", timeout=10_000)
+        await bot.send_photo(chat_id, BufferedInputFile(data, filename="uchrashuv_debug.png"), caption=caption)
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to capture/send debug screenshot for chat=%s", chat_id)
 
 
 async def _deliver_minutes(bot, chat_id: int, transcript: str) -> None:
