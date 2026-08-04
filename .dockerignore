@@ -1,0 +1,12 @@
+.git
+.github
+__pycache__
+*.pyc
+.pytest_cache
+.env
+.env.*
+!.env.example
+*.tar.gz
+test_proposal.pdf
+.venv
+venv

@@ -98,14 +98,32 @@ cd orchestrator-bot
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 cp .env.example .env
-# заполните BOT_TOKEN, GEMINI_API_KEY, GROQ_API_KEY в .env
+# заполните BOT_TOKEN и хотя бы один AI-провайдер (см. .env.example — их 7,
+# ключ нужен только для тех, которыми планируете пользоваться)
 python bot.py
 ```
 
+### Docker (для локальной разработки)
+
+```bash
+cp .env.example .env   # заполните BOT_TOKEN + хотя бы один AI-ключ
+docker compose up --build
+```
+
+Поднимает бота вместе с настоящими Postgres и Redis (вместо
+in-memory fallback), чтобы локально проверялось то же поведение
+хранения, что и в проде. На Railway это не используется — там
+свой buildpack и managed Postgres/Redis.
+
 ### Где взять ключи
 - `BOT_TOKEN` — у @BotFather в Telegram.
-- `GEMINI_API_KEY` — Google AI Studio.
-- `GROQ_API_KEY` — Groq Cloud Console.
+- Хотя бы один AI-провайдер: `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`
+  (бесплатный), `OPENAI_API_KEY`, `GEMINI_API_KEY`, `XAI_API_KEY`,
+  `DEEPSEEK_API_KEY`, `KIMI_API_KEY` — можно указать несколько сразу,
+  тогда между ними работает автоматический failover (см.
+  `PROVIDER_PRIORITY` в `.env.example`).
+- `GROQ_API_KEY` *(опционально)* — для распознавания голосовых сообщений
+  (Whisper), Groq Cloud Console.
 - `GITHUB_TOKEN` *(опционально)* — GitHub → Settings → Developer settings →
   Personal access tokens, scope `repo`. **Только в `.env` на сервере, никогда
   в чат.**
