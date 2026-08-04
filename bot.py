@@ -3667,6 +3667,9 @@ async def main() -> None:
         if await db.init_schema():
             logger.info("PostgreSQL: durable storage ENABLED for users/tasks/decisions/memory.")
             await db.migrate_from_redis()
+            applied = await db.run_migrations()
+            if applied:
+                logger.info("Applied %d pending migration(s) — see migrations/README.md", applied)
         else:
             logger.warning("DATABASE_URL set but PostgreSQL init failed — falling back to Redis/in-memory.")
     else:
