@@ -17,23 +17,28 @@ not a best-effort courtesy:
     ever starting the recorder. There is no configuration flag to skip
     the announcement — see _announce() and _run_session() below.
 
-Requires optional system dependencies this repo does NOT install by
-default (heavy, and most deployments won't use this feature):
-  - `pip install -r requirements-meeting.txt` (Playwright + Chromium)
-  - ffmpeg, on PATH
-  - PulseAudio with module-null-sink support (captures what the browser
-    tab plays out — i.e. the other participants' audio — without needing
-    a physical audio device; standard technique for headless meeting
-    bots). Not available in most PaaS buildpacks (e.g. Railway/nixpacks)
-    out of the box — see README for the apt packages to add.
-All of the above are probed lazily at call time, never at import time,
-so a deployment that never uses this feature is completely unaffected.
+The `playwright` Python package ships in requirements.txt (small — it does
+NOT pull the Chromium binary itself). Two things still can't be handled
+from inside this process and need a one-time deploy-side setup:
+  - The Chromium *browser binary* — downloaded automatically on first use
+    (see _ensure_chromium()) the first time someone runs /uchrashuv, so no
+    manual `playwright install` step is needed. Costs ~1-2 minutes on the
+    very first call after each deploy (Railway's filesystem is ephemeral
+    across deploys); every call after that is instant.
+  - OS-level shared libraries Chromium links against (Debian: libnss3,
+    libatk-bridge2.0-0, libgbm1, ...) and ffmpeg/PulseAudio for audio
+    capture — these need root+apt at BUILD time, which this process
+    cannot reach at runtime. See README's "Meeting attendee" section for
+    the one Railway env var (`NIXPACKS_APT_PKGS`) that covers this.
+Everything above is probed/attempted lazily at call time, never at import
+time, so a deployment that never uses this feature is unaffected.
 """
 
 import asyncio
 import logging
 import re
 import shutil
+import sys
 import tempfile
 import uuid
 from dataclasses import dataclass, field
@@ -135,6 +140,33 @@ class MeetingBotUnavailable(RuntimeError):
     pass
 
 
+_chromium_ready = False
+
+
+async def _ensure_chromium() -> tuple[bool, str | None]:
+    """Downloads Playwright's Chromium binary on first use. Idempotent —
+    the `playwright install` CLI already skips the download when the
+    browser is present, so this is safe to call every session; the
+    process-wide flag just avoids re-shelling out once we know it
+    succeeded this run. Only caches SUCCESS — a transient network failure
+    must not permanently lock out the next attempt."""
+    global _chromium_ready
+    if _chromium_ready:
+        return True, None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-m", "playwright", "install", "chromium",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        )
+        out, _ = await proc.communicate()
+    except Exception as exc:  # noqa: BLE001
+        return False, str(exc)[:500]
+    if proc.returncode != 0:
+        return False, (out or b"").decode(errors="replace")[-500:]
+    _chromium_ready = True
+    return True, None
+
+
 async def start(chat_id: int, user_id: int, meeting_url: str, bot) -> MeetingSession:
     """Kicks off a background session and returns immediately — joining,
     announcing, recording and transcribing all happen in the background
@@ -148,8 +180,8 @@ async def start(chat_id: int, user_id: int, meeting_url: str, bot) -> MeetingSes
     pw = _try_import_playwright()
     if pw is None:
         raise MeetingBotUnavailable(
-            "Playwright o'rnatilmagan. `pip install -r requirements-meeting.txt && "
-            "playwright install --with-deps chromium` bajaring."
+            "Playwright python paketi o'rnatilmagan. Serverni requirements.txt "
+            "yangilangan holatda qayta deploy qiling (`pip install playwright`)."
         )
     if shutil.which("ffmpeg") is None:
         raise MeetingBotUnavailable("ffmpeg topilmadi (audio yozib olish uchun kerak).")
@@ -200,6 +232,12 @@ async def _run_session(session: MeetingSession, bot) -> None:
     try:
         session.status = "joining"
         pw = _try_import_playwright()
+        ready, chromium_err = await _ensure_chromium()
+        if not ready:
+            session.status = "failed"
+            session.error = f"Chromium o'rnata olmadim: {chromium_err or 'nomaʼlum xatolik'}"
+            await _notify(bot, chat_id, f"⚠️ {session.error}")
+            return
         sink_ready = await _setup_virtual_sink(sink_name)
 
         async with pw.async_playwright() as p:

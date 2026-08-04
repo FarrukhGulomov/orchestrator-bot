@@ -1,8 +1,0 @@
-# Optional — only needed for meeting_attendee.py (MEETING_BOT_ENABLED=true).
-# Not part of requirements.txt on purpose: it pulls in a Chromium download
-# and this feature is opt-in. See README's "Meeting attendee" section for
-# the additional system packages (ffmpeg, PulseAudio) this also needs.
-#
-#   pip install -r requirements-meeting.txt
-#   playwright install --with-deps chromium
-playwright>=1.45,<2.0

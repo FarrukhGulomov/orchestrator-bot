@@ -107,6 +107,10 @@ class _FakeBot:
 
 def _patch_playwright_plumbing(monkeypatch):
     monkeypatch.setattr(ma, "_try_import_playwright", lambda: _FakePlaywrightModule())
+    # Real Chromium download needs network + takes ~a minute — not something
+    # a unit test should depend on; the dedicated test below covers the
+    # "install failed" branch on its own with an explicit mock.
+    monkeypatch.setattr(ma, "_ensure_chromium", _async_return((True, None)))
     monkeypatch.setattr(ma, "_setup_virtual_sink", _async_return(False))
     monkeypatch.setattr(ma, "_teardown_virtual_sink", _async_noop)
     monkeypatch.setattr(ma, "_leave", _async_noop)
@@ -181,6 +185,32 @@ async def test_recording_starts_only_after_disclosure_succeeds(monkeypatch, tmp_
     # No audio file was actually produced by the mock, so transcription
     # short-circuits on the empty file rather than failing the session.
     assert session.status in ("done",)
+
+
+async def test_chromium_install_failure_never_reaches_join(monkeypatch, tmp_path):
+    monkeypatch.setattr(ma.settings, "meeting_audio_dir", str(tmp_path), raising=False)
+    monkeypatch.setattr(ma, "_try_import_playwright", lambda: _FakePlaywrightModule())
+    monkeypatch.setattr(ma, "_ensure_chromium", _async_return((False, "network unreachable")))
+
+    join_called = {"called": False}
+
+    async def _fake_join(*a, **kw):
+        join_called["called"] = True
+        return True
+
+    monkeypatch.setattr(ma, "_join", _fake_join)
+
+    session = ma.MeetingSession(
+        session_id="test4", chat_id=114, user_id=222,
+        meeting_url="https://meet.google.com/abc-defg-hij",
+        platform=ma.MeetingPlatform.GOOGLE_MEET,
+    )
+    bot = _FakeBot()
+    await ma._run_session(session, bot)
+
+    assert join_called["called"] is False
+    assert session.status == "failed"
+    assert any("Chromium" in m for m in bot.sent)
 
 
 async def test_join_failure_never_reaches_announce(monkeypatch, tmp_path):
