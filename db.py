@@ -152,6 +152,35 @@ CREATE TABLE IF NOT EXISTS memory_facts (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_memory_chat ON memory_facts (chat_id, id);
+
+-- One row per LLM API call (see telemetry.py). Written on every reply, so
+-- it grows faster than every other table here — hence the narrow columns
+-- and the two indexes matching the only two access patterns: "this user's
+-- spend today" (budget check, hot path) and "everything in a window"
+-- (/xarajatai report).
+--
+-- provider is the one that ACTUALLY answered, which is not necessarily the
+-- one the router preferred — that distinction is the whole point of
+-- recording fallback_position.
+CREATE TABLE IF NOT EXISTS llm_calls (
+    id                SERIAL PRIMARY KEY,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    provider          TEXT NOT NULL,
+    model             TEXT NOT NULL,
+    tier              TEXT NOT NULL DEFAULT 'main',
+    input_tokens      INTEGER NOT NULL DEFAULT 0,
+    output_tokens     INTEGER NOT NULL DEFAULT 0,
+    cost_usd          NUMERIC(12, 6) NOT NULL DEFAULT 0,
+    latency_ms        INTEGER NOT NULL DEFAULT 0,
+    ok                BOOLEAN NOT NULL DEFAULT TRUE,
+    fallback_position INTEGER NOT NULL DEFAULT 0,
+    user_id           BIGINT,
+    chat_id           BIGINT,
+    agent_key         TEXT,
+    error             TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_llm_calls_user_day ON llm_calls (user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_llm_calls_created ON llm_calls (created_at DESC);
 """
 
 

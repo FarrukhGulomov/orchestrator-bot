@@ -34,3 +34,7 @@ Thumbs.db
 
 # Railway
 .railway/
+
+# Build artifacts / local test files — never intentionally committed
+*.tar.gz
+test_proposal.pdf

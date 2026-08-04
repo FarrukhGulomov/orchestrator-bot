@@ -200,6 +200,22 @@ class Settings:
         )
     )
 
+    # --- LLM telemetry & spend guardrails ----------------------------------
+    # Recording is on by default (it is read-only bookkeeping); the spend CAP
+    # is off by default, because a cap set carelessly locks the user out of
+    # their own assistant. Set DAILY_USER_TOKEN_BUDGET to a positive number
+    # to switch enforcement on.
+    telemetry_enabled: bool = field(
+        default_factory=lambda: os.getenv("TELEMETRY_ENABLED", "true").lower() == "true"
+    )
+    daily_user_token_budget: int = field(
+        default_factory=lambda: _int_env("DAILY_USER_TOKEN_BUDGET", 0)
+    )
+
+    @property
+    def budget_enforced(self) -> bool:
+        return self.telemetry_enabled and self.daily_user_token_budget > 0
+
     @property
     def any_ai_key_set(self) -> bool:
         return bool(
@@ -394,3 +410,67 @@ class Settings:
 
 
 settings = Settings()
+
+
+# ---------------------------------------------------------------------------
+# Model pricing — USD per 1,000,000 tokens, as (input, output).
+#
+# ESTIMATES, deliberately. Vendors reprice without notice and this table is
+# not fetched from anywhere, so every figure derived from it is an estimate
+# and must be labelled as one wherever it's shown to a user (see
+# telemetry.py). It exists to answer "roughly what is this costing, and
+# which provider dominates the bill" — not to reconcile an invoice.
+#
+# A model missing from this table is priced at 0.0 rather than guessed, so
+# an unknown model shows as free instead of silently inventing a number.
+# Override the whole table with MODEL_PRICES_JSON, e.g.
+#   MODEL_PRICES_JSON={"gpt-4.1": [2.0, 8.0]}
+# ---------------------------------------------------------------------------
+_DEFAULT_MODEL_PRICES: dict[str, tuple[float, float]] = {
+    # Anthropic
+    "claude-sonnet-4-6": (3.00, 15.00),
+    "claude-haiku-4-5-20251001": (1.00, 5.00),
+    # OpenAI
+    "gpt-4.1": (2.00, 8.00),
+    "gpt-4.1-mini": (0.40, 1.60),
+    # Google
+    "gemini-2.5-pro": (1.25, 10.00),
+    "gemini-2.5-flash": (0.30, 2.50),
+    # xAI
+    "grok-4": (3.00, 15.00),
+    # DeepSeek
+    "deepseek-chat": (0.27, 1.10),
+    # Moonshot
+    "kimi-k2-0711-preview": (0.60, 2.50),
+    # OpenRouter's free router and any ":free" pinned model cost nothing.
+    "openrouter/free": (0.0, 0.0),
+}
+
+
+def _load_model_prices() -> dict[str, tuple[float, float]]:
+    prices = dict(_DEFAULT_MODEL_PRICES)
+    raw = os.getenv("MODEL_PRICES_JSON", "").strip()
+    if not raw:
+        return prices
+    try:
+        import json
+
+        for model, pair in json.loads(raw).items():
+            prices[str(model)] = (float(pair[0]), float(pair[1]))
+    except Exception:  # noqa: BLE001 — bad override must not break startup
+        _logger.warning("MODEL_PRICES_JSON is not valid JSON of {model: [in, out]} — ignoring it.")
+    return prices
+
+
+MODEL_PRICES: dict[str, tuple[float, float]] = _load_model_prices()
+
+
+def estimate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> float:
+    """Estimated USD cost of one call. Unknown models cost 0.0 — see the
+    MODEL_PRICES comment for why that's deliberate rather than a guess."""
+    if not model:
+        return 0.0
+    in_rate, out_rate = MODEL_PRICES.get(model, (0.0, 0.0))
+    if (in_rate, out_rate) == (0.0, 0.0) and ":free" in model:
+        return 0.0
+    return (input_tokens * in_rate + output_tokens * out_rate) / 1_000_000

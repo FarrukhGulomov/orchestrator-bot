@@ -22,6 +22,7 @@ PROVIDER, before moving on to the next provider in the chain.
 
 import asyncio
 import base64
+import contextvars
 import io
 import json
 import logging
@@ -74,10 +75,39 @@ def _is_model_unavailable(exc: Exception) -> bool:
     return "404" in msg or "No endpoints found" in msg or "model not found" in msg.lower()
 
 
+def _capture_usage(usage_out: dict | None, response: object, model: str) -> None:
+    """Fill an optional caller-supplied dict with token counts from a raw
+    provider response.
+
+    An out-parameter rather than a changed return type on purpose: these
+    sync functions have other callers (the vision path calls _or_sync
+    directly), and threading a tuple through all of them would be a wide,
+    risky diff for a bookkeeping feature. Passing None — the default — keeps
+    the original behaviour exactly.
+
+    `model` is recorded here rather than by the caller because _or_sync can
+    swap to the auto-router mid-retry; this captures what actually ran.
+    """
+    if usage_out is None:
+        return
+    try:
+        import telemetry
+
+        inp, out = telemetry.extract_usage(response)
+        usage_out["input_tokens"] = inp
+        usage_out["output_tokens"] = out
+        usage_out["model"] = model
+    except Exception:  # noqa: BLE001 — never let bookkeeping break a call
+        logger.debug("usage capture failed", exc_info=True)
+
+
 # --------------------------------------------------------------------------
 # OpenRouter (OpenAI-compatible)
 # --------------------------------------------------------------------------
-def _or_sync(model: str, system: str, messages: list[dict], temperature: float, max_tokens: int) -> str:
+def _or_sync(
+    model: str, system: str, messages: list[dict], temperature: float, max_tokens: int,
+    usage_out: dict | None = None,
+) -> str:
     client = _get_or_client()
     full = [{"role": "system", "content": system}] + messages
     last_exc: Exception | None = None
@@ -90,6 +120,7 @@ def _or_sync(model: str, system: str, messages: list[dict], temperature: float, 
                 temperature=temperature,
                 max_tokens=max_tokens,
             )
+            _capture_usage(usage_out, resp, model)
             return (resp.choices[0].message.content or "").strip()
         except Exception as exc:
             last_exc = exc
@@ -190,7 +221,10 @@ def _or_vision_sync(data: bytes, mime_type: str, instruction: str) -> str:
 # --------------------------------------------------------------------------
 # Claude (Anthropic)
 # --------------------------------------------------------------------------
-def _claude_sync(model: str, system: str, messages: list[dict], temperature: float, max_tokens: int) -> str:
+def _claude_sync(
+    model: str, system: str, messages: list[dict], temperature: float, max_tokens: int,
+    usage_out: dict | None = None,
+) -> str:
     client = _get_claude_client()
     last_exc: Exception | None = None
 
@@ -200,6 +234,7 @@ def _claude_sync(model: str, system: str, messages: list[dict], temperature: flo
                 model=model, system=system, messages=messages,
                 temperature=temperature, max_tokens=max_tokens,
             )
+            _capture_usage(usage_out, resp, model)
             return (resp.content[0].text if resp.content else "").strip()
         except Exception as exc:
             last_exc = exc
@@ -287,6 +322,7 @@ def _get_compat_client(key: str, api_key: str, base_url: str):
 def _compat_sync(
     key: str, base_url: str, api_key: str, model: str,
     system: str, messages: list[dict], temperature: float, max_tokens: int,
+    usage_out: dict | None = None,
 ) -> str:
     client = _get_compat_client(key, api_key, base_url)
     full = [{"role": "system", "content": system}] + messages
@@ -296,6 +332,7 @@ def _compat_sync(
             resp = client.chat.completions.create(
                 model=model, messages=full, temperature=temperature, max_tokens=max_tokens,
             )
+            _capture_usage(usage_out, resp, model)
             return (resp.choices[0].message.content or "").strip()
         except Exception as exc:
             last_exc = exc
@@ -312,6 +349,7 @@ def _compat_sync(
 def _compat_json_sync(
     key: str, base_url: str, api_key: str, model: str,
     system: str, messages: list[dict], max_tokens: int,
+    usage_out: dict | None = None,
 ) -> str:
     client = _get_compat_client(key, api_key, base_url)
     full = [{"role": "system", "content": system + "\nRespond with ONLY valid JSON, no markdown, no prose."}] + messages
@@ -321,6 +359,7 @@ def _compat_json_sync(
             resp = client.chat.completions.create(
                 model=model, messages=full, temperature=0.0, max_tokens=max_tokens,
             )
+            _capture_usage(usage_out, resp, model)
             raw = (resp.choices[0].message.content or "").strip()
             return _strip_json_fences(raw)
         except Exception as exc:
@@ -389,24 +428,88 @@ def provider_chain_status() -> list[tuple[str, str, bool]]:
 
 def _call_main_sync(
     key: str, model: str, system: str, messages: list[dict], temperature: float, max_tokens: int,
+    usage_out: dict | None = None,
 ) -> str:
     if key == "claude":
-        return _claude_sync(model, system, messages, temperature, max_tokens)
+        return _claude_sync(model, system, messages, temperature, max_tokens, usage_out)
     if key == "openrouter":
-        return _or_sync(model, system, messages, temperature, max_tokens)
+        return _or_sync(model, system, messages, temperature, max_tokens, usage_out)
     return _compat_sync(
-        key, _COMPAT_BASE_URLS[key], _provider_api_key(key), model, system, messages, temperature, max_tokens,
+        key, _COMPAT_BASE_URLS[key], _provider_api_key(key), model, system, messages,
+        temperature, max_tokens, usage_out,
     )
 
 
-def _call_json_sync(key: str, model: str, system: str, messages: list[dict], max_tokens: int) -> str:
+def _call_json_sync(
+    key: str, model: str, system: str, messages: list[dict], max_tokens: int,
+    usage_out: dict | None = None,
+) -> str:
     if key == "claude":
-        return _claude_json_sync(system, messages, model, max_tokens)
+        return _claude_json_sync(system, messages, model, max_tokens, usage_out)
     if key == "openrouter":
-        return _or_json_sync(system, messages, model, max_tokens)
+        return _or_json_sync(system, messages, model, max_tokens, usage_out)
     return _compat_json_sync(
-        key, _COMPAT_BASE_URLS[key], _provider_api_key(key), model, system, messages, max_tokens,
+        key, _COMPAT_BASE_URLS[key], _provider_api_key(key), model, system, messages,
+        max_tokens, usage_out,
     )
+
+
+# Which (provider_key, model) actually answered the most recent
+# claude_generate()/claude_generate_json() call in THIS async task — set on
+# every successful attempt in _attempt(). Not necessarily the provider
+# router.model_for() preferred: failover may have moved on. Exists so a
+# caller can correct a model-id label AFTER the fact instead of guessing it
+# beforehand (see bot.py's _answer_with_agent, which fixes route.model_label
+# to reflect who actually answered rather than who was merely asked first).
+_last_provider: contextvars.ContextVar[tuple[str, str] | None] = contextvars.ContextVar(
+    "last_llm_provider", default=None
+)
+
+
+def last_used_provider() -> tuple[str, str] | None:
+    """(provider_key, model) for the most recent successful call, or None
+    before any call has completed in this task."""
+    return _last_provider.get()
+
+
+def provider_label(key: str) -> str:
+    """Display label for a provider key, e.g. 'ChatGPT (GPT-4.1)'."""
+    return _provider_models(key)[2] if key in _KNOWN_PROVIDERS else key
+
+
+async def _attempt(
+    call, key: str, model: str, tier: str, position: int, *args,
+) -> str:
+    """Run one provider attempt, timing it and recording the outcome either
+    way. `call` is _call_main_sync or _call_json_sync.
+
+    Recording lives here — one place, wrapping every provider attempt — so
+    a FAILED attempt is recorded too. That's what makes "provider 0 is
+    quietly 401-ing and provider 1 is silently carrying the traffic"
+    visible instead of invisible.
+    """
+    import telemetry
+
+    usage: dict = {}
+    started = time.monotonic()
+    try:
+        result = await asyncio.to_thread(call, key, model, *args, usage)
+    except Exception as exc:
+        await telemetry.record(
+            provider=key, model=usage.get("model") or model, tier=tier,
+            latency_ms=int((time.monotonic() - started) * 1000),
+            ok=False, fallback_position=position, error=str(exc)[:300],
+        )
+        raise
+    await telemetry.record(
+        provider=key, model=usage.get("model") or model, tier=tier,
+        input_tokens=usage.get("input_tokens", 0),
+        output_tokens=usage.get("output_tokens", 0),
+        latency_ms=int((time.monotonic() - started) * 1000),
+        ok=True, fallback_position=position,
+    )
+    _last_provider.set((key, usage.get("model") or model))
+    return result
 
 
 async def _generate_with_failover(
@@ -427,8 +530,9 @@ async def _generate_with_failover(
         preferred_key = "openrouter" if "/" in preferred_model else "claude"
         if preferred_key in chain:
             try:
-                return await asyncio.to_thread(
-                    _call_main_sync, preferred_key, preferred_model, system, messages, temperature, max_tokens,
+                return await _attempt(
+                    _call_main_sync, preferred_key, preferred_model, tier, 0,
+                    system, messages, temperature, max_tokens,
                 )
             except Exception as exc:
                 last_exc = exc
@@ -442,8 +546,9 @@ async def _generate_with_failover(
         main_model, fast_model, _label = _provider_models(key)
         model = main_model if tier == "main" else fast_model
         try:
-            result = await asyncio.to_thread(
-                _call_main_sync, key, model, system, messages, temperature, max_tokens,
+            result = await _attempt(
+                _call_main_sync, key, model, tier, len(tried),
+                system, messages, temperature, max_tokens,
             )
             if tried:
                 logger.info("Answered via fallback provider '%s' (tier=%s)", key, tier)
@@ -471,8 +576,9 @@ async def _generate_json_with_failover(
         preferred_key = "openrouter" if "/" in preferred_model else "claude"
         if preferred_key in chain:
             try:
-                return await asyncio.to_thread(
-                    _call_json_sync, preferred_key, preferred_model, system, messages, max_tokens,
+                return await _attempt(
+                    _call_json_sync, preferred_key, preferred_model, tier, 0,
+                    system, messages, max_tokens,
                 )
             except Exception as exc:
                 last_exc = exc
@@ -486,7 +592,10 @@ async def _generate_json_with_failover(
         main_model, fast_model, _label = _provider_models(key)
         model = main_model if tier == "main" else fast_model
         try:
-            result = await asyncio.to_thread(_call_json_sync, key, model, system, messages, max_tokens)
+            result = await _attempt(
+                _call_json_sync, key, model, tier, len(tried),
+                system, messages, max_tokens,
+            )
             if tried:
                 logger.info("Answered via fallback provider '%s' (tier=%s, JSON)", key, tier)
             return result
@@ -682,7 +791,10 @@ def parse_llm_json(raw: str):
         raise first_exc
 
 
-def _or_json_sync(system: str, messages: list[dict], model: str, max_tokens: int) -> str:
+def _or_json_sync(
+    system: str, messages: list[dict], model: str, max_tokens: int,
+    usage_out: dict | None = None,
+) -> str:
     client = _get_or_client()
     full = [{"role": "system", "content": system + "\nRespond with ONLY valid JSON, no markdown, no prose."}] + messages
     last_exc: Exception | None = None
@@ -695,6 +807,7 @@ def _or_json_sync(system: str, messages: list[dict], model: str, max_tokens: int
                 temperature=0.0,
                 max_tokens=max_tokens,
             )
+            _capture_usage(usage_out, resp, model)
             raw = (resp.choices[0].message.content or "").strip()
             return _strip_json_fences(raw)
         except Exception as exc:
@@ -716,7 +829,10 @@ def _or_json_sync(system: str, messages: list[dict], model: str, max_tokens: int
     raise last_exc  # type: ignore[misc]
 
 
-def _claude_json_sync(system: str, messages: list[dict], model: str, max_tokens: int) -> str:
+def _claude_json_sync(
+    system: str, messages: list[dict], model: str, max_tokens: int,
+    usage_out: dict | None = None,
+) -> str:
     client = _get_claude_client()
     msgs = list(messages) + [{"role": "assistant", "content": "{"}]
     last_exc: Exception | None = None
@@ -727,6 +843,7 @@ def _claude_json_sync(system: str, messages: list[dict], model: str, max_tokens:
                 model=model, system=system,
                 messages=msgs, temperature=0.0, max_tokens=max_tokens,
             )
+            _capture_usage(usage_out, resp, model)
             raw = (resp.content[0].text if resp.content else "").strip()
             return "{" + raw if not raw.startswith("{") else raw
         except Exception as exc:

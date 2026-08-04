@@ -27,6 +27,7 @@ Commands:
   /reset — clear chat history
   /status — show configuration health
   /users — admin: see everyone who's messaged the bot, approve/deny them
+  /xarajatai — admin: AI spend report (cost by day/user/provider/agent) — see telemetry.py
 
 Business copilot (automatic, no command): if the admin connects this bot to
 their own personal chats via Telegram's Settings > Business > Chatbots,
@@ -89,6 +90,7 @@ import railway_integration
 import redis_client
 import task_assistant
 import tasks
+import telemetry
 import web_search
 from agents import (
     Agent,
@@ -100,10 +102,12 @@ from agents import (
 )
 from config import settings
 from file_processing import SUPPORTED_SUMMARY, extract, transcribe_audio
+import llm_clients
 from llm_clients import (
     claude_generate,
     claude_generate_fast,
     claude_generate_json,
+    last_used_provider,
     parse_llm_json,
     provider_chain_status,
 )
@@ -485,6 +489,14 @@ class AccessGateMiddleware(BaseMiddleware):
     — it stays governed by ALLOWED_CHAT_IDS / mention-required logic below."""
 
     async def __call__(self, handler, event: Message, data):
+        # Attribute every LLM call made while handling this update to the
+        # person who sent it. Set here, before any early return, because
+        # this is the one place EVERY message passes through — including
+        # group messages, which skip the rest of this middleware. The agent
+        # is filled in later by the router (telemetry.set_agent).
+        if event.from_user:
+            telemetry.set_call_context(event.from_user.id, event.chat.id)
+
         if event.chat.type != "private" or not event.from_user:
             return await handler(event, data)
 
@@ -547,6 +559,19 @@ class AccessGateMiddleware(BaseMiddleware):
         if await access_control.is_approved(uid):
             if await _handle_onboarding_step(event, uid):
                 return
+            # Daily spend cap. Off unless DAILY_USER_TOKEN_BUDGET is set, and
+            # the admin is never capped (checked above — the admin branch has
+            # already returned by this point). Commands that cost no tokens
+            # stay usable so a capped user isn't locked out of their own data.
+            if settings.budget_enforced and not _is_free_command(event.text):
+                over, used, limit = await telemetry.over_budget(uid)
+                if over:
+                    await event.answer(
+                        f"⚠️ Bugungi AI limitingiz tugadi ({used:,} / {limit:,} token).\n\n"
+                        "Limit har kuni yarim tunda (UTC) yangilanadi. "
+                        "Shu vaqtgacha /tasks, /xarajatlar, /hisobot kabi buyruqlar ishlaydi.".replace(",", " ")
+                    )
+                    return
             return await handler(event, data)
 
         if await access_control.is_denied(uid):
@@ -565,6 +590,25 @@ class AccessGateMiddleware(BaseMiddleware):
 # were never relayed to the admin. Outer middleware runs for EVERY
 # private message before any filter, closing both holes.
 dp.message.outer_middleware(AccessGateMiddleware())
+
+# Commands that never reach an LLM — they read stored data or render it
+# deterministically. A user who has exhausted their daily token budget can
+# still use these, so a spend cap never locks someone out of their own
+# tasks, expenses or reports (see AccessGateMiddleware).
+_FREE_COMMANDS = frozenset({
+    "/start", "/help", "/id", "/status", "/agents", "/team", "/examples", "/tour",
+    "/tasks", "/todo", "/done", "/canceltask", "/addtask",
+    "/xarajatlar", "/expenses", "/xarajatochir", "/delexpense", "/byudjet", "/budget",
+    "/decisions", "/cleardecisions", "/memory", "/forget", "/reset",
+    "/standup", "/week", "/digest", "/loops",
+})
+
+
+def _is_free_command(text: str | None) -> bool:
+    if not text:
+        return False
+    return text.split()[0].split("@")[0].lower() in _FREE_COMMANDS
+
 
 # Hard cap on combined user input (typed text + quoted file/reply context)
 # before it reaches the router/agents — protects token budget and free-tier
@@ -889,8 +933,17 @@ def _agent_from_name_prefix(text: str) -> tuple[str | None, str]:
 
 
 async def _answer_with_agent(route: Route, system_prompt: str, messages: list[dict]) -> str:
-    """All agents use Claude — model choice (Sonnet vs Haiku) is in route.model."""
-    return await claude_generate(system_prompt, messages, model=route.model)
+    """route.model is the PREFERRED model (from router.model_for()), but the
+    multi-provider failover chain in llm_clients.py may have actually
+    answered via a different provider if the preferred one failed. Correct
+    route.model_label to the provider that really answered — otherwise a
+    ChatGPT/Gemini/DeepSeek fallback reply would still show a Claude
+    signature, misattributing every fallback answer to the wrong model."""
+    body = await claude_generate(system_prompt, messages, model=route.model)
+    used = last_used_provider()
+    if used:
+        route.model_label = llm_clients.provider_label(used[0])
+    return body
 
 
 async def _maybe_create_tickets(route: Route, user_text: str, body: str) -> str:
@@ -1160,6 +1213,12 @@ async def _process_inner(
         route.request_type = get_request_type(forced_type)
     if forced_document:
         route.wants_document = True
+
+    # The classifier call above is already recorded (attributed to the user,
+    # agent NULL — it runs before an agent exists). From here on, attribute
+    # to the specialist that actually answers, so /xarajatai can show which
+    # agents cost the most.
+    telemetry.set_agent(route.agent.key)
 
     if route.is_capability_question and not forced_type and not forced_document:
         logger.info("chat=%s -> capability overview", chat_id)
@@ -1855,6 +1914,19 @@ async def cmd_status(message: Message) -> None:
             "\nBiri ishlamay qolsa (kalit noto'g'ri/limit tugagan), keyingisi "
             "avtomatik javob beradi — bot to'xtab qolmaydi."
         )
+        if settings.telemetry_enabled:
+            health = await telemetry.provider_health(24)
+            if health:
+                lines.append("\n**So'nggi 24 soat:**")
+                for name, calls, success_rate, median_ms in health:
+                    warn = " ⚠️" if success_rate < 90 else ""
+                    lines.append(f"  {name} — {calls} chaqiruv · {success_rate:.0f}% muvaffaqiyat"
+                                 f" · {median_ms}ms{warn}")
+        if settings.budget_enforced:
+            lines.append(
+                f"\n**Kunlik AI limiti:** {settings.daily_user_token_budget:,} token/foydalanuvchi"
+                .replace(",", " ")
+            )
     else:
         lines.append(
             "**Provider:** ❌ Sozlanmagan (ANTHROPIC_API_KEY, OPENAI_API_KEY, "
@@ -2581,6 +2653,76 @@ async def cmd_stats(message: Message) -> None:
         f"🤖 AI: {'>'.join(active_providers) if active_providers else '❌'} "
         f"· 🗄 PostgreSQL: {'✅' if settings.db_enabled else '⚠️'} "
         f"· 💾 Redis: {'✅' if settings.redis_enabled else '⚠️ in-memory'}"
+    )
+    await _send_long(message, "\n".join(lines))
+
+
+@dp.message(Command("xarajatai", "aicost"))
+async def cmd_ai_spend(message: Message, command: CommandObject) -> None:
+    """Admin: what the AI actually cost — by day, user, provider and agent.
+
+    Distinct from /xarajatlar, which is the user's own personal spending.
+    This is the bot's own infrastructure bill."""
+    uid = message.from_user.id if message.from_user else 0
+    uname = message.from_user.username if message.from_user else None
+    if not access_control.is_admin(uid, uname):
+        return
+
+    if not settings.telemetry_enabled:
+        await message.answer("Telemetriya o'chirilgan (TELEMETRY_ENABLED=false).")
+        return
+
+    arg = (command.args or "").strip()
+    try:
+        days = max(1, min(90, int(arg))) if arg else 7
+    except ValueError:
+        days = 7
+
+    rep = await telemetry.spend_report(days)
+    if not rep["calls"]:
+        await message.answer(f"So'nggi {days} kunda AI chaqiruvlari qayd etilmagan.")
+        return
+
+    def money(v: float) -> str:
+        return f"${v:.4f}" if v < 1 else f"${v:,.2f}"
+
+    lines = [
+        f"**AI xarajatlari — so'nggi {days} kun**\n",
+        f"Chaqiruvlar: {rep['calls']:,}".replace(",", " "),
+        f"Tokenlar: {rep['tokens']:,}".replace(",", " "),
+        f"Taxminiy xarajat: **{money(rep['cost'])}**",
+    ]
+    if rep["failures"]:
+        lines.append(f"Muvaffaqiyatsiz chaqiruvlar: {rep['failures']}")
+    if rep["fallbacks"]:
+        lines.append(f"Zaxira provayder ishlatilgan: {rep['fallbacks']} marta")
+    if not rep["persistent"]:
+        lines.append("\n⚠️ DATABASE_URL sozlanmagan — faqat shu sessiya ma'lumotlari.")
+
+    if rep["by_provider"]:
+        lines.append("\n**Provayderlar bo'yicha:**")
+        for name, calls, cost, toks in rep["by_provider"]:
+            lines.append(f"• {name} — {money(cost)} · {calls} chaqiruv · {toks:,} token".replace(",", " "))
+
+    if rep["by_agent"]:
+        lines.append("\n**Mutaxassislar bo'yicha (top):**")
+        for key, calls, cost, _t in rep["by_agent"]:
+            label = persona(key)[0] if key != "—" else "routing"
+            lines.append(f"• {label} — {money(cost)} · {calls} chaqiruv")
+
+    if rep["by_user"]:
+        lines.append("\n**Foydalanuvchilar bo'yicha (top):**")
+        for u, calls, cost, _t in rep["by_user"]:
+            lines.append(f"• `{u}` — {money(cost)} · {calls} chaqiruv")
+
+    if rep["by_day"]:
+        lines.append("\n**Kunlar bo'yicha:**")
+        for day, calls, cost in rep["by_day"][:14]:
+            lines.append(f"• {day} — {money(cost)} · {calls} chaqiruv")
+
+    lines.append(
+        "\n_Xarajatlar taxminiy: narxlar jadvalidan hisoblanadi, "
+        "provayder hisobidan emas._"
     )
     await _send_long(message, "\n".join(lines))
 
