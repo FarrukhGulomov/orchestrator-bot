@@ -1,0 +1,43 @@
+name: CI
+
+# Every push to main and every PR must import cleanly, pass ruff's error/
+# undefined-name check, and pass the test suite — the precondition, per the
+# engineering audit, for being able to touch bot.py at all with confidence.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt ruff
+
+      - name: Lint (errors + undefined names only — not a style pass)
+        run: ruff check --select=E9,F --exclude=tests .
+
+      - name: Syntax check every module
+        # Parse-only, not a real import — bot.py is the Telegram entrypoint
+        # and constructs a live Bot object at import time, which needs a
+        # real-shaped token this job doesn't have. The modules that DO
+        # matter for logic (config, llm_clients, telemetry, agents, router,
+        # request_types) are genuinely imported below, by pytest collecting
+        # tests/ — this step only catches an outright syntax error in the
+        # rest (bot.py, digest.py, etc.) that pytest would never reach.
+        run: |
+          for f in *.py; do
+            python -c "import ast; ast.parse(open('$f').read())"
+          done
+
+      - name: Test
+        run: pytest -v
