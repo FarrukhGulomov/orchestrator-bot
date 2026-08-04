@@ -71,10 +71,12 @@ from aiogram.types import (
 
 import access_control
 import business_copilot
+from bot_utils import TELEGRAM_LIMIT, is_allowed as _is_allowed, send_long as _send_long
 import decisions as decisions_store
 import digest
 import monthly_report
 import expenses
+import expense_handlers
 import document_generation as docgen
 import github_integration
 import db
@@ -121,8 +123,12 @@ logging.basicConfig(
 logger = logging.getLogger("orchestrator")
 
 dp = Dispatcher()
-
-TELEGRAM_LIMIT = 4096
+# Handler groups extracted into their own module register their own Router
+# (see each module's docstring) and get included here. dp's outer
+# middlewares (AccessGateMiddleware, registered further below) apply to
+# included routers too — aiogram propagates them down the routing tree —
+# so extraction doesn't change access-gating or budget/rate-limit behavior.
+dp.include_router(expense_handlers.router)
 
 # --------------------------------------------------------------------------
 # Post-approval onboarding — collect phone number before an approved user's
@@ -722,8 +728,9 @@ async def _check_group_relevance(text: str) -> bool:
 # --------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------
-def _is_allowed(chat_id: int) -> bool:
-    return not settings.allowed_chat_ids or chat_id in settings.allowed_chat_ids
+# _is_allowed/_send_long/_split/TELEGRAM_LIMIT now live in bot_utils.py (see
+# its module docstring) — imported under their original names here so every
+# existing call site in this file is untouched.
 
 
 async def _callback_still_authorized(callback: CallbackQuery) -> bool:
@@ -985,28 +992,6 @@ async def _maybe_create_tickets(route: Route, user_text: str, body: str) -> str:
     return ("\n\n" + "\n".join(lines)) if lines else ""
 
 
-async def _send_long(message: Message, text: str, reply_mode: bool = False) -> Message | None:
-    """Send a (possibly long) reply, splitting at TELEGRAM_LIMIT. If reply_mode,
-    the first chunk quotes the original message so group context is clear.
-    Returns the LAST sent Message — callers can attach an inline keyboard to
-    it (quick actions) via edit_reply_markup."""
-    chunks = _split(text, TELEGRAM_LIMIT)
-    sent: Message | None = None
-    for i, chunk in enumerate(chunks):
-        use_reply = reply_mode and i == 0
-        try:
-            if use_reply:
-                sent = await message.reply(chunk, parse_mode="Markdown")
-            else:
-                sent = await message.answer(chunk, parse_mode="Markdown")
-        except TelegramBadRequest:
-            if use_reply:
-                sent = await message.reply(chunk, parse_mode=None)
-            else:
-                sent = await message.answer(chunk, parse_mode=None)
-    return sent
-
-
 # Only offer quick actions under answers with enough substance to be worth
 # turning into a document/task — short conversational replies would just
 # collect button clutter.
@@ -1024,28 +1009,6 @@ async def _offer_quick_actions(message: Message, sent: Message | None, user_text
         await sent.edit_reply_markup(reply_markup=quick_actions.keyboard(sent.message_id))
     except Exception:  # noqa: BLE001 — cosmetic; the answer itself already reached the user
         logger.exception("Failed to attach quick-action buttons")
-
-
-def _split(text: str, limit: int) -> list[str]:
-    if len(text) <= limit:
-        return [text]
-    parts, current = [], ""
-    for line in text.split("\n"):
-        while len(line) > limit:
-            if current:
-                parts.append(current)
-                current = ""
-            parts.append(line[:limit])
-            line = line[limit:]
-        if len(current) + len(line) + 1 > limit:
-            if current:  # never emit an empty chunk (Telegram rejects empty text)
-                parts.append(current)
-            current = line
-        else:
-            current = f"{current}\n{line}" if current else line
-    if current:
-        parts.append(current)
-    return parts
 
 
 async def _send_document_deliverable(message: Message, route: Route, user_text: str) -> None:
@@ -3115,137 +3078,6 @@ async def handle_tour_callback(callback: CallbackQuery, bot: Bot) -> None:
     await callback.answer()
 
 
-async def _try_log_expense(message: Message, uid: int, chat_id: int, text: str) -> bool:
-    """Parse and store a spend mention. Returns True if it was recorded (so
-    the caller skips the normal AI pipeline). Any failure returns False and
-    the message is answered normally — a missed capture is a small loss, a
-    hijacked conversation is a big one."""
-    parsed = await expenses.extract(text)
-    if not parsed:
-        return False
-    expense_id = await expenses.add(
-        uid, chat_id, parsed["amount"], parsed["currency"], parsed["category"], parsed["note"],
-    )
-    if expense_id is None:
-        return False
-    await message.answer(
-        expenses.render_confirmation(
-            parsed["amount"], parsed["currency"], parsed["category"], parsed["note"], expense_id,
-        ),
-        parse_mode="Markdown",
-    )
-    alert = await expenses.check_budget_alert(uid)
-    if alert:
-        await message.answer(alert)
-    return True
-
-
-@dp.message(Command("xarajat", "expense"))
-async def cmd_expense(message: Message, command: CommandObject) -> None:
-    """Explicit expense entry — the same parser as the automatic capture,
-    for when the user wants to be sure it's recorded as a spend."""
-    chat_id = message.chat.id
-    if not _is_allowed(chat_id):
-        return
-    if not expenses.available():
-        await message.answer(
-            "💸 Xarajat hisobi uchun PostgreSQL kerak (moliyaviy yozuvlar "
-            "restartda yo'qolmasligi uchun).\nRailway'da DATABASE_URL qo'shing."
-        )
-        return
-    text = (command.args or "").strip()
-    if not text:
-        await message.answer(
-            "Xarajatni yozing:\n/xarajat taksiga 30 ming\n\n"
-            "Yoki shunchaki oddiy xabar sifatida yozavering — o'zim tushunaman.\n"
-            "Hisobot: /xarajatlar"
-        )
-        return
-    uid = message.from_user.id if message.from_user else 0
-    if not await _try_log_expense(message, uid, chat_id, text):
-        await message.answer(
-            "Buni xarajat sifatida tushunolmadim. Masalan: /xarajat obed 45 ming"
-        )
-
-
-@dp.message(Command("xarajatlar", "expenses"))
-async def cmd_expenses(message: Message, command: CommandObject) -> None:
-    chat_id = message.chat.id
-    if not _is_allowed(chat_id):
-        return
-    if not expenses.available():
-        await message.answer(
-            "💸 Xarajat hisobi uchun PostgreSQL kerak — Railway'da DATABASE_URL qo'shing."
-        )
-        return
-    period = (command.args or "").strip().lower() or "oy"
-    since, until, label = expenses.period_bounds(period)
-    uid = message.from_user.id if message.from_user else 0
-    data = await expenses.summary(uid, since, until)
-    if data is None:
-        await message.answer("⚠️ Hisobotni olishda xatolik. Keyinroq urinib ko'ring.")
-        return
-    await _send_long(message, expenses.render_summary(data, label))
-
-
-@dp.message(Command("xarajatochir", "delexpense"))
-async def cmd_delete_expense(message: Message, command: CommandObject) -> None:
-    chat_id = message.chat.id
-    if not _is_allowed(chat_id):
-        return
-    arg = (command.args or "").strip().split()[0] if command.args else ""
-    if not arg.isdigit():
-        await message.answer("O'chirish uchun ID yozing: /xarajatochir 42\n(ID lar /xarajatlar da)")
-        return
-    uid = message.from_user.id if message.from_user else 0
-    if await expenses.delete(uid, int(arg)):
-        await message.answer("🗑 O'chirildi.")
-    else:
-        await message.answer("Bunday yozuv topilmadi (yoki u sizniki emas).")
-
-
-@dp.message(Command("byudjet", "budget"))
-async def cmd_budget(message: Message, command: CommandObject) -> None:
-    """Set or view a monthly spending limit. Alerts fire automatically from
-    the expense-capture path (_try_log_expense) once 80%/100% is crossed."""
-    chat_id = message.chat.id
-    if not _is_allowed(chat_id):
-        return
-    if not expenses.available():
-        await message.answer(
-            "💸 Byudjet uchun PostgreSQL kerak — Railway'da DATABASE_URL qo'shing."
-        )
-        return
-    uid = message.from_user.id if message.from_user else 0
-    arg = (command.args or "").strip()
-    if arg:
-        amount = expenses.parse_amount_shorthand(arg)
-        if not amount:
-            await message.answer("Byudjet miqdorini yozing, masalan: /byudjet 3 mln")
-            return
-        await expenses.set_budget(uid, amount)
-        await message.answer(f"✅ Oylik byudjet o'rnatildi: {expenses.fmt_amount(amount, 'UZS')}")
-        return
-    budget = await expenses.get_budget(uid)
-    if not budget:
-        await message.answer(
-            "Oylik byudjet o'rnatilmagan.\nMasalan: /byudjet 3 mln — 80% va 100% da ogohlantiraman."
-        )
-        return
-    spent = await expenses.month_to_date_uzs_total(uid)
-    pct = int(spent / budget * 100) if budget else 0
-    remaining = budget - spent
-    lines = [
-        f"💰 Oylik byudjet: {expenses.fmt_amount(budget, 'UZS')}",
-        f"💸 Sarflandi: {expenses.fmt_amount(spent, 'UZS')} ({pct}%)",
-    ]
-    if remaining >= 0:
-        lines.append(f"✅ Qoldi: {expenses.fmt_amount(remaining, 'UZS')}")
-    else:
-        lines.append(f"🔴 Oshib ketdi: {expenses.fmt_amount(-remaining, 'UZS')}")
-    await message.answer("\n".join(lines))
-
-
 @dp.message(Command("qidir", "find"))
 async def cmd_find(message: Message, command: CommandObject) -> None:
     """Substring search across everything this chat has ACCUMULATED —
@@ -3593,7 +3425,7 @@ async def handle_text(message: Message, bot: Bot) -> None:
             and expenses.looks_like_expense(user_text)
         ):
             uid = message.from_user.id if message.from_user else 0
-            if await _try_log_expense(message, uid, chat_id, user_text):
+            if await expense_handlers.try_log_expense(message, uid, chat_id, user_text):
                 return
         # @mention, reply-to-bot, or private chat → respond normally
         await _process(message, bot, user_text, forced_type=None)
