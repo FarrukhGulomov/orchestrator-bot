@@ -77,13 +77,17 @@ class _FakePage:
 
 
 class _FakeChromium:
+    def __init__(self):
+        self.last_launch_kwargs: dict | None = None
+
     async def launch(self, **kw):
+        self.last_launch_kwargs = kw
         return _FakeBrowser()
 
 
 class _FakeAsyncPlaywright:
-    def __init__(self):
-        self.chromium = _FakeChromium()
+    def __init__(self, chromium):
+        self.chromium = chromium
 
     async def __aenter__(self):
         return self
@@ -93,8 +97,13 @@ class _FakeAsyncPlaywright:
 
 
 class _FakePlaywrightModule:
+    def __init__(self):
+        # One instance shared across async_playwright() calls so a test can
+        # hold a reference and inspect what launch() was actually called with.
+        self.chromium = _FakeChromium()
+
     def async_playwright(self):
-        return _FakeAsyncPlaywright()
+        return _FakeAsyncPlaywright(self.chromium)
 
 
 class _FakeBot:
@@ -106,7 +115,8 @@ class _FakeBot:
 
 
 def _patch_playwright_plumbing(monkeypatch):
-    monkeypatch.setattr(ma, "_try_import_playwright", lambda: _FakePlaywrightModule())
+    module = _FakePlaywrightModule()
+    monkeypatch.setattr(ma, "_try_import_playwright", lambda: module)
     # Real Chromium download needs network + takes ~a minute — not something
     # a unit test should depend on; the dedicated test below covers the
     # "install failed" branch on its own with an explicit mock.
@@ -114,6 +124,7 @@ def _patch_playwright_plumbing(monkeypatch):
     monkeypatch.setattr(ma, "_setup_virtual_sink", _async_return(False))
     monkeypatch.setattr(ma, "_teardown_virtual_sink", _async_noop)
     monkeypatch.setattr(ma, "_leave", _async_noop)
+    return module
 
 
 async def _async_noop(*a, **kw):
@@ -185,6 +196,34 @@ async def test_recording_starts_only_after_disclosure_succeeds(monkeypatch, tmp_
     # No audio file was actually produced by the mock, so transcription
     # short-circuits on the empty file rather than failing the session.
     assert session.status in ("done",)
+
+
+async def test_launch_env_merges_with_not_replaces_os_environ(monkeypatch, tmp_path):
+    """Regression test: Playwright's launch(env=...) REPLACES the child
+    process's whole environment rather than merging with it. Passing just
+    {"PULSE_SINK": ..., "DISPLAY": ...} would silently strip PATH/HOME/etc.
+    and break the browser launch outright — see _run_session's comment at
+    the p.chromium.launch(...) call."""
+    monkeypatch.setattr(ma.settings, "meeting_audio_dir", str(tmp_path), raising=False)
+    monkeypatch.setenv("SOME_PREEXISTING_VAR", "should-survive")
+    module = _patch_playwright_plumbing(monkeypatch)
+    monkeypatch.setattr(ma, "_setup_virtual_sink", _async_return(True))  # force PULSE_SINK to be set
+    monkeypatch.setattr(ma, "_ensure_display", _async_return(":99"))  # force DISPLAY to be set
+    monkeypatch.setattr(ma, "_join", _async_return(False))  # fail fast, we only care about launch()
+
+    session = ma.MeetingSession(
+        session_id="test5", chat_id=115, user_id=222,
+        meeting_url="https://meet.google.com/abc-defg-hij",
+        platform=ma.MeetingPlatform.GOOGLE_MEET,
+    )
+    bot = _FakeBot()
+    await ma._run_session(session, bot)
+
+    launch_env = module.chromium.last_launch_kwargs["env"]
+    assert launch_env["PULSE_SINK"] == "meetbot_test5"
+    assert launch_env["DISPLAY"] == ":99"
+    assert launch_env.get("SOME_PREEXISTING_VAR") == "should-survive"
+    assert launch_env.get("PATH")  # the whole point: PATH must not have been wiped
 
 
 async def test_chromium_install_failure_never_reaches_join(monkeypatch, tmp_path):
