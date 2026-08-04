@@ -1,0 +1,5 @@
+# Test-only dependencies — not needed in production, kept separate so the
+# deployed image (Railway installs requirements.txt) stays lean.
+-r requirements.txt
+pytest>=8.0
+pytest-asyncio>=0.24

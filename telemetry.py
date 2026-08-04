@@ -45,7 +45,6 @@ made outside a handler (startup, background loops) simply record NULL.
 import asyncio
 import contextvars
 import logging
-import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -71,7 +70,7 @@ _EMPTY = CallContext()
 _ctx: contextvars.ContextVar[CallContext] = contextvars.ContextVar("llm_call_ctx", default=_EMPTY)
 
 
-def set_call_context(user_id: int | None, chat_id: int | None, agent_key: str | None = None) -> None:
+def set_call_context(user_id: int | None, chat_id: int | None = None, agent_key: str | None = None) -> None:
     """Attribute subsequent LLM calls in this async task to a user/chat."""
     _ctx.set(CallContext(user_id=user_id, chat_id=chat_id, agent_key=agent_key))
 

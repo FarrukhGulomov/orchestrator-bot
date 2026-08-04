@@ -10,7 +10,6 @@ and the background reminder loop.
 """
 
 import asyncio
-import json
 import logging
 from datetime import datetime, timedelta, timezone
 

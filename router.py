@@ -15,7 +15,6 @@ STICKY ROUTING: short, content-free follow-ups ("ok", "continue", "davom et")
 reuse the previous turn's agent/type rather than misrouting.
 """
 
-import json
 import logging
 from dataclasses import dataclass, field
 
@@ -197,7 +196,6 @@ async def classify(
     """Classify a message and return its Route. Never raises."""
     agent_key = last_agent if last_agent in AGENTS else DEFAULT_AGENT_KEY
     type_key = last_type if last_type in REQUEST_TYPES else DEFAULT_REQUEST_TYPE_KEY
-    complexity = "high"
     wants_document = False
     is_capability_question = False
     needs_web = False
@@ -230,7 +228,9 @@ async def classify(
         if type_candidate in REQUEST_TYPES:
             type_key = type_candidate
 
-        complexity = "low" if str(data.get("complexity", "")).lower() == "low" else "high"
+        # The classifier still emits a "complexity" field (see _ROUTER_SYSTEM's
+        # JSON schema) but nothing reads it since model_for() is always
+        # called with "high" below — see that call's comment for why.
         wants_document = bool(data.get("wants_document", False))
         is_capability_question = bool(data.get("is_capability_question", False))
         needs_web = bool(data.get("needs_web", False))
