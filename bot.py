@@ -86,6 +86,7 @@ import shared_context
 import user_profile
 import minutes as minutes_mod
 import railway_integration
+import rate_limit
 import redis_client
 import task_assistant
 import tasks
@@ -557,6 +558,15 @@ class AccessGateMiddleware(BaseMiddleware):
 
         if await access_control.is_approved(uid):
             if await _handle_onboarding_step(event, uid):
+                return
+            # Burst protection: N messages per short window, on by default
+            # (unlike the $ budget below — this is abuse protection, not a
+            # product choice). Applies to every message, including free
+            # commands, since a tight loop of ANY kind hammers Telegram/DB
+            # calls too, not just AI spend — see rate_limit.py.
+            allowed, retry_after = await rate_limit.check(uid)
+            if not allowed:
+                await event.answer(f"⏳ Juda tez yubordingiz, {retry_after}s dan keyin urinib ko'ring.")
                 return
             # Daily spend cap. Off unless DAILY_USER_TOKEN_BUDGET is set, and
             # the admin is never capped (checked above — the admin branch has
@@ -1925,6 +1935,11 @@ async def cmd_status(message: Message) -> None:
             lines.append(
                 f"\n**Kunlik AI limiti:** {settings.daily_user_token_budget:,} token/foydalanuvchi"
                 .replace(",", " ")
+            )
+        if settings.rate_limit_enabled:
+            lines.append(
+                f"**Burst himoya:** {settings.rate_limit_max_per_window} "
+                f"xabar / {settings.rate_limit_window_seconds}s"
             )
     else:
         lines.append(
