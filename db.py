@@ -30,6 +30,7 @@ purpose, per the reasoning above.
 """
 
 import logging
+import os
 
 from config import settings
 
@@ -202,6 +203,62 @@ async def init_schema() -> bool:
     except Exception:  # noqa: BLE001
         logger.exception("Failed to initialise PostgreSQL schema")
         return False
+
+
+_MIGRATIONS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "migrations")
+
+_MIGRATIONS_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    filename   TEXT PRIMARY KEY,
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+"""
+
+
+async def run_migrations() -> int:
+    """Apply any migrations/*.sql file not yet recorded in
+    schema_migrations, in filename order, one transaction per file — see
+    migrations/README.md for the convention and why this exists alongside
+    (not instead of) init_schema()'s CREATE TABLE IF NOT EXISTS baseline.
+
+    Safe to call on every startup: already-applied files are skipped, and
+    a missing migrations/ directory or no pending files is a normal no-op,
+    not an error. Returns the count of newly-applied migrations."""
+    pool = await get_pool()
+    if pool is None:
+        return 0
+    if not os.path.isdir(_MIGRATIONS_DIR):
+        return 0
+
+    files = sorted(f for f in os.listdir(_MIGRATIONS_DIR) if f.endswith(".sql"))
+    if not files:
+        return 0
+
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(_MIGRATIONS_SCHEMA_SQL)
+            applied = {
+                r["filename"] for r in await conn.fetch("SELECT filename FROM schema_migrations")
+            }
+
+            newly_applied = 0
+            for filename in files:
+                if filename in applied:
+                    continue
+                path = os.path.join(_MIGRATIONS_DIR, filename)
+                with open(path, "r", encoding="utf-8") as f:
+                    sql = f.read()
+                async with conn.transaction():
+                    await conn.execute(sql)
+                    await conn.execute(
+                        "INSERT INTO schema_migrations (filename) VALUES ($1)", filename,
+                    )
+                logger.info("Applied migration: %s", filename)
+                newly_applied += 1
+            return newly_applied
+    except Exception:  # noqa: BLE001
+        logger.exception("Migration run failed — see migrations/README.md")
+        return 0
 
 
 async def kv_get(key: str) -> str | None:
