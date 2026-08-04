@@ -1,0 +1,58 @@
+# Local development stack: the bot plus REAL Postgres and Redis, so the
+# durable-storage code paths (db.py, and everything that uses its
+# three-tier fallback) get exercised locally instead of only ever hitting
+# the in-memory tier the way `pytest` does. Not used in production —
+# Railway manages its own Postgres/Redis add-ons; this is dev-only.
+#
+# Usage:
+#   cp .env.example .env   # fill in BOT_TOKEN + at least one AI provider key
+#   docker compose up --build
+#
+# DATABASE_URL/REDIS_URL below are set to point at the services in THIS
+# stack and intentionally override anything in .env for those two vars —
+# every other secret (BOT_TOKEN, API keys) still comes from .env.
+services:
+  bot:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://orchestrator:orchestrator@postgres:5432/orchestrator
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: orchestrator
+      POSTGRES_PASSWORD: orchestrator
+      POSTGRES_DB: orchestrator
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"  # convenience for `psql` from the host; remove if unwanted
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orchestrator"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redisdata:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:
+  redisdata:
