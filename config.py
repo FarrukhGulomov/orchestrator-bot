@@ -216,6 +216,24 @@ class Settings:
     def budget_enforced(self) -> bool:
         return self.telemetry_enabled and self.daily_user_token_budget > 0
 
+    # --- Burst rate limiting -------------------------------------------------
+    # Distinct from the BUDGET above: budget caps total spend over a day;
+    # this caps BURST — N messages in a short window — so a stuck client
+    # retry-looping or someone hammering the bot can't fire dozens of
+    # concurrent LLM calls before the daily counter even catches up. Ships
+    # ON by default (unlike the $ budget) because this is abuse protection,
+    # not a product/UX choice — the default (10 msgs / 20s) is far above
+    # any real typing pace.
+    rate_limit_enabled: bool = field(
+        default_factory=lambda: os.getenv("RATE_LIMIT_ENABLED", "true").lower() == "true"
+    )
+    rate_limit_max_per_window: int = field(
+        default_factory=lambda: _int_env("RATE_LIMIT_MAX_PER_WINDOW", 10)
+    )
+    rate_limit_window_seconds: int = field(
+        default_factory=lambda: _int_env("RATE_LIMIT_WINDOW_SECONDS", 20)
+    )
+
     @property
     def any_ai_key_set(self) -> bool:
         return bool(

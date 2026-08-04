@@ -26,6 +26,7 @@ _RESETTABLE_VARS = (
     "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY",
     "GOOGLE_API_KEY", "XAI_API_KEY", "DEEPSEEK_API_KEY", "KIMI_API_KEY", "MOONSHOT_API_KEY",
     "PROVIDER_PRIORITY", "TELEMETRY_ENABLED", "DAILY_USER_TOKEN_BUDGET", "MODEL_PRICES_JSON",
+    "RATE_LIMIT_ENABLED", "RATE_LIMIT_MAX_PER_WINDOW", "RATE_LIMIT_WINDOW_SECONDS",
 )
 
 
@@ -61,14 +62,23 @@ def _reload_all():
     importlib.reload(llm_clients)
     import telemetry
     importlib.reload(telemetry)
+    # Not part of the returned tuple (would break every existing 3-way
+    # unpack of reload_env's result) — importlib.reload() mutates the
+    # existing module object in sys.modules in place, so a plain
+    # `import rate_limit` at a test file's top still sees the fresh state.
+    import rate_limit
+    importlib.reload(rate_limit)
     return config, llm_clients, telemetry
 
 
 @pytest.fixture(autouse=True)
-def _clear_telemetry_buffer():
-    """telemetry._mem is a module-level deque — without this, spend/budget
-    assertions in one test would see rows left over from another."""
+def _clear_module_state():
+    """telemetry._mem and rate_limit._mem are module-level, process-lifetime
+    state — without this, one test's calls/timestamps would leak into the
+    next test's assertions."""
     yield
     import telemetry
     telemetry._mem.clear()
     telemetry.clear_call_context()
+    import rate_limit
+    rate_limit._mem.clear()
