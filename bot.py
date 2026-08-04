@@ -20,6 +20,9 @@ Commands:
   /tasks — list active tasks; /done /canceltask — mark complete/cancelled
   /digest — opt-in daily morning plan; /standup /week — status drafts
   /minutes — meeting notes → structured minutes + action items → tasks
+  /uchrashuv <link> — join a live Meet/Zoom/Teams call, record + auto-minutes
+    (opt-in, MEETING_BOT_ENABLED — see meeting_attendee.py); /uchrashuvtugat
+    stops it, /uchrashuvlar shows recent sessions
   /decision /decisions — dated project decision log
   /remember /memory /forget — project memory management
   /logs — Railway deployment log analysis (if configured)
@@ -82,6 +85,7 @@ import github_integration
 import db
 import group_copilot
 import history
+import meeting_attendee
 import memory
 import quick_actions
 import shared_context
@@ -1918,6 +1922,10 @@ async def cmd_status(message: Message) -> None:
     lines.append(f"**Railway logs:** {'✅' if settings.railway_enabled else '❌ Sozlanmagan'}")
     lines.append(f"**Ovozli xabar (Groq Whisper):** {'✅' if settings.groq_enabled else '❌ Sozlanmagan (GROQ_API_KEY kerak)'}")
     lines.append(f"**Internetdan izlash (Tavily):** {'✅' if web_search.enabled() else '❌ Sozlanmagan (TAVILY_API_KEY kerak)'}")
+    meeting_status = "❌ O'chirilgan" if not settings.meeting_bot_enabled else (
+        "✅ Yoqilgan" if meeting_attendee.playwright_available() else "⚠️ Yoqilgan, lekin Playwright/ffmpeg topilmadi"
+    )
+    lines.append(f"**Uchrashuvga qo'shilish (/uchrashuv):** {meeting_status}")
 
     from agents import AGENTS
     lines.append(f"\n**Faol agentlar ({len(AGENTS)} ta):**")
@@ -2386,6 +2394,67 @@ async def handle_minutes_callback(callback: CallbackQuery, bot: Bot) -> None:
         return
 
     await callback.answer()
+
+
+@dp.message(Command("uchrashuv", "meeting"))
+async def cmd_meeting_join(message: Message, bot: Bot, command: CommandObject) -> None:
+    """Joins a live Google Meet/Zoom/Teams call as a guest, posts a
+    mandatory disclosure in the meeting chat, records audio, and — once
+    the call ends or /uchrashuvtugat is used — delivers auto-generated
+    minutes. See meeting_attendee.py; off unless MEETING_BOT_ENABLED=true."""
+    chat_id = message.chat.id
+    if not _is_allowed(chat_id):
+        return
+    url = (command.args or "").strip()
+    if not url:
+        await message.answer(
+            "Havolani yuboring:\n/uchrashuv <Google Meet/Zoom/Teams havolasi>\n\n"
+            "⚠️ Bot uchrashuvga qo'shilganda chatga OCHIQ e'lon qiladi — yashirin yozib olish yo'q."
+        )
+        return
+    uid = message.from_user.id if message.from_user else 0
+    try:
+        await meeting_attendee.start(chat_id, uid, url, bot)
+    except meeting_attendee.MeetingBotUnavailable as exc:
+        await message.answer(f"⚠️ {exc}")
+        return
+    await message.answer(
+        "🔄 Uchrashuvga qo'shilyapman... Qo'shilgach chatda ochiq e'lon qilaman, "
+        "shundan keyingina yozib olishni boshlayman. Tugatish: /uchrashuvtugat"
+    )
+
+
+@dp.message(Command("uchrashuvtugat"))
+async def cmd_meeting_stop(message: Message) -> None:
+    chat_id = message.chat.id
+    if not _is_allowed(chat_id):
+        return
+    stopped = await meeting_attendee.stop(chat_id)
+    if not stopped:
+        await message.answer("Faol uchrashuv sessiyasi topilmadi.")
+        return
+    await message.answer("🛑 Sessiyani tugatyapman — chiqib, transkript va protokol tayyorlanadi...")
+
+
+@dp.message(Command("uchrashuvlar"))
+async def cmd_meeting_history(message: Message) -> None:
+    chat_id = message.chat.id
+    if not _is_allowed(chat_id):
+        return
+    sessions = await meeting_attendee.list_recent(chat_id)
+    if not sessions:
+        session = meeting_attendee.get_active(chat_id)
+        if session is not None:
+            await message.answer(f"Joriy sessiya: {session.status} ({session.platform.value})")
+            return
+        await message.answer("Hali uchrashuv sessiyalari yo'q.")
+        return
+    lines = ["🎥 Oxirgi uchrashuv sessiyalari:\n"]
+    for s in sessions:
+        stamp = s["started_at"].strftime("%d-%m-%Y %H:%M") if s.get("started_at") else "?"
+        mark = "✅" if s["disclosed"] else "⚠️"
+        lines.append(f"{mark} {stamp} — {s['platform']} — {s['status']} ({s['transcript_chars']} belgi)")
+    await _send_long(message, "\n".join(lines))
 
 
 @dp.callback_query(F.data.startswith("acc:"))
@@ -3571,6 +3640,9 @@ _USER_COMMANDS: list[tuple[str, str]] = [
     ("standup", "Standup draft"),
     ("week", "Haftalik hisobot"),
     ("minutes", "Uchrashuv protokoli"),
+    ("uchrashuv", "Live uchrashuvga qo'shilib yozib olish"),
+    ("uchrashuvtugat", "Yozib olishni tugatish"),
+    ("uchrashuvlar", "Oxirgi uchrashuv sessiyalari"),
     ("decisions", "Qarorlar jurnali"),
     ("remember", "Loyiha faktini yodlash"),
     ("memory", "Yodlangan faktlar"),

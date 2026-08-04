@@ -182,6 +182,25 @@ CREATE TABLE IF NOT EXISTS llm_calls (
 );
 CREATE INDEX IF NOT EXISTS idx_llm_calls_user_day ON llm_calls (user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_llm_calls_created ON llm_calls (created_at DESC);
+
+-- Audit trail for meeting_attendee.py sessions (bot joining a live
+-- Meet/Zoom/Teams call). `disclosed` records whether the mandatory
+-- in-meeting chat announcement was confirmed sent — see that module's
+-- docstring for why audio capture never starts unless this is true.
+CREATE TABLE IF NOT EXISTS meeting_sessions (
+    id                TEXT PRIMARY KEY,
+    chat_id           BIGINT NOT NULL,
+    user_id           BIGINT NOT NULL,
+    platform          TEXT NOT NULL,
+    meeting_url       TEXT NOT NULL,
+    status            TEXT NOT NULL DEFAULT 'starting',
+    disclosed         BOOLEAN NOT NULL DEFAULT FALSE,
+    started_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    ended_at          TIMESTAMPTZ,
+    error             TEXT,
+    transcript_chars  INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_meeting_sessions_chat ON meeting_sessions (chat_id, started_at DESC);
 """
 
 

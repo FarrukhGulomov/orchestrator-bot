@@ -361,6 +361,39 @@ class Settings:
         default_factory=lambda: os.getenv("GITHUB_AUTO_PR", "false").lower() == "true"
     )
 
+    # --- Optional: Meeting attendee (browser automation) -------------------
+    # Joins a live Google Meet/Zoom/Teams call as a guest (Playwright),
+    # posts a mandatory disclosure message in the meeting chat, records
+    # audio, and turns it into the same structured minutes /minutes
+    # produces. See meeting_attendee.py — off by default: this drives a
+    # real browser into a real call and needs extra system dependencies
+    # (Playwright browsers, ffmpeg, PulseAudio) most deployments won't
+    # have installed. Enable explicitly once those are in place.
+    meeting_bot_enabled: bool = field(
+        default_factory=lambda: os.getenv("MEETING_BOT_ENABLED", "false").lower() == "true"
+    )
+    # Name shown in the meeting's participant list AND in the mandatory
+    # chat announcement posted on join (see meeting_attendee.disclosure_text
+    # — the announcement itself is NOT configurable/skippable, only this
+    # label and the optional org name below are).
+    meeting_bot_display_name: str = field(
+        default_factory=lambda: os.getenv("MEETING_BOT_DISPLAY_NAME", "BA Orchestrator — Recording Bot")
+    )
+    meeting_bot_org_name: str = field(default_factory=lambda: os.getenv("MEETING_BOT_ORG_NAME", ""))
+    # Safety cap so a forgotten /uchrashuvtugat can't record forever.
+    meeting_max_duration_minutes: int = field(
+        default_factory=lambda: _int_env("MEETING_MAX_DURATION_MINUTES", 180)
+    )
+    meeting_audio_dir: str = field(
+        default_factory=lambda: os.getenv("MEETING_AUDIO_DIR", "/tmp/meeting_audio")
+    )
+    # Headless Chromium is more likely to be detected/blocked by meeting
+    # platforms than a "headed" browser running under a virtual display
+    # (Xvfb) — default false, i.e. headed-under-Xvfb, for join reliability.
+    meeting_bot_headless: bool = field(
+        default_factory=lambda: os.getenv("MEETING_BOT_HEADLESS", "false").lower() == "true"
+    )
+
     # --- Persistent storage (PostgreSQL) ------------------------------------
     # The durable "source of truth" for relational business data: users/
     # access-control, per-user profile notes, tasks/reminders, decision log,
