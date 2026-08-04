@@ -18,13 +18,16 @@ RUN pip install --no-cache-dir -r requirements-dev.txt
 
 # meeting_attendee.py (/uchrashuv, gated behind MEETING_BOT_ENABLED so it's
 # a no-op cost for anyone who doesn't set that) needs OS-level packages pip
-# can't provide: ffmpeg/PulseAudio for audio capture, and Chromium's shared
-# libraries. These need apt+root at BUILD time — the container runs as a
-# non-root user below, so this can't happen later. Chromium's own browser
-# binary is NOT fetched here; it downloads itself lazily on the first
-# /uchrashuv call (see meeting_attendee._ensure_chromium).
+# can't provide: ffmpeg/PulseAudio for audio capture, xvfb for a virtual
+# display (Chromium launches headED by default — meeting_bot_headless — so
+# platforms don't fingerprint it as a headless bot; that needs an X server
+# in a container with no desktop session, see meeting_attendee._ensure_display),
+# and Chromium's own shared libraries. These need apt+root at BUILD time —
+# the container runs as a non-root user below, so this can't happen later.
+# Chromium's own browser binary is NOT fetched here; it downloads itself
+# lazily on the first /uchrashuv call (see meeting_attendee._ensure_chromium).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg pulseaudio \
+    && apt-get install -y --no-install-recommends ffmpeg pulseaudio xvfb \
     && playwright install-deps chromium \
     && rm -rf /var/lib/apt/lists/*
 

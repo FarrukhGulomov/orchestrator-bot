@@ -39,6 +39,7 @@ time, so a deployment that never uses this feature is unaffected.
 
 import asyncio
 import logging
+import os
 import re
 import shutil
 import sys
@@ -170,6 +171,42 @@ async def _ensure_chromium() -> tuple[bool, str | None]:
     return True, None
 
 
+_DISPLAY = ":99"
+_display_ready = False
+
+
+async def _ensure_display() -> str | None:
+    """Starts a virtual X display (Xvfb) so a headed Chromium launch
+    (settings.meeting_bot_headless=False, the default — meeting platforms
+    are more likely to flag a real-headless browser as a bot) has
+    somewhere to render. Returns the DISPLAY value to pass to Chromium, or
+    None if Xvfb isn't available — caller falls back to real headless
+    launch rather than hard-failing the whole session over this."""
+    global _display_ready
+    if _display_ready:
+        return _DISPLAY
+    if shutil.which("Xvfb") is None:
+        return None
+    try:
+        await asyncio.create_subprocess_exec(
+            "Xvfb", _DISPLAY, "-screen", "0", "1920x1080x24", "-nolisten", "tcp",
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to start Xvfb")
+        return None
+    socket_path = Path(f"/tmp/.X11-unix/X{_DISPLAY.lstrip(':')}")
+    for _ in range(30):
+        if socket_path.exists():
+            break
+        await asyncio.sleep(0.1)
+    else:
+        logger.warning("Xvfb socket never appeared — falling back to headless Chromium")
+        return None
+    _display_ready = True
+    return _DISPLAY
+
+
 async def start(chat_id: int, user_id: int, meeting_url: str, bot) -> MeetingSession:
     """Kicks off a background session and returns immediately — joining,
     announcing, recording and transcribing all happen in the background
@@ -243,14 +280,30 @@ async def _run_session(session: MeetingSession, bot) -> None:
             return
         sink_ready = await _setup_virtual_sink(sink_name)
 
+        launch_headless = settings.meeting_bot_headless
+        launch_env: dict[str, str] = {}
+        if sink_ready:
+            launch_env["PULSE_SINK"] = sink_name
+        if not launch_headless:
+            display = await _ensure_display()
+            if display:
+                launch_env["DISPLAY"] = display
+            else:
+                launch_headless = True
+
         async with pw.async_playwright() as p:
             browser = await p.chromium.launch(
-                headless=settings.meeting_bot_headless,
+                headless=launch_headless,
                 args=[
                     "--autoplay-policy=no-user-gesture-required",
                     "--use-fake-ui-for-media-stream",
                 ],
-                env={"PULSE_SINK": sink_name} if sink_ready else None,
+                # Playwright's `env` REPLACES the child process's entire
+                # environment rather than merging with it — passing just
+                # {"DISPLAY": ...} would strip PATH/HOME/etc. and break the
+                # launch outright, so start from a copy of our own env and
+                # overlay only what we're actually adding.
+                env={**os.environ, **launch_env} if launch_env else None,
             )
             context = await browser.new_context(permissions=["microphone", "camera"])
             page = await context.new_page()
@@ -534,9 +587,36 @@ async def _run(*args: str) -> int:
     return await proc.wait()
 
 
+_pulseaudio_ready = False
+
+
+async def _ensure_pulseaudio() -> bool:
+    """Installing the `pulseaudio` package doesn't start a daemon — there's
+    no desktop session to auto-launch one in a container. `pulseaudio
+    --start` is the standard idempotent "start it if it isn't already
+    running" invocation, safe to call every session."""
+    global _pulseaudio_ready
+    if _pulseaudio_ready:
+        return True
+    if shutil.which("pulseaudio") is None:
+        return False
+    try:
+        rc = await _run("pulseaudio", "--start", "--exit-idle-time=-1")
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to start PulseAudio")
+        return False
+    if rc != 0:
+        return False
+    _pulseaudio_ready = True
+    return True
+
+
 async def _setup_virtual_sink(sink_name: str) -> bool:
     if shutil.which("pactl") is None:
         logger.warning("pactl not found — recording will capture silence unless PULSE_SINK routing exists.")
+        return False
+    if not await _ensure_pulseaudio():
+        logger.warning("PulseAudio daemon unavailable — recording will capture silence.")
         return False
     try:
         rc = await _run("pactl", "load-module", "module-null-sink", f"sink_name={sink_name}")
