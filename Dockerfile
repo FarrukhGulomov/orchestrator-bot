@@ -1,31 +1,32 @@
-# Local development image — see docker-compose.yml. Production on Railway
-# builds from source with its own buildpack (nixpacks) and is NOT affected
-# by this file; this exists purely so `docker compose up` gives a
-# reproducible dev environment against real Postgres/Redis instead of the
-# in-memory fallback tier every module degrades to without them.
+# Used for BOTH local dev (docker-compose.yml) AND production on Railway —
+# Railway auto-detects a Dockerfile at the repo root and builds from it
+# INSTEAD of nixpacks whenever one is present (that's Railway's own
+# builder-selection rule, not something set in this repo). An earlier
+# version of this comment claimed nixpacks was always used and this file
+# was dev-only; that was wrong from the moment this file was added and
+# cost real debugging time chasing a NIXPACKS_APT_PKGS env var that was
+# never actually in the build path — see meeting_attendee.py's docstring
+# for the full story. Treat this file as the real production build.
 FROM python:3.11-slim
 
 WORKDIR /app
 
-# Separate layer from the app source so `docker compose build` only
-# re-installs dependencies when requirements.txt actually changes.
+# Separate layer from the app source so a rebuild only re-installs
+# dependencies when requirements.txt actually changes.
 COPY requirements.txt requirements-dev.txt ./
 RUN pip install --no-cache-dir -r requirements-dev.txt
 
-# Optional: meeting_attendee.py (MEETING_BOT_ENABLED=true) — joins a live
-# Meet/Zoom/Teams call and records it. The `playwright` pip package is
-# already installed above (it's in requirements.txt, and it's small); what's
-# still missing here is the OS side — ffmpeg/PulseAudio for audio capture
-# and Chromium's shared libraries, which need apt+root at BUILD time (the
-# container runs as a non-root user below, so this can't happen later).
-# Chromium's own browser binary downloads itself lazily on first /uchrashuv
-# call (see meeting_attendee._ensure_chromium) so it's not fetched here.
-# Uncomment to build an image with the feature actually usable:
-#
-# RUN apt-get update \
-#     && apt-get install -y --no-install-recommends ffmpeg pulseaudio \
-#     && playwright install-deps chromium \
-#     && rm -rf /var/lib/apt/lists/*
+# meeting_attendee.py (/uchrashuv, gated behind MEETING_BOT_ENABLED so it's
+# a no-op cost for anyone who doesn't set that) needs OS-level packages pip
+# can't provide: ffmpeg/PulseAudio for audio capture, and Chromium's shared
+# libraries. These need apt+root at BUILD time — the container runs as a
+# non-root user below, so this can't happen later. Chromium's own browser
+# binary is NOT fetched here; it downloads itself lazily on the first
+# /uchrashuv call (see meeting_attendee._ensure_chromium).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg pulseaudio \
+    && playwright install-deps chromium \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY . .
 

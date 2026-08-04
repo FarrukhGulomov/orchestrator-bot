@@ -28,8 +28,11 @@ from inside this process and need a one-time deploy-side setup:
   - OS-level shared libraries Chromium links against (Debian: libnss3,
     libatk-bridge2.0-0, libgbm1, ...) and ffmpeg/PulseAudio for audio
     capture — these need root+apt at BUILD time, which this process
-    cannot reach at runtime. See README's "Meeting attendee" section for
-    the one Railway env var (`NIXPACKS_APT_PKGS`) that covers this.
+    cannot reach at runtime. The Dockerfile installs these (Railway builds
+    from it directly whenever it's present at the repo root — see that
+    file's own top comment for why an earlier version of this docstring
+    pointed at a nixpacks env var instead, which was never actually in
+    the build path).
 Everything above is probed/attempted lazily at call time, never at import
 time, so a deployment that never uses this feature is unaffected.
 """
