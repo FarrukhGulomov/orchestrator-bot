@@ -10,3 +10,9 @@ redis>=5.0
 asyncpg>=0.29
 pypdf>=4.0
 tzdata>=2024.1
+# meeting_attendee.py (/uchrashuv, off unless MEETING_BOT_ENABLED=true) —
+# just the Python package here (a few MB); the Chromium browser binary is
+# downloaded lazily on first use, not at install time. See that module's
+# docstring for the OS-level pieces (ffmpeg, PulseAudio, Chromium's shared
+# libs) this still needs, which pip can't provide.
+playwright>=1.45,<2.0

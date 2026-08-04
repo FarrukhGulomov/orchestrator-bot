@@ -180,19 +180,21 @@ Microsoft Teams звонок как гость (через Playwright), запи
 странах) — ответственность за использование этой функции лежит на операторе
 бота. Используйте только когда у вас есть право записывать конкретную встречу.
 
-Функция выключена по умолчанию (`MEETING_BOT_ENABLED=false`) и требует
-дополнительных зависимостей, которые НЕ входят в `requirements.txt`:
+Функция выключена по умолчанию (`MEETING_BOT_ENABLED=false`). Включение —
+`MEETING_BOT_ENABLED=true` плюс один шаг на стороне деплоя:
 
-```
-pip install -r requirements-meeting.txt
-playwright install --with-deps chromium
-```
-
-Плюс системные пакеты `ffmpeg` и PulseAudio (с поддержкой
-`module-null-sink` — так захватывается звук, который браузер выводит на
-динамики, без физического аудиоустройства). Это нестандартный набор для
-большинства PaaS-buildpack'ов (например, Railway/nixpacks) — см.
-закомментированный блок в `Dockerfile` для сборки образа с этой функцией.
+- Python-пакет `playwright` уже в `requirements.txt` (маленький, ставится
+  всегда). Сам браузер Chromium скачивается автоматически при первом
+  `/uchrashuv` (`meeting_attendee._ensure_chromium`) — вручную запускать
+  `playwright install` не нужно.
+- Единственное, что процесс не может поставить сам во время работы —
+  системные библиотеки: `ffmpeg`, PulseAudio (с `module-null-sink` — так
+  захватывается звук, который браузер выводит на динамики, без физического
+  устройства) и разделяемые библиотеки самого Chromium. Это требует
+  root+apt на этапе СБОРКИ, а не в рантайме. На Railway/nixpacks — одна
+  переменная окружения в Variables (без правки кода), см. `.env.example`
+  (`NIXPACKS_APT_PKGS=...`); при деплое через Docker — раскомментируйте
+  блок в `Dockerfile`.
 
 Селекторы для Google Meet/Zoom/Teams — best-effort: ни один из этих
 продуктов не публикует стабильный DOM-контракт для автоматизации, и вёрстка
@@ -270,7 +272,6 @@ orchestrator-bot/
 ├── minutes.py                    # /minutes: заметки/транскрипт → протокол
 ├── meeting_attendee.py            # /uchrashuv: заход в звонок + запись + протокол
 ├── requirements.txt
-├── requirements-meeting.txt        # опционально: Playwright (для meeting_attendee.py)
 └── .env.example
 ```
 
