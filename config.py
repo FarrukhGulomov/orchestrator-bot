@@ -410,6 +410,29 @@ class Settings:
     meeting_storage_state_json: str = field(
         default_factory=lambda: os.getenv("MEETING_STORAGE_STATE_JSON", "")
     )
+    # Alternative to MEETING_STORAGE_STATE_JSON: let the bot sign itself in
+    # to Google, so no one has to run `playwright open --save-storage` by
+    # hand. Used only when MEETING_STORAGE_STATE_JSON is empty.
+    #
+    # ⚠️ EXPECT THIS TO FAIL more often than not, and not because of a bug:
+    # Google actively blocks automated sign-ins from datacenter IPs (the
+    # "This browser or app may not be secure" wall) and any account with
+    # 2FA enabled cannot be signed into unattended at all. The successful
+    # sign-in is cached (see meeting_attendee._ensure_google_login) so a
+    # working login isn't repeated per meeting — repeatedly re-logging in
+    # is itself a fast way to get an account locked.
+    #
+    # Use a DEDICATED throwaway account, never a personal or admin one.
+    meeting_google_email: str = field(
+        default_factory=lambda: os.getenv("MEETING_GOOGLE_EMAIL", "")
+    )
+    meeting_google_password: str = field(
+        default_factory=lambda: os.getenv("MEETING_GOOGLE_PASSWORD", "")
+    )
+
+    @property
+    def meeting_google_auto_login_enabled(self) -> bool:
+        return bool(self.meeting_google_email and self.meeting_google_password)
 
     # --- Persistent storage (PostgreSQL) ------------------------------------
     # The durable "source of truth" for relational business data: users/

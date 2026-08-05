@@ -209,8 +209,148 @@ def _load_storage_state():
     return state
 
 
-def storage_state_configured() -> bool:
+def storage_state_json_configured() -> bool:
+    """A pasted storage_state blob specifically (not auto-login)."""
     return _load_storage_state() is not None
+
+
+def storage_state_configured() -> bool:
+    """True when the browser will be signed in to Google by SOME means —
+    either a pasted storage_state blob or auto-login credentials."""
+    return storage_state_json_configured() or settings.meeting_google_auto_login_enabled
+
+
+# Where a successful auto-login is cached. Google locks accounts that
+# re-authenticate constantly, so the sign-in must happen once per container
+# lifetime, not once per meeting. Railway's filesystem is wiped between
+# deploys, which just means one fresh login after each deploy.
+_GOOGLE_STATE_CACHE = Path("/tmp/meeting_google_state.json")
+_google_login_failed_reason: str | None = None
+
+
+def _read_cached_google_state():
+    try:
+        if _GOOGLE_STATE_CACHE.exists():
+            return json.loads(_GOOGLE_STATE_CACHE.read_text())
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to read cached Google session — will re-login")
+    return None
+
+
+def invalidate_google_session() -> None:
+    """Drops the cached sign-in so the next session logs in fresh. Called
+    when Meet rejects us despite having a session — the usual cause is
+    Google having expired it."""
+    global _google_login_failed_reason
+    _google_login_failed_reason = None
+    try:
+        _GOOGLE_STATE_CACHE.unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to clear cached Google session")
+
+
+async def _ensure_google_login(browser) -> tuple[dict | None, str | None]:
+    """Signs the bot's browser in to Google with MEETING_GOOGLE_EMAIL/
+    PASSWORD and returns its storage_state. Cached on success; a hard
+    failure (bad password, 2FA, Google's automation block) is remembered
+    for the process lifetime so every subsequent meeting doesn't retry a
+    login that will fail the same way — and, more importantly, doesn't
+    hammer Google with repeat attempts and get the account locked."""
+    global _google_login_failed_reason
+    if not settings.meeting_google_auto_login_enabled:
+        return None, None
+    if _google_login_failed_reason:
+        return None, _google_login_failed_reason
+
+    cached = _read_cached_google_state()
+    if cached is not None:
+        return cached, None
+
+    context = None
+    try:
+        context = await browser.new_context()
+        page = await context.new_page()
+        await page.goto(
+            "https://accounts.google.com/ServiceLogin?service=mail",
+            timeout=_JOIN_TIMEOUT_MS,
+        )
+
+        await page.fill('input[type="email"]', settings.meeting_google_email, timeout=15_000)
+        await page.keyboard.press("Enter")
+        try:
+            await page.wait_for_selector('input[type="password"]', timeout=20_000)
+        except Exception:  # noqa: BLE001
+            reason = await _google_login_failure_reason(page, stage="email")
+            _google_login_failed_reason = reason
+            return None, reason
+
+        await page.fill('input[type="password"]', settings.meeting_google_password, timeout=15_000)
+        await page.keyboard.press("Enter")
+
+        # A successful sign-in lands on myaccount/mail; anything else means
+        # Google interrupted us (2FA, device confirmation, security block).
+        try:
+            await page.wait_for_url(
+                re.compile(r"(myaccount\.google\.com|mail\.google\.com|google\.com/webhp)"),
+                timeout=30_000,
+            )
+        except Exception:  # noqa: BLE001
+            reason = await _google_login_failure_reason(page, stage="password")
+            _google_login_failed_reason = reason
+            return None, reason
+
+        state = await context.storage_state()
+        try:
+            _GOOGLE_STATE_CACHE.write_text(json.dumps(state))
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to cache Google session (will re-login next time)")
+        logger.info("Google auto-login succeeded for the meeting bot account.")
+        return state, None
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Google auto-login raised")
+        reason = f"Google'ga kirishda kutilmagan xatolik: {str(exc)[:200]}"
+        _google_login_failed_reason = reason
+        return None, reason
+    finally:
+        if context is not None:
+            try:
+                await context.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+async def _google_login_failure_reason(page, stage: str) -> str:
+    """Turns whatever Google put on screen into an actionable message.
+    These are the predicted failure modes, not hypotheticals — automated
+    sign-in from a server IP is exactly what Google's defences target."""
+    try:
+        body = ((await page.inner_text("body")) or "").lower()
+    except Exception:  # noqa: BLE001
+        body = ""
+
+    if "couldn't sign you in" in body or "browser or app may not be secure" in body:
+        return (
+            "Google avtomatik loginni bloklab qo'ydi (\"This browser or app may not be secure\"). "
+            "Bu server IP'sidan kirishda odatiy hol va parolni o'zgartirish bilan hal bo'lmaydi.\n\n"
+            "Yagona ishonchli yechim: MEETING_STORAGE_STATE_JSON ni qo'lda tayyorlash "
+            "(README'dagi \"Google-сессия\" bo'limi). Yoki Zoom/Teams ishlating."
+        )
+    if "2-step verification" in body or "verify it's you" in body or "2-step" in body:
+        return (
+            "Akkauntda 2FA (ikki bosqichli tasdiqlash) yoqilgan — bot uni o'tolmaydi. "
+            "Bot uchun 2FA'siz alohida akkaunt oching, yoki MEETING_STORAGE_STATE_JSON "
+            "usulidan foydalaning."
+        )
+    if "wrong password" in body or "incorrect password" in body:
+        return "Parol noto'g'ri — MEETING_GOOGLE_PASSWORD ni tekshiring."
+    if "couldn't find your google account" in body or "enter a valid email" in body:
+        return "Bunday Google akkaunt topilmadi — MEETING_GOOGLE_EMAIL ni tekshiring."
+    if stage == "email":
+        return "Google login sahifasida parol maydoniga o'tolmadim (Google jarayonni to'xtatdi)."
+    return (
+        "Google login yakunlanmadi — ehtimol qo'shimcha tasdiqlash so'raldi "
+        "(telefon raqami, zaxira email yoki qurilmani tasdiqlash)."
+    )
 
 
 _DISPLAY = ":99"
@@ -348,9 +488,22 @@ async def _run_session(session: MeetingSession, bot) -> None:
                 # overlay only what we're actually adding.
                 env={**os.environ, **launch_env} if launch_env else None,
             )
+            # An explicitly pasted session wins; auto-login is the fallback.
+            storage_state = _load_storage_state()
+            if storage_state is None:
+                storage_state, login_error = await _ensure_google_login(browser)
+                # Meet cannot work without a signed-in browser, so a login
+                # failure there is fatal and worth reporting properly.
+                # Zoom/Teams take guests, so they carry on anonymously.
+                if login_error and session.platform is MeetingPlatform.GOOGLE_MEET:
+                    session.status = "failed"
+                    session.error = login_error
+                    await _notify(bot, chat_id, f"⚠️ {login_error}")
+                    return
+
             context = await browser.new_context(
                 permissions=["microphone", "camera"],
-                storage_state=_load_storage_state(),
+                storage_state=storage_state,
             )
             page = await context.new_page()
 
@@ -578,10 +731,13 @@ async def _meet_block_reason(page) -> str | None:
                 "bo'limiga qarang). Yoki uchrashuvni Zoom/Teams'da o'tkazing — ular mehmon "
                 "sifatida kirishga ruxsat beradi."
             )
+        # Most likely an expired session — drop the cached login so the
+        # next attempt re-authenticates instead of reusing dead cookies.
+        invalidate_google_session()
         return (
-            "Google Meet bu akkauntni qo'ng'iroqqa qo'ymadi. Sabablari: saqlangan sessiya eskirgan "
-            "(MEETING_STORAGE_STATE_JSON ni yangilang), yoki uchrashuv faqat tashkilot ichidagilar "
-            "uchun ochiq, yoki uchrashuv hali boshlanmagan."
+            "Google Meet bu akkauntni qo'ng'iroqqa qo'ymadi. Sabablari: sessiya eskirgan "
+            "(keyingi urinishda qaytadan login qilaman — yana bir bor sinab ko'ring), yoki "
+            "uchrashuv faqat tashkilot ichidagilar uchun ochiq, yoki uchrashuv hali boshlanmagan."
         )
     if "ask your host" in body or "denied your request" in body:
         return "Host botni qo'ng'iroqqa qabul qilmadi (so'rov rad etildi)."
