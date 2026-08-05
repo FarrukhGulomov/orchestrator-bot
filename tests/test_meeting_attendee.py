@@ -17,6 +17,36 @@ def test_platform_detection():
     assert ma.detect_platform("") == ma.MeetingPlatform.UNKNOWN
 
 
+def test_normalize_url_adds_missing_scheme():
+    """Regression: people paste links the way chat apps render them, with
+    no scheme. Playwright's page.goto() rejects those outright, which
+    surfaced as a confusing "UI elements not found" failure with a blank
+    about:blank screenshot — the browser never navigated at all."""
+    assert ma.normalize_url("meet.google.com/fov-kayt-yno") == "https://meet.google.com/fov-kayt-yno"
+    assert ma.normalize_url("  meet.google.com/abc  ") == "https://meet.google.com/abc"
+    # Already-schemed URLs pass through untouched.
+    assert ma.normalize_url("https://meet.google.com/abc") == "https://meet.google.com/abc"
+    assert ma.normalize_url("http://zoom.us/j/1") == "http://zoom.us/j/1"
+
+
+async def test_start_stores_normalized_url(monkeypatch):
+    """The schemeless URL was always recognised as a Meet link
+    (detect_platform is scheme-agnostic) — the bug was that it reached
+    page.goto() unnormalised. Assert start() fixes it up before the
+    session (and therefore the browser) ever sees it."""
+    monkeypatch.setattr(ma.settings, "meeting_bot_enabled", True, raising=False)
+    monkeypatch.setattr(ma, "_try_import_playwright", lambda: object())
+    monkeypatch.setattr(ma.shutil, "which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(ma, "_run_session", _async_noop)
+
+    session = await ma.start(999, 222, "meet.google.com/fov-kayt-yno", bot=None)
+    try:
+        assert session.meeting_url == "https://meet.google.com/fov-kayt-yno"
+        assert session.platform == ma.MeetingPlatform.GOOGLE_MEET
+    finally:
+        ma._sessions.pop(999, None)
+
+
 def test_disclosure_text_states_recording_clearly(monkeypatch):
     monkeypatch.setattr(ma.settings, "meeting_bot_org_name", "", raising=False)
     text = ma.disclosure_text(ma.MeetingPlatform.GOOGLE_MEET)
@@ -149,7 +179,7 @@ async def test_recording_never_starts_when_disclosure_fails(monkeypatch, tmp_pat
     confirmed sent, _start_recording must never be called."""
     monkeypatch.setattr(ma.settings, "meeting_audio_dir", str(tmp_path), raising=False)
     _patch_playwright_plumbing(monkeypatch)
-    monkeypatch.setattr(ma, "_join", _async_return(True))
+    monkeypatch.setattr(ma, "_join", _async_return((True, None)))
     monkeypatch.setattr(ma, "_announce", _async_return(False))
 
     recording_started = {"called": False}
@@ -177,7 +207,7 @@ async def test_recording_never_starts_when_disclosure_fails(monkeypatch, tmp_pat
 async def test_recording_starts_only_after_disclosure_succeeds(monkeypatch, tmp_path):
     monkeypatch.setattr(ma.settings, "meeting_audio_dir", str(tmp_path), raising=False)
     _patch_playwright_plumbing(monkeypatch)
-    monkeypatch.setattr(ma, "_join", _async_return(True))
+    monkeypatch.setattr(ma, "_join", _async_return((True, None)))
     monkeypatch.setattr(ma, "_announce", _async_return(True))
 
     recording_started = {"called": False}
@@ -216,7 +246,7 @@ async def test_launch_env_merges_with_not_replaces_os_environ(monkeypatch, tmp_p
     module = _patch_playwright_plumbing(monkeypatch)
     monkeypatch.setattr(ma, "_setup_virtual_sink", _async_return(True))  # force PULSE_SINK to be set
     monkeypatch.setattr(ma, "_ensure_display", _async_return(":99"))  # force DISPLAY to be set
-    monkeypatch.setattr(ma, "_join", _async_return(False))  # fail fast, we only care about launch()
+    monkeypatch.setattr(ma, "_join", _async_return((False, "test")))  # fail fast, we only care about launch()
 
     session = ma.MeetingSession(
         session_id="test5", chat_id=115, user_id=222,
@@ -262,7 +292,7 @@ async def test_chromium_install_failure_never_reaches_join(monkeypatch, tmp_path
 async def test_join_failure_never_reaches_announce(monkeypatch, tmp_path):
     monkeypatch.setattr(ma.settings, "meeting_audio_dir", str(tmp_path), raising=False)
     _patch_playwright_plumbing(monkeypatch)
-    monkeypatch.setattr(ma, "_join", _async_return(False))
+    monkeypatch.setattr(ma, "_join", _async_return((False, "test")))
 
     announce_called = {"called": False}
 
