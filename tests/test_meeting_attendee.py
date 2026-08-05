@@ -6,6 +6,8 @@ browser + a real meeting and aren't exercised here — these tests cover the
 orchestration logic around them.
 """
 
+import json
+
 import meeting_attendee as ma
 
 
@@ -67,6 +69,29 @@ def test_storage_state_parsing(monkeypatch):
     assert ma.storage_state_configured() is True
 
 
+def test_storage_state_accepts_browser_extension_cookie_array(monkeypatch):
+    """A bare cookie list — the way Cookie-Editor/EditThisCookie export —
+    must be converted to a Playwright storage_state so a no-terminal export
+    works. Extension field names (expirationDate, sameSite=no_restriction)
+    get normalised."""
+    export = json.dumps([
+        {"name": "SID", "value": "abc", "domain": ".google.com", "path": "/",
+         "secure": True, "httpOnly": True, "sameSite": "no_restriction",
+         "expirationDate": 1893456000.5},
+        {"name": "nodomain", "value": "skip"},  # no domain → dropped
+    ])
+    monkeypatch.setattr(ma.settings, "meeting_storage_state_json", export, raising=False)
+    state = ma._load_storage_state()
+    assert state is not None
+    assert len(state["cookies"]) == 1
+    c = state["cookies"][0]
+    assert c["name"] == "SID"
+    assert c["domain"] == ".google.com"
+    assert c["sameSite"] == "None"       # no_restriction → None
+    assert c["expires"] == 1893456000    # float floored to int
+    assert state["origins"] == []
+
+
 class _BodyPage:
     def __init__(self, body: str, title: str = "Sign in"):
         self._body = body
@@ -109,6 +134,12 @@ async def test_google_login_failure_reasons_are_actionable(monkeypatch):
 
     two_fa = _BodyPage("2-Step Verification\nVerify it's you")
     assert "2FA" in await ma._google_login_failure_reason(two_fa, stage="password")
+
+    captcha = _BodyPage("Sign in\nType the text you hear or see")
+    captcha_msg = await ma._google_login_failure_reason(captcha, stage="email")
+    assert "CAPTCHA" in captcha_msg
+    # Must point at the working alternatives, not just say "failed".
+    assert "Zoom" in captcha_msg or "cookie" in captcha_msg.lower()
 
     bad_pw = _BodyPage("Wrong password. Try again")
     assert "MEETING_GOOGLE_PASSWORD" in await ma._google_login_failure_reason(bad_pw, stage="password")

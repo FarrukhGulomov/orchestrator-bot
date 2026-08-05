@@ -199,14 +199,59 @@ def _load_storage_state():
     if not raw:
         return None
     try:
-        state = json.loads(raw)
+        parsed = json.loads(raw)
     except ValueError:
         logger.warning("MEETING_STORAGE_STATE_JSON is not valid JSON — ignoring it (anonymous browser).")
         return None
-    if not isinstance(state, dict) or not (state.get("cookies") or state.get("origins")):
-        logger.warning("MEETING_STORAGE_STATE_JSON has no cookies/origins — ignoring it.")
+    state = _coerce_storage_state(parsed)
+    if state is None:
+        logger.warning("MEETING_STORAGE_STATE_JSON has no usable cookies — ignoring it.")
         return None
     return state
+
+
+def _coerce_storage_state(parsed):
+    """Accepts either a real Playwright storage_state dict OR a bare list of
+    cookies the way browser extensions ("EditThisCookie", "Cookie-Editor",
+    "Get cookies.txt") export them — so the value can be produced from a
+    phone/desktop browser with no terminal at all. A bare list is wrapped
+    and each cookie's fields are normalised to what Playwright expects
+    (extensions use sameSite "no_restriction"/"lax"/"unspecified", expiry
+    as expirationDate float, etc.)."""
+    if isinstance(parsed, dict) and (parsed.get("cookies") or parsed.get("origins")):
+        return parsed  # already a Playwright storage_state
+    cookies_in = None
+    if isinstance(parsed, list):
+        cookies_in = parsed
+    elif isinstance(parsed, dict) and isinstance(parsed.get("cookies"), list):
+        cookies_in = parsed["cookies"]
+    if not cookies_in:
+        return None
+
+    _SAME_SITE = {"no_restriction": "None", "unspecified": "Lax", "lax": "Lax",
+                  "strict": "Strict", "none": "None"}
+    cookies = []
+    for c in cookies_in:
+        if not isinstance(c, dict) or not c.get("name"):
+            continue
+        cookie = {
+            "name": c["name"],
+            "value": c.get("value", ""),
+            "domain": c.get("domain", ""),
+            "path": c.get("path", "/"),
+            "httpOnly": bool(c.get("httpOnly", False)),
+            "secure": bool(c.get("secure", False)),
+        }
+        raw_ss = str(c.get("sameSite", "Lax")).lower()
+        cookie["sameSite"] = _SAME_SITE.get(raw_ss, "Lax")
+        expiry = c.get("expires", c.get("expirationDate"))
+        if isinstance(expiry, (int, float)) and expiry > 0:
+            cookie["expires"] = int(expiry)
+        if cookie["domain"]:
+            cookies.append(cookie)
+    if not cookies:
+        return None
+    return {"cookies": cookies, "origins": []}
 
 
 def storage_state_json_configured() -> bool:
@@ -385,6 +430,19 @@ async def _google_login_failure_reason(page, stage: str) -> str:
     except Exception:  # noqa: BLE001
         body = ""
 
+    # CAPTCHA is the wall you actually hit from a datacenter IP — check it
+    # first and name it, because it's a hard dead end for automation (that's
+    # the entire point of a CAPTCHA) and no code change gets past it.
+    if "type the text you hear or see" in body or "enter the characters" in body or "recaptcha" in body:
+        return (
+            "Google CAPTCHA so'radi (\"Type the text you hear or see\") — bu ataylab faqat ODAM "
+            "yechishi uchun qo'yilgan to'siq, botni to'xtatadi. Kod bilan aylanib o'tib bo'lmaydi, "
+            "va avtomatik login (email+parol) shu bilan tugadi.\n\n"
+            "Ishlaydigan yo'llar:\n"
+            "  • Zoom yoki Teams havolasini yuboring — akkauntsiz, hozir ishlaydi;\n"
+            "  • yoki cookie'larni brauzerdan eksport qilib MEETING_STORAGE_STATE_JSON ga qo'ying "
+            "(README'dagi \"Google-сессия\" → cookie eksport bo'limi — terminal shart emas)."
+        )
     if "couldn't sign you in" in body or "browser or app may not be secure" in body:
         return (
             "Google avtomatik loginni bloklab qo'ydi (\"This browser or app may not be secure\"). "
