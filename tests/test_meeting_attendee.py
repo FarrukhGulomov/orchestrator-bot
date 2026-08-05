@@ -47,6 +47,62 @@ async def test_start_stores_normalized_url(monkeypatch):
         ma._sessions.pop(999, None)
 
 
+def test_storage_state_parsing(monkeypatch):
+    """A malformed saved session must degrade to an anonymous browser
+    (still fine for Zoom/Teams) rather than killing every session."""
+    monkeypatch.setattr(ma.settings, "meeting_storage_state_json", "", raising=False)
+    assert ma._load_storage_state() is None
+    assert ma.storage_state_configured() is False
+
+    monkeypatch.setattr(ma.settings, "meeting_storage_state_json", "not json at all", raising=False)
+    assert ma._load_storage_state() is None
+
+    # Valid JSON but not a usable session shape.
+    monkeypatch.setattr(ma.settings, "meeting_storage_state_json", '{"foo": 1}', raising=False)
+    assert ma._load_storage_state() is None
+
+    good = '{"cookies": [{"name": "SID", "value": "x"}], "origins": []}'
+    monkeypatch.setattr(ma.settings, "meeting_storage_state_json", good, raising=False)
+    assert ma._load_storage_state() == {"cookies": [{"name": "SID", "value": "x"}], "origins": []}
+    assert ma.storage_state_configured() is True
+
+
+class _BodyPage:
+    def __init__(self, body: str):
+        self._body = body
+
+    async def inner_text(self, selector):
+        return self._body
+
+
+async def test_meet_block_reason_explains_anonymous_refusal(monkeypatch):
+    """Meet's anonymous wall has no join button, so it's indistinguishable
+    from a broken selector unless the page copy is actually read."""
+    monkeypatch.setattr(ma.settings, "meeting_storage_state_json", "", raising=False)
+    page = _BodyPage("You can't join this video call\nYour meeting is safe")
+    reason = await ma._meet_block_reason(page)
+    assert reason is not None
+    assert "MEETING_STORAGE_STATE_JSON" in reason
+
+
+async def test_meet_block_reason_differs_when_session_configured(monkeypatch):
+    monkeypatch.setattr(
+        ma.settings, "meeting_storage_state_json",
+        '{"cookies": [{"name": "SID", "value": "x"}]}', raising=False,
+    )
+    page = _BodyPage("You can't join this video call")
+    reason = await ma._meet_block_reason(page)
+    assert reason is not None
+    assert "eskirgan" in reason  # "expired session" guidance, not "set up a session"
+
+
+async def test_meet_block_reason_none_for_ordinary_page(monkeypatch):
+    """A normal pre-join page must NOT be reported as a block — otherwise a
+    genuine selector break gets misattributed to Google's policy."""
+    page = _BodyPage("Ready to join? Nobody else is here")
+    assert await ma._meet_block_reason(page) is None
+
+
 def test_disclosure_text_states_recording_clearly(monkeypatch):
     monkeypatch.setattr(ma.settings, "meeting_bot_org_name", "", raising=False)
     text = ma.disclosure_text(ma.MeetingPlatform.GOOGLE_MEET)

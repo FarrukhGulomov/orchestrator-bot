@@ -38,6 +38,7 @@ time, so a deployment that never uses this feature is unaffected.
 """
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -188,6 +189,30 @@ async def _ensure_chromium() -> tuple[bool, str | None]:
     return True, None
 
 
+def _load_storage_state():
+    """Parses MEETING_STORAGE_STATE_JSON into the dict Playwright's
+    new_context(storage_state=...) wants, or None when unset/malformed.
+    Malformed never raises: an unusable saved session should degrade to an
+    anonymous browser (which still works for Zoom/Teams) rather than
+    killing every meeting session outright."""
+    raw = (settings.meeting_storage_state_json or "").strip()
+    if not raw:
+        return None
+    try:
+        state = json.loads(raw)
+    except ValueError:
+        logger.warning("MEETING_STORAGE_STATE_JSON is not valid JSON — ignoring it (anonymous browser).")
+        return None
+    if not isinstance(state, dict) or not (state.get("cookies") or state.get("origins")):
+        logger.warning("MEETING_STORAGE_STATE_JSON has no cookies/origins — ignoring it.")
+        return None
+    return state
+
+
+def storage_state_configured() -> bool:
+    return _load_storage_state() is not None
+
+
 _DISPLAY = ":99"
 _display_ready = False
 
@@ -323,7 +348,10 @@ async def _run_session(session: MeetingSession, bot) -> None:
                 # overlay only what we're actually adding.
                 env={**os.environ, **launch_env} if launch_env else None,
             )
-            context = await browser.new_context(permissions=["microphone", "camera"])
+            context = await browser.new_context(
+                permissions=["microphone", "camera"],
+                storage_state=_load_storage_state(),
+            )
             page = await context.new_page()
 
             joined, join_error = await _join(
@@ -527,9 +555,47 @@ async def _page_hint(page) -> str:
     return f"sahifa: \"{title}\"" + (f" — {body}" if body else "")
 
 
+async def _meet_block_reason(page) -> str | None:
+    """Distinguishes Google Meet's "we refuse you" walls from an ordinary
+    selector miss. Meet blocks an anonymous (not-signed-in) browser before
+    it ever offers the "Ask to join" knock, and the page it shows has no
+    join button at all — indistinguishable from a broken selector unless
+    the copy is actually read. Returns an actionable message, or None if
+    this doesn't look like a block."""
+    try:
+        body = ((await page.inner_text("body")) or "").lower()
+    except Exception:  # noqa: BLE001
+        return None
+
+    signed_in = storage_state_configured()
+    if "you can't join this video call" in body or "you cannot join this video call" in body:
+        if not signed_in:
+            return (
+                "Google Meet anonim (akkauntga kirmagan) brauzerni qo'ng'iroqqa umuman qo'ymaydi — "
+                "\"Ask to join\" tugmasi ham ko'rsatilmaydi. Bu kod xatosi emas, Google siyosati.\n\n"
+                "Yechim: bot uchun ALOHIDA Google akkaunt oching, brauzerda unga kiring va "
+                "sessiyani MEETING_STORAGE_STATE_JSON ga saqlang (README'dagi \"Google sessiyasi\" "
+                "bo'limiga qarang). Yoki uchrashuvni Zoom/Teams'da o'tkazing — ular mehmon "
+                "sifatida kirishga ruxsat beradi."
+            )
+        return (
+            "Google Meet bu akkauntni qo'ng'iroqqa qo'ymadi. Sabablari: saqlangan sessiya eskirgan "
+            "(MEETING_STORAGE_STATE_JSON ni yangilang), yoki uchrashuv faqat tashkilot ichidagilar "
+            "uchun ochiq, yoki uchrashuv hali boshlanmagan."
+        )
+    if "ask your host" in body or "denied your request" in body:
+        return "Host botni qo'ng'iroqqa qabul qilmadi (so'rov rad etildi)."
+    if "check your meeting code" in body or "invalid video call name" in body:
+        return "Uchrashuv kodi noto'g'ri yoki havola eskirgan — havolani tekshirib qayta yuboring."
+    return None
+
+
 async def _join_google_meet(page, display_name: str) -> tuple[bool, str | None]:
     await _fill_name_field(page, display_name)
     if not await _click_first(page, [r"ask to join", r"join now"]):
+        blocked = await _meet_block_reason(page)
+        if blocked:
+            return False, blocked
         return False, f"\"Ask to join\"/\"Join now\" tugmasi topilmadi ({await _page_hint(page)})"
     try:
         await page.get_by_role("button", name=re.compile(r"leave call|leave", re.I)).first.wait_for(
