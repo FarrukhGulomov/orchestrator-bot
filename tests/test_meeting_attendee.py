@@ -75,6 +75,9 @@ class _FakePage:
     def is_closed(self):
         return False
 
+    async def screenshot(self, **kw):
+        return b"fake-png-bytes"
+
 
 class _FakeChromium:
     def __init__(self):
@@ -109,9 +112,13 @@ class _FakePlaywrightModule:
 class _FakeBot:
     def __init__(self):
         self.sent: list[str] = []
+        self.photos_sent = 0
 
     async def send_message(self, chat_id, text, **kw):
         self.sent.append(text)
+
+    async def send_photo(self, chat_id, photo, **kw):
+        self.photos_sent += 1
 
 
 def _patch_playwright_plumbing(monkeypatch):
@@ -275,3 +282,4 @@ async def test_join_failure_never_reaches_announce(monkeypatch, tmp_path):
 
     assert announce_called["called"] is False
     assert session.status == "failed"
+    assert bot.photos_sent == 1  # debug screenshot sent so the failure is diagnosable
