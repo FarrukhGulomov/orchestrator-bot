@@ -96,6 +96,68 @@ async def test_meet_block_reason_differs_when_session_configured(monkeypatch):
     assert "eskirgan" in reason  # "expired session" guidance, not "set up a session"
 
 
+async def test_google_login_failure_reasons_are_actionable(monkeypatch):
+    """The predicted failure modes must each produce their own guidance —
+    "login failed" alone would leave the user with no next step."""
+    blocked = _BodyPage("Couldn't sign you in\nThis browser or app may not be secure")
+    msg = await ma._google_login_failure_reason(blocked, stage="password")
+    assert "MEETING_STORAGE_STATE_JSON" in msg
+
+    two_fa = _BodyPage("2-Step Verification\nVerify it's you")
+    assert "2FA" in await ma._google_login_failure_reason(two_fa, stage="password")
+
+    bad_pw = _BodyPage("Wrong password. Try again")
+    assert "MEETING_GOOGLE_PASSWORD" in await ma._google_login_failure_reason(bad_pw, stage="password")
+
+    no_acct = _BodyPage("Couldn't find your Google Account")
+    assert "MEETING_GOOGLE_EMAIL" in await ma._google_login_failure_reason(no_acct, stage="email")
+
+
+async def test_google_login_skipped_when_not_configured(monkeypatch):
+    monkeypatch.setattr(ma.settings, "meeting_google_email", "", raising=False)
+    monkeypatch.setattr(ma.settings, "meeting_google_password", "", raising=False)
+    state, err = await ma._ensure_google_login(browser=None)
+    assert state is None and err is None
+
+
+async def test_google_login_failure_is_remembered(monkeypatch, tmp_path):
+    """A hard login failure must not be retried on every meeting — repeat
+    attempts are exactly what gets a Google account locked."""
+    monkeypatch.setattr(ma.settings, "meeting_google_email", "bot@example.com", raising=False)
+    monkeypatch.setattr(ma.settings, "meeting_google_password", "hunter2", raising=False)
+    monkeypatch.setattr(ma, "_GOOGLE_STATE_CACHE", tmp_path / "state.json")
+    monkeypatch.setattr(ma, "_google_login_failed_reason", "2FA yoqilgan")
+
+    attempts = {"n": 0}
+
+    class _ExplodingBrowser:
+        async def new_context(self, **kw):
+            attempts["n"] += 1
+            raise AssertionError("must not attempt login again after a hard failure")
+
+    state, err = await ma._ensure_google_login(_ExplodingBrowser())
+    assert state is None
+    assert err == "2FA yoqilgan"
+    assert attempts["n"] == 0
+
+
+async def test_cached_google_session_is_reused(monkeypatch, tmp_path):
+    cache = tmp_path / "state.json"
+    cache.write_text('{"cookies": [{"name": "SID", "value": "cached"}]}')
+    monkeypatch.setattr(ma.settings, "meeting_google_email", "bot@example.com", raising=False)
+    monkeypatch.setattr(ma.settings, "meeting_google_password", "hunter2", raising=False)
+    monkeypatch.setattr(ma, "_GOOGLE_STATE_CACHE", cache)
+    monkeypatch.setattr(ma, "_google_login_failed_reason", None)
+
+    class _ExplodingBrowser:
+        async def new_context(self, **kw):
+            raise AssertionError("must reuse the cached session instead of re-logging in")
+
+    state, err = await ma._ensure_google_login(_ExplodingBrowser())
+    assert err is None
+    assert state == {"cookies": [{"name": "SID", "value": "cached"}]}
+
+
 async def test_meet_block_reason_none_for_ordinary_page(monkeypatch):
     """A normal pre-join page must NOT be reported as a block — otherwise a
     genuine selector break gets misattributed to Google's policy."""

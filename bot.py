@@ -1927,10 +1927,12 @@ async def cmd_status(message: Message) -> None:
     )
     lines.append(f"**Uchrashuvga qo'shilish (/uchrashuv):** {meeting_status}")
     if settings.meeting_bot_enabled:
-        google_session = (
-            "✅ Sozlangan" if meeting_attendee.storage_state_configured()
-            else "❌ Yo'q — Google Meet anonim brauzerni qo'ymaydi (Zoom/Teams ishlaydi)"
-        )
+        if meeting_attendee.storage_state_json_configured():
+            google_session = "✅ Tayyor sessiya (STORAGE_STATE)"
+        elif settings.meeting_google_auto_login_enabled:
+            google_session = "⚠️ Avto-login (email+parol) — Google bloklashi mumkin"
+        else:
+            google_session = "❌ Yo'q — Google Meet anonim brauzerni qo'ymaydi (Zoom/Teams ishlaydi)"
         lines.append(f"  ↳ Google sessiyasi: {google_session}")
 
     from agents import AGENTS
