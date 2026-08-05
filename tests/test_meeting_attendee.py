@@ -68,11 +68,15 @@ def test_storage_state_parsing(monkeypatch):
 
 
 class _BodyPage:
-    def __init__(self, body: str):
+    def __init__(self, body: str, title: str = "Sign in"):
         self._body = body
+        self._title = title
 
     async def inner_text(self, selector):
         return self._body
+
+    async def title(self):
+        return self._title
 
 
 async def test_meet_block_reason_explains_anonymous_refusal(monkeypatch):
@@ -111,6 +115,27 @@ async def test_google_login_failure_reasons_are_actionable(monkeypatch):
 
     no_acct = _BodyPage("Couldn't find your Google Account")
     assert "MEETING_GOOGLE_EMAIL" in await ma._google_login_failure_reason(no_acct, stage="email")
+
+
+async def test_unrecognised_login_page_reports_what_was_on_screen():
+    """The catch-all branch is the one that fires when Google serves a
+    sign-in front-end we don't recognise — it has to say what the page
+    WAS, or there's nothing to act on but a bare selector timeout."""
+    odd = _BodyPage("Choose an account to continue", title="Google Accounts")
+    msg = await ma._google_login_failure_reason(odd, stage="email")
+    assert "Google Accounts" in msg
+    assert "Choose an account" in msg
+
+
+async def test_fill_first_selector_reports_failure_not_raises():
+    """A missing field must return False (so the caller can screenshot and
+    explain) rather than bubbling a raw Playwright timeout to the user."""
+
+    class _NoFieldPage:
+        async def wait_for_selector(self, selector, **kw):
+            raise TimeoutError("no such element")
+
+    assert await ma._fill_first_selector(_NoFieldPage(), ('input[type="email"]',), "x") is False
 
 
 async def test_google_login_skipped_when_not_configured(monkeypatch):

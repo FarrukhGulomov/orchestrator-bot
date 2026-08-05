@@ -249,13 +249,54 @@ def invalidate_google_session() -> None:
         logger.exception("Failed to clear cached Google session")
 
 
-async def _ensure_google_login(browser) -> tuple[dict | None, str | None]:
+# Google serves several sign-in front-ends and changes them freely; a
+# single selector is not a safe bet, so each field is tried several ways
+# before giving up.
+_EMAIL_SELECTORS = (
+    'input[type="email"]',
+    "input#identifierId",
+    'input[name="identifier"]',
+    'input[autocomplete="username"]',
+)
+_PASSWORD_SELECTORS = (
+    'input[type="password"]',
+    'input[name="Passwd"]',
+    'input[autocomplete="current-password"]',
+)
+
+
+async def _fill_first_selector(page, selectors, value: str, timeout: int = 20_000) -> bool:
+    """Waits for whichever of `selectors` shows up first and fills it.
+    Returns False if none appeared — the caller then reports what WAS on
+    screen rather than a bare Playwright timeout, which says nothing about
+    the page Google actually served."""
+    try:
+        await page.wait_for_selector(", ".join(selectors), timeout=timeout, state="visible")
+    except Exception:  # noqa: BLE001
+        return False
+    for selector in selectors:
+        try:
+            locator = page.locator(selector).first
+            if await locator.count() > 0:
+                await locator.fill(value, timeout=10_000)
+                return True
+        except Exception:  # noqa: BLE001
+            continue
+    return False
+
+
+async def _ensure_google_login(browser, bot=None, chat_id: int | None = None) -> tuple[dict | None, str | None]:
     """Signs the bot's browser in to Google with MEETING_GOOGLE_EMAIL/
     PASSWORD and returns its storage_state. Cached on success; a hard
     failure (bad password, 2FA, Google's automation block) is remembered
     for the process lifetime so every subsequent meeting doesn't retry a
     login that will fail the same way — and, more importantly, doesn't
-    hammer Google with repeat attempts and get the account locked."""
+    hammer Google with repeat attempts and get the account locked.
+
+    On failure a screenshot of Google's page goes to the chat when `bot`
+    is supplied: the sign-in front-end varies by region/account/risk
+    signals, and guessing at it blind is exactly what dragged the earlier
+    join debugging out."""
     global _google_login_failed_reason
     if not settings.meeting_google_auto_login_enabled:
         return None, None
@@ -268,23 +309,35 @@ async def _ensure_google_login(browser) -> tuple[dict | None, str | None]:
 
     context = None
     try:
-        context = await browser.new_context()
+        context = await browser.new_context(user_agent=_REALISTIC_UA, locale="en-US")
+        await context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+        )
         page = await context.new_page()
         await page.goto(
-            "https://accounts.google.com/ServiceLogin?service=mail",
+            "https://accounts.google.com/ServiceLogin?service=mail&hl=en",
             timeout=_JOIN_TIMEOUT_MS,
+            wait_until="domcontentloaded",
         )
 
-        await page.fill('input[type="email"]', settings.meeting_google_email, timeout=15_000)
-        await page.keyboard.press("Enter")
-        try:
-            await page.wait_for_selector('input[type="password"]', timeout=20_000)
-        except Exception:  # noqa: BLE001
+        if not await _fill_first_selector(page, _EMAIL_SELECTORS, settings.meeting_google_email):
             reason = await _google_login_failure_reason(page, stage="email")
             _google_login_failed_reason = reason
+            if bot is not None and chat_id is not None:
+                await _send_debug_screenshot(
+                    bot, chat_id, page, "Google login sahifasi shunday ko'rindi (email bosqichi):"
+                )
             return None, reason
+        await page.keyboard.press("Enter")
 
-        await page.fill('input[type="password"]', settings.meeting_google_password, timeout=15_000)
+        if not await _fill_first_selector(page, _PASSWORD_SELECTORS, settings.meeting_google_password):
+            reason = await _google_login_failure_reason(page, stage="email")
+            _google_login_failed_reason = reason
+            if bot is not None and chat_id is not None:
+                await _send_debug_screenshot(
+                    bot, chat_id, page, "Google login sahifasi shunday ko'rindi (parol bosqichi):"
+                )
+            return None, reason
         await page.keyboard.press("Enter")
 
         # A successful sign-in lands on myaccount/mail; anything else means
@@ -297,6 +350,10 @@ async def _ensure_google_login(browser) -> tuple[dict | None, str | None]:
         except Exception:  # noqa: BLE001
             reason = await _google_login_failure_reason(page, stage="password")
             _google_login_failed_reason = reason
+            if bot is not None and chat_id is not None:
+                await _send_debug_screenshot(
+                    bot, chat_id, page, "Google login yakunlanmadi — sahifa shunday ko'rindi:"
+                )
             return None, reason
 
         state = await context.storage_state()
@@ -345,11 +402,15 @@ async def _google_login_failure_reason(page, stage: str) -> str:
         return "Parol noto'g'ri — MEETING_GOOGLE_PASSWORD ni tekshiring."
     if "couldn't find your google account" in body or "enter a valid email" in body:
         return "Bunday Google akkaunt topilmadi — MEETING_GOOGLE_EMAIL ni tekshiring."
+    hint = await _page_hint(page)
     if stage == "email":
-        return "Google login sahifasida parol maydoniga o'tolmadim (Google jarayonni to'xtatdi)."
+        return (
+            "Google login sahifasidagi maydonni topolmadim — Google odatdagidan boshqa "
+            f"sahifa ko'rsatdi ({hint}). Skrinshotga qarang."
+        )
     return (
         "Google login yakunlanmadi — ehtimol qo'shimcha tasdiqlash so'raldi "
-        "(telefon raqami, zaxira email yoki qurilmani tasdiqlash)."
+        f"(telefon raqami, zaxira email yoki qurilmani tasdiqlash). {hint}"
     )
 
 
@@ -506,7 +567,7 @@ async def _run_session(session: MeetingSession, bot) -> None:
             # An explicitly pasted session wins; auto-login is the fallback.
             storage_state = _load_storage_state()
             if storage_state is None:
-                storage_state, login_error = await _ensure_google_login(browser)
+                storage_state, login_error = await _ensure_google_login(browser, bot, chat_id)
                 # Meet cannot work without a signed-in browser, so a login
                 # failure there is fatal and worth reporting properly.
                 # Zoom/Teams take guests, so they carry on anonymously.
