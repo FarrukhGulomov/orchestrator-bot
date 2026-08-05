@@ -215,6 +215,9 @@ class _FakeContext:
     async def new_page(self):
         return _FakePage()
 
+    async def add_init_script(self, script):
+        pass
+
     async def close(self):
         pass
 

@@ -353,6 +353,13 @@ async def _google_login_failure_reason(page, stage: str) -> str:
     )
 
 
+# Playwright's default UA contains "HeadlessChrome" even in headed mode on
+# some builds, which is a trivial automation tell for anything checking.
+_REALISTIC_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
+
 _DISPLAY = ":99"
 _display_ready = False
 
@@ -480,6 +487,14 @@ async def _run_session(session: MeetingSession, bot) -> None:
                 args=[
                     "--autoplay-policy=no-user-gesture-required",
                     "--use-fake-ui-for-media-stream",
+                    # Playwright's Chromium advertises itself as automated
+                    # (navigator.webdriver, the "Chrome is being controlled
+                    # by automated software" surface). Meeting platforms
+                    # check for that, so a rejection can be about the
+                    # browser looking automated rather than about the
+                    # account — worth removing as a variable before
+                    # concluding it's purely a permissions problem.
+                    "--disable-blink-features=AutomationControlled",
                 ],
                 # Playwright's `env` REPLACES the child process's entire
                 # environment rather than merging with it — passing just
@@ -504,6 +519,14 @@ async def _run_session(session: MeetingSession, bot) -> None:
             context = await browser.new_context(
                 permissions=["microphone", "camera"],
                 storage_state=storage_state,
+                user_agent=_REALISTIC_UA,
+                viewport={"width": 1280, "height": 720},
+                locale="en-US",
+            )
+            # The launch flag above doesn't clear navigator.webdriver on its
+            # own; this does, before any page script can read it.
+            await context.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
             )
             page = await context.new_page()
 
@@ -725,10 +748,15 @@ async def _meet_block_reason(page) -> str | None:
         if not signed_in:
             return (
                 "Google Meet anonim (akkauntga kirmagan) brauzerni qo'ng'iroqqa umuman qo'ymaydi — "
-                "\"Ask to join\" tugmasi ham ko'rsatilmaydi. Bu kod xatosi emas, Google siyosati.\n\n"
-                "Yechim: bot uchun ALOHIDA Google akkaunt oching, brauzerda unga kiring va "
-                "sessiyani MEETING_STORAGE_STATE_JSON ga saqlang (README'dagi \"Google sessiyasi\" "
-                "bo'limiga qarang). Yoki uchrashuvni Zoom/Teams'da o'tkazing — ular mehmon "
+                "\"Ask to join\" tugmasi ham ko'rsatilmaydi. Bu kod xatosi emas, Google siyosati, "
+                "va kod bilan aylanib o'tib bo'lmaydi.\n\n"
+                "HOZIR botda hech qanday Google akkaunt sozlanmagan. Railway → Variables'ga "
+                "quyidagilardan BIRINI qo'shing:\n"
+                "  • MEETING_GOOGLE_EMAIL + MEETING_GOOGLE_PASSWORD — bot o'zi kiradi "
+                "(2FA'siz alohida akkaunt kerak; Google server IP'sidan bloklashi mumkin), yoki\n"
+                "  • MEETING_STORAGE_STATE_JSON — qo'lda tayyorlangan sessiya (ishonchliroq, "
+                "README'dagi \"Google-сессия\" bo'limi).\n\n"
+                "Akkauntsiz sinash uchun: Zoom yoki Teams havolasini yuboring — ular mehmon "
                 "sifatida kirishga ruxsat beradi."
             )
         # Most likely an expired session — drop the cached login so the
