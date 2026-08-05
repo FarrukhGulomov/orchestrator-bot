@@ -88,6 +88,21 @@ def detect_platform(url: str) -> MeetingPlatform:
     return MeetingPlatform.UNKNOWN
 
 
+def normalize_url(url: str) -> str:
+    """Adds the https:// scheme when it's missing. People paste meeting
+    links the way chat apps render them — "meet.google.com/abc-defg-hij",
+    no scheme — and Playwright's page.goto() rejects a schemeless URL
+    outright ("Cannot navigate to invalid URL"), which surfaced as a
+    confusing "couldn't find the UI elements" failure with a blank
+    about:blank screenshot: the browser never navigated anywhere at all."""
+    url = (url or "").strip()
+    # Strip surrounding angle brackets/quotes some clients add on paste.
+    url = url.strip("<>\"'")
+    if url and not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", url):
+        url = f"https://{url}"
+    return url
+
+
 def disclosure_text(platform: MeetingPlatform) -> str:
     """The message posted in the meeting's chat on join. Kept short so it
     fits every platform's chat box, and deliberately not fully
@@ -228,6 +243,7 @@ async def start(chat_id: int, user_id: int, meeting_url: str, bot) -> MeetingSes
     if shutil.which("ffmpeg") is None:
         raise MeetingBotUnavailable("ffmpeg topilmadi (audio yozib olish uchun kerak).")
 
+    meeting_url = normalize_url(meeting_url)
     platform = detect_platform(meeting_url)
     if platform is MeetingPlatform.UNKNOWN:
         raise MeetingBotUnavailable(
@@ -310,12 +326,12 @@ async def _run_session(session: MeetingSession, bot) -> None:
             context = await browser.new_context(permissions=["microphone", "camera"])
             page = await context.new_page()
 
-            joined = await _join(
+            joined, join_error = await _join(
                 page, session.platform, session.meeting_url, settings.meeting_bot_display_name
             )
             if not joined:
                 session.status = "failed"
-                session.error = "Uchrashuvga qo'shila olmadim (interfeys elementlari topilmadi yoki host qabul qilmadi)."
+                session.error = f"Uchrashuvga qo'shila olmadim — {join_error or 'sabab nomaʼlum'}"
                 await _notify(bot, chat_id, f"⚠️ {session.error}")
                 await _send_debug_screenshot(bot, chat_id, page, "Qo'shilishga urinilgan payt sahifa shunday ko'rinardi:")
                 return
@@ -443,12 +459,18 @@ async def _deliver_minutes(bot, chat_id: int, transcript: str) -> None:
 # wrapped so a selector miss fails that ONE step (join/announce returns
 # False) rather than raising and losing the ability to leave cleanly.
 # --------------------------------------------------------------------------
-async def _join(page, platform: MeetingPlatform, meeting_url: str, display_name: str) -> bool:
+async def _join(
+    page, platform: MeetingPlatform, meeting_url: str, display_name: str,
+) -> tuple[bool, str | None]:
+    """Returns (joined, reason_if_not). The reason is surfaced to the user
+    verbatim — a generic "couldn't find the UI elements" message hid a
+    plain navigation failure (schemeless URL) for a whole debugging round,
+    so failures here say which step actually broke."""
     try:
         await page.goto(meeting_url, timeout=_JOIN_TIMEOUT_MS)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         logger.exception("Failed to navigate to meeting URL")
-        return False
+        return False, f"havolani ocholmadim: {str(exc)[:200]}"
     try:
         if platform is MeetingPlatform.GOOGLE_MEET:
             return await _join_google_meet(page, display_name)
@@ -456,9 +478,10 @@ async def _join(page, platform: MeetingPlatform, meeting_url: str, display_name:
             return await _join_zoom(page, display_name)
         if platform is MeetingPlatform.TEAMS:
             return await _join_teams(page, display_name)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         logger.exception("Join flow raised for platform=%s", platform.value)
-    return False
+        return False, f"qo'shilish jarayonida xatolik: {str(exc)[:200]}"
+    return False, "qo'llab-quvvatlanmaydigan platforma"
 
 
 async def _fill_name_field(page, display_name: str) -> None:
@@ -487,20 +510,37 @@ async def _click_first(page, patterns: list[str], timeout: int = 8000) -> bool:
     return False
 
 
-async def _join_google_meet(page, display_name: str) -> bool:
+async def _page_hint(page) -> str:
+    """A short "what was actually on screen" string for failure messages —
+    the page title plus the first bit of visible text. Google Meet's
+    sign-in wall and "you can't join this call" states look identical to a
+    selector break from the outside without this."""
+    try:
+        title = await page.title()
+    except Exception:  # noqa: BLE001
+        title = "?"
+    body = ""
+    try:
+        body = ((await page.inner_text("body")) or "").strip().replace("\n", " / ")[:200]
+    except Exception:  # noqa: BLE001
+        pass
+    return f"sahifa: \"{title}\"" + (f" — {body}" if body else "")
+
+
+async def _join_google_meet(page, display_name: str) -> tuple[bool, str | None]:
     await _fill_name_field(page, display_name)
     if not await _click_first(page, [r"ask to join", r"join now"]):
-        return False
+        return False, f"\"Ask to join\"/\"Join now\" tugmasi topilmadi ({await _page_hint(page)})"
     try:
         await page.get_by_role("button", name=re.compile(r"leave call|leave", re.I)).first.wait_for(
             timeout=_JOIN_TIMEOUT_MS
         )
-        return True
+        return True, None
     except Exception:  # noqa: BLE001
-        return False
+        return False, f"tugma bosildi, lekin qo'ng'iroqqa kirmadim — host qabul qilmadi yoki kutish xonasida qoldim ({await _page_hint(page)})"
 
 
-async def _join_zoom(page, display_name: str) -> bool:
+async def _join_zoom(page, display_name: str) -> tuple[bool, str | None]:
     try:
         link = page.get_by_text(re.compile(r"join from.*browser", re.I))
         if await link.count() > 0:
@@ -509,28 +549,28 @@ async def _join_zoom(page, display_name: str) -> bool:
         pass
     await _fill_name_field(page, display_name)
     if not await _click_first(page, [r"^join$", r"join meeting"]):
-        return False
+        return False, f"\"Join\" tugmasi topilmadi ({await _page_hint(page)})"
     try:
         await page.get_by_text(re.compile(r"leave meeting|end meeting", re.I)).first.wait_for(
             timeout=_JOIN_TIMEOUT_MS
         )
-        return True
+        return True, None
     except Exception:  # noqa: BLE001
         # Common failure mode: stuck in the host's waiting room — not a
         # selector bug, just no admission within the timeout.
-        return False
+        return False, f"qo'ng'iroqqa kirmadim — host qabul qilmadi yoki kutish xonasida qoldim ({await _page_hint(page)})"
 
 
-async def _join_teams(page, display_name: str) -> bool:
+async def _join_teams(page, display_name: str) -> tuple[bool, str | None]:
     await _click_first(page, [r"continue on this browser", r"use the web app instead"])
     await _fill_name_field(page, display_name)
     if not await _click_first(page, [r"join now", r"join$"]):
-        return False
+        return False, f"\"Join now\" tugmasi topilmadi ({await _page_hint(page)})"
     try:
         await page.get_by_text(re.compile(r"leave", re.I)).first.wait_for(timeout=_JOIN_TIMEOUT_MS)
-        return True
+        return True, None
     except Exception:  # noqa: BLE001
-        return False
+        return False, f"qo'ng'iroqqa kirmadim — host qabul qilmadi yoki kutish xonasida qoldim ({await _page_hint(page)})"
 
 
 async def _announce(page, platform: MeetingPlatform, text: str) -> bool:
