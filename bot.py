@@ -1926,6 +1926,12 @@ async def cmd_status(message: Message) -> None:
         "✅ Yoqilgan" if meeting_attendee.playwright_available() else "⚠️ Yoqilgan, lekin Playwright/ffmpeg topilmadi"
     )
     lines.append(f"**Uchrashuvga qo'shilish (/uchrashuv):** {meeting_status}")
+    if settings.meeting_bot_enabled:
+        google_session = (
+            "✅ Sozlangan" if meeting_attendee.storage_state_configured()
+            else "❌ Yo'q — Google Meet anonim brauzerni qo'ymaydi (Zoom/Teams ishlaydi)"
+        )
+        lines.append(f"  ↳ Google sessiyasi: {google_session}")
 
     from agents import AGENTS
     lines.append(f"\n**Faol agentlar ({len(AGENTS)} ta):**")

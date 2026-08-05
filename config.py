@@ -393,6 +393,23 @@ class Settings:
     meeting_bot_headless: bool = field(
         default_factory=lambda: os.getenv("MEETING_BOT_HEADLESS", "false").lower() == "true"
     )
+    # A Playwright storage_state JSON blob (cookies + localStorage) for a
+    # browser session that's already signed in to a Google account.
+    #
+    # WHY THIS EXISTS: Google Meet refuses anonymous browsers outright
+    # ("You can't join this video call" — it never even offers the "Ask to
+    # join" knock), so without a signed-in session the Meet path cannot
+    # work at all. Zoom and Teams generally do allow guest joins, so this
+    # is Meet-specific in practice.
+    #
+    # ⚠️ These cookies grant access to the Google account they came from —
+    # use a DEDICATED account for the bot, never a personal/admin one, and
+    # treat this value like a password. Google also expires these
+    # periodically (and may invalidate them on a datacenter-IP login), so
+    # expect to refresh it; the bot reports a clear error when it lapses.
+    meeting_storage_state_json: str = field(
+        default_factory=lambda: os.getenv("MEETING_STORAGE_STATE_JSON", "")
+    )
 
     # --- Persistent storage (PostgreSQL) ------------------------------------
     # The durable "source of truth" for relational business data: users/
