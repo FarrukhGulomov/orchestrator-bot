@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "codex": {
+      "command": "python",
+      "args": ["/absolute/path/to/mcp_codex_server/server.py"],
+      "env": {
+        "OPENAI_API_KEY": "${OPENAI_API_KEY}"
+      }
+    }
+  }
+}
