@@ -2046,6 +2046,11 @@ async def cmd_status(message: Message) -> None:
             "\nBiri ishlamay qolsa (kalit noto'g'ri/limit tugagan), keyingisi "
             "avtomatik javob beradi — bot to'xtab qolmaydi."
         )
+        if "gemini" in active_chain:
+            lines.append(
+                "🇺🇿 O'zbekcha xabarlarga navbatdan qat'iy nazar birinchi "
+                "Gemini javob beradi (o'zbek tilida sifatliroq yozadi)."
+            )
         if settings.telemetry_enabled:
             health = await telemetry.provider_health(24)
             if health:

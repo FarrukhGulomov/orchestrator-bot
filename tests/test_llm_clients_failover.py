@@ -138,3 +138,117 @@ def test_configured_chain_filters_to_only_providers_with_keys(reload_env):
         "PROVIDER_PRIORITY": "openai,claude,gemini,grok,deepseek,kimi,openrouter",
     })
     assert llm._configured_chain() == ["openai", "deepseek"]
+
+
+def test_looks_uzbek_positive_and_negative_cases(reload_env):
+    _cfg, llm, _tel = reload_env({})
+    assert llm._looks_uzbek("ertaga soat 15:00 da hisobot topshirishim kerak") is True
+    assert llm._looks_uzbek("bu haqida yordam kerak, rahmat") is True
+    assert llm._looks_uzbek("Ҳисобот учун раҳмат") is True  # Uzbek Cyrillic-only letters
+    assert llm._looks_uzbek("") is False
+    assert llm._looks_uzbek("can you help me write a SQL query?") is False
+    assert llm._looks_uzbek("привет, как дела, спасибо большое") is False
+
+
+async def test_uzbek_message_tries_gemini_first_regardless_of_priority(reload_env):
+    _cfg, llm, _tel = reload_env({
+        "OPENAI_API_KEY": "k1", "GEMINI_API_KEY": "k2",
+        "PROVIDER_PRIORITY": "openai,gemini",  # openai would normally go first
+    })
+    tried = []
+
+    def fake(key, model, system, messages, temperature, max_tokens, usage_out=None):
+        tried.append(key)
+        return f"answer-from-{key}"
+
+    llm._call_main_sync = fake
+    result = await llm.claude_generate(
+        "sys", [{"role": "user", "content": "ertaga uchrashuvni eslatib qo'y, iltimos"}],
+    )
+    assert tried == ["gemini"]
+    assert result == "answer-from-gemini"
+
+
+async def test_uzbek_message_falls_back_past_gemini_on_failure(reload_env):
+    _cfg, llm, _tel = reload_env({
+        "OPENAI_API_KEY": "k1", "GEMINI_API_KEY": "k2",
+        "PROVIDER_PRIORITY": "openai,gemini",
+    })
+    tried = []
+
+    def fake(key, model, system, messages, temperature, max_tokens, usage_out=None):
+        tried.append(key)
+        if key == "gemini":
+            raise RuntimeError("gemini quota exhausted")
+        return f"answer-from-{key}"
+
+    llm._call_main_sync = fake
+    result = await llm.claude_generate(
+        "sys", [{"role": "user", "content": "bugun kerakli hisobotni tayyorlab bering"}],
+    )
+    assert tried == ["gemini", "openai"]
+    assert result == "answer-from-openai"
+
+
+async def test_non_uzbek_message_does_not_prioritize_gemini(reload_env):
+    _cfg, llm, _tel = reload_env({
+        "OPENAI_API_KEY": "k1", "GEMINI_API_KEY": "k2",
+        "PROVIDER_PRIORITY": "openai,gemini",
+    })
+    tried = []
+
+    def fake(key, model, system, messages, temperature, max_tokens, usage_out=None):
+        tried.append(key)
+        return f"answer-from-{key}"
+
+    llm._call_main_sync = fake
+    result = await llm.claude_generate("sys", [{"role": "user", "content": "please write a SQL query"}])
+    assert tried == ["openai"]
+    assert result == "answer-from-openai"
+
+
+async def test_uzbek_preference_skipped_entirely_when_gemini_not_configured(reload_env):
+    _cfg, llm, _tel = reload_env({"OPENAI_API_KEY": "k1"})  # no GEMINI_API_KEY
+    tried = []
+
+    def fake(key, model, system, messages, temperature, max_tokens, usage_out=None):
+        tried.append(key)
+        return f"answer-from-{key}"
+
+    llm._call_main_sync = fake
+    result = await llm.claude_generate("sys", [{"role": "user", "content": "ertaga eslatib qo'y"}])
+    assert tried == ["openai"]
+    assert result == "answer-from-openai"
+
+
+async def test_gemini_uses_separate_fast_model_for_fast_tier(reload_env):
+    # Routing/classification calls (claude_generate_fast, no explicit model)
+    # must not hit the pricier main Gemini model on every Uzbek message.
+    _cfg, llm, _tel = reload_env({"GEMINI_API_KEY": "k2"})
+    seen_models = []
+
+    def fake(key, model, system, messages, temperature, max_tokens, usage_out=None):
+        seen_models.append(model)
+        return "ok"
+
+    llm._call_main_sync = fake
+    await llm.claude_generate_fast("sys", [{"role": "user", "content": "ertaga eslatib qo'y"}])
+    assert seen_models == [_cfg.settings.gemini_fast_model]
+    assert _cfg.settings.gemini_fast_model != _cfg.settings.gemini_model
+
+
+async def test_uzbek_preference_applies_to_json_failover_too(reload_env):
+    _cfg, llm, _tel = reload_env({
+        "OPENAI_API_KEY": "k1", "GEMINI_API_KEY": "k2",
+        "PROVIDER_PRIORITY": "openai,gemini",
+    })
+    tried = []
+
+    def fake_json(key, model, system, messages, max_tokens, usage_out=None):
+        tried.append(key)
+        return '{"ok": true}'
+
+    llm._call_json_sync = fake_json
+    result = await llm.claude_generate_json("sys", [{"role": "user", "content": "bugungi vazifalarni ko'rsat"}])
+    assert tried == ["gemini"]
+    assert result == '{"ok": true}'

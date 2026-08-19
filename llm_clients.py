@@ -18,6 +18,15 @@ Public API (provider-transparent):
 
 Retry logic: 3x exponential backoff (2s → 4s → 8s) on 503/429/529 PER
 PROVIDER, before moving on to the next provider in the chain.
+
+LANGUAGE-DRIVEN PREFERENCE: an Uzbek message jumps Gemini to the front of
+the attempt order regardless of PROVIDER_PRIORITY, if GEMINI_API_KEY is
+configured — see _looks_uzbek(). Reported directly by the bot's operator:
+Gemini answers Uzbek noticeably more fluently than the other providers.
+This only ever REORDERS the first attempt; the full configured chain
+(including whatever PROVIDER_PRIORITY/an explicit preferred model would
+have tried) still runs afterward if Gemini is unavailable or fails, so it
+never narrows the failover safety net — just biases who answers first.
 """
 
 import asyncio
@@ -34,6 +43,28 @@ logger = logging.getLogger(__name__)
 
 _MAX_RETRIES = 3
 _RETRY_BASE = 2  # seconds
+
+# Gemini answers Uzbek noticeably more fluently than the other configured
+# providers (reported directly by the bot's operator) — worth a quality-
+# driven preference, not just whatever PROVIDER_PRIORITY says. This is a
+# best-effort LANGUAGE SIGNAL, not real language ID: good enough to pick a
+# preferred provider, not to gate a feature. A false positive/negative just
+# means an ordinary provider answers instead of the preferred one — never a
+# broken reply, since the full failover chain still runs either way.
+_UZBEK_CYRILLIC_ONLY = ("ў", "қ", "ғ", "ҳ")  # not in the standard Russian alphabet
+_UZBEK_WORDS = (
+    "bo'l", "bo'ladi", "qil", "qiladi", "uchun", "bilan", "kerak", "ekan",
+    "rahmat", "salom", "yordam", "qanday", "nima", "qachon", "bugun",
+    "ertaga", "sizga", "menga", "bizga", "iltimos", "tushun", "haqida",
+    "o'zbek", "yaxshi", "albatta", "javob", "savol",
+)
+
+
+def _looks_uzbek(text: str) -> bool:
+    low = (text or "").lower()
+    if any(ch in low for ch in _UZBEK_CYRILLIC_ONLY):
+        return True
+    return any(w in low for w in _UZBEK_WORDS)
 
 # --------------------------------------------------------------------------
 # Lazy singletons
@@ -391,7 +422,7 @@ def _provider_models(key: str) -> tuple[str, str, str]:
     return {
         "claude": (settings.claude_model, settings.claude_fast_model, "Claude"),
         "openai": (settings.openai_model, settings.openai_model, settings.openai_model_label),
-        "gemini": (settings.gemini_model, settings.gemini_model, settings.gemini_model_label),
+        "gemini": (settings.gemini_model, settings.gemini_fast_model, settings.gemini_model_label),
         "grok": (settings.grok_model, settings.grok_model, settings.grok_model_label),
         "deepseek": (settings.deepseek_model, settings.deepseek_model, settings.deepseek_model_label),
         "kimi": (settings.kimi_model, settings.kimi_model, settings.kimi_model_label),
@@ -523,15 +554,34 @@ async def _generate_with_failover(
     tried: set[str] = set()
     last_exc: Exception | None = None
 
+    # Uzbek gets a quality-driven preference for Gemini (see _looks_uzbek),
+    # tried BEFORE the router's own preferred_model — a fluent answer in
+    # the user's language matters more here than the general "best model"
+    # ranking. This only ever REORDERS the first attempt; every provider,
+    # including whatever preferred_model would have been, is still tried
+    # afterward if Gemini is unavailable or fails, so it never narrows the
+    # failover safety net.
+    if "gemini" in chain and _looks_uzbek(" ".join(str(m.get("content", "")) for m in messages)):
+        main_model, fast_model, _label = _provider_models("gemini")
+        try:
+            return await _attempt(
+                _call_main_sync, "gemini", main_model if tier == "main" else fast_model,
+                tier, 0, system, messages, temperature, max_tokens,
+            )
+        except Exception as exc:
+            last_exc = exc
+            logger.warning("Gemini (Uzbek preference) failed, falling back: %s", str(exc)[:200])
+            tried.add("gemini")
+
     # An explicit model id (e.g. from router.model_for()) is honored as the
-    # first attempt if its provider is in the chain, before falling through
+    # next attempt if its provider is in the chain, before falling through
     # to the standard priority order.
     if preferred_model:
         preferred_key = "openrouter" if "/" in preferred_model else "claude"
-        if preferred_key in chain:
+        if preferred_key in chain and preferred_key not in tried:
             try:
                 return await _attempt(
-                    _call_main_sync, preferred_key, preferred_model, tier, 0,
+                    _call_main_sync, preferred_key, preferred_model, tier, len(tried),
                     system, messages, temperature, max_tokens,
                 )
             except Exception as exc:
@@ -572,12 +622,27 @@ async def _generate_json_with_failover(
     tried: set[str] = set()
     last_exc: Exception | None = None
 
+    # See the identical block in _generate_with_failover for why Uzbek
+    # jumps the queue for Gemini specifically, and why this only reorders
+    # rather than narrows the failover chain.
+    if "gemini" in chain and _looks_uzbek(" ".join(str(m.get("content", "")) for m in messages)):
+        main_model, fast_model, _label = _provider_models("gemini")
+        try:
+            return await _attempt(
+                _call_json_sync, "gemini", main_model if tier == "main" else fast_model,
+                tier, 0, system, messages, max_tokens,
+            )
+        except Exception as exc:
+            last_exc = exc
+            logger.warning("Gemini (Uzbek preference) failed (JSON), falling back: %s", str(exc)[:200])
+            tried.add("gemini")
+
     if preferred_model:
         preferred_key = "openrouter" if "/" in preferred_model else "claude"
-        if preferred_key in chain:
+        if preferred_key in chain and preferred_key not in tried:
             try:
                 return await _attempt(
-                    _call_json_sync, preferred_key, preferred_model, tier, 0,
+                    _call_json_sync, preferred_key, preferred_model, tier, len(tried),
                     system, messages, max_tokens,
                 )
             except Exception as exc:
