@@ -11,6 +11,7 @@ and the background reminder loop.
 
 import asyncio
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot
@@ -77,10 +78,26 @@ _TIME_SIGNAL_WORDS = (
     "today", "tomorrow",
 )
 
+# A pasted calendar-invite-style dump ("Встреча по продуктам ... чт 20,
+# авг. 11:30 - 12:00") never says "eslat"/"напомни"/"kerak" — it's just
+# event details, no request phrasing at all — so neither branch above
+# catches it. A meeting/call word PLUS an actual clock time (not just any
+# digit, which is too common to mean anything alone) is specific enough on
+# its own: nobody pastes "встреча ... 11:30" without wanting it tracked.
+_MEETING_WORDS = (
+    "uchrashuv", "yig'ilish", "qo'ng'iroq", "kelishuv", "suhbat",
+    "учрашув", "йиғилиш",
+    "встреча", "совещание", "созвон", "звонок", "собрание",
+    "meeting", "call", "sync", "standup", "kickoff", "interview",
+)
+_CLOCK_TIME_RE = re.compile(r"\b\d{1,2}[:.]\d{2}\b")
+
 
 def looks_like_task(text: str) -> bool:
     low = text.lower()
     if any(w in low for w in _TRIGGER_WORDS):
+        return True
+    if any(w in low for w in _MEETING_WORDS) and _CLOCK_TIME_RE.search(low):
         return True
     has_obligation = any(w in low for w in _OBLIGATION_WORDS)
     if not has_obligation:
