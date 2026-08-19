@@ -13,6 +13,23 @@ def test_reported_bug_now_detected():
     assert ta.looks_like_task("я хочу чтобы ти завтра мне вспомнить эту встрече") is True
 
 
+def test_pasted_calendar_invite_detected_without_any_request_phrasing():
+    """Second reported gap: a forwarded meeting-invite dump has no "eslat"/
+    "напомни"/"kerak" anywhere — it's pure event details, no request
+    phrasing at all. A meeting word + an actual clock time is the signal."""
+    assert ta.looks_like_task(
+        "Встреча по продуктам в RS 1303 и 1305 чт 20, авг. 11:30 - 12:00"
+    ) is True
+    assert ta.looks_like_task("ertaga uchrashuv bor, soat 14:00 da") is True
+
+
+def test_meeting_word_alone_without_clock_time_not_flagged():
+    # A meeting word with no time attached isn't specific enough to assume
+    # tracking is wanted ("yig'ilishda 5 kishi bor edi" — just a comment).
+    assert ta.looks_like_task("yig'ilishda 5 kishi bor edi") is False
+    assert ta.looks_like_task("kecha yaxshi suhbat bo'ldi") is False
+
+
 def test_standard_trigger_words_across_scripts():
     assert ta.looks_like_task("ertaga eslatib qo'y") is True
     assert ta.looks_like_task("эртага эслатиб қўй") is True
