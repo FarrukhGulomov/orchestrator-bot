@@ -19,6 +19,19 @@ def test_platform_detection():
     assert ma.detect_platform("") == ma.MeetingPlatform.UNKNOWN
 
 
+def test_extract_meeting_url_finds_link_inside_a_sentence():
+    """Natural-language join detection: the link doesn't have to be the
+    whole message, and doesn't need a scheme."""
+    text = "keling ertaga meet.google.com/fov-kayt-yno da uchrashamiz soat 15da"
+    assert ma.extract_meeting_url(text) == "https://meet.google.com/fov-kayt-yno"
+
+    assert ma.extract_meeting_url("no link here") is None
+    assert ma.extract_meeting_url("") is None
+
+    zoom = "join here: https://us02web.zoom.us/j/123456789?pwd=abc please"
+    assert ma.extract_meeting_url(zoom) == "https://us02web.zoom.us/j/123456789?pwd=abc"
+
+
 def test_normalize_url_adds_missing_scheme():
     """Regression: people paste links the way chat apps render them, with
     no scheme. Playwright's page.goto() rejects those outright, which

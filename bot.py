@@ -282,6 +282,12 @@ WELCOME_TOUR_TEXT = (
     "5️⃣ Xarajat hisobi — \"taksiga 30 ming\" deb yozing → yozib boraman, "
     "/xarajatlar bilan oylik hisobot. /byudjet 3 mln bilan chegara qo'ying — "
     "80% va 100% da o'zim ogohlantiraman\n\n"
+    "6️⃣ Qaror jurnali — \"PostgreSQL ishlatishga qaror qildik\" deb yozing → "
+    "o'zim qarorlar jurnaliga yozib qo'yaman, /decisions bilan ko'ring\n\n"
+    "7️⃣ Uchrashuvga qo'shilish — Meet/Zoom/Teams havolasini shunchaki yuboring "
+    "→ qo'shilib, ochiq e'lon bilan yozib olishni so'rayman (ruxsatingizdan keyin)\n\n"
+    "Buyruq (\"/\") yozish shart emas — yuqoridagilarning barchasi oddiy "
+    "yozuvdan avtomatik aniqlanadi.\n\n"
     "☀️ Har kuni ertalab kunlik reja (vazifalaringiz, muddatlar, eslatmalar) "
     "olib turishni xohlaysizmi?"
 )
@@ -644,6 +650,14 @@ _proactive_last: dict[int, float] = {}
 # the first is still generating gets a polite "wait" instead of spawning more
 # parallel chains/collaborations (each one is multiple LLM calls).
 _in_flight: set[int] = set()
+
+# Natural-language meeting-join detection: a pasted Meet/Zoom/Teams link
+# waits here for the confirm button (see handle_meeting_join_callback) —
+# joining a live call is consequential enough (it announces itself to real
+# people) that it needs an explicit tap, unlike task/expense/decision
+# auto-capture below which just happen. In-memory only, on purpose: losing
+# this on a restart just means re-pasting the link, not lost data.
+_pending_meeting_url: dict[int, str] = {}
 
 # Grouped agent catalogue — used by /agents (discoverability) and /status.
 # Keys must match agents.AGENTS; anything missing there is skipped gracefully.
@@ -2491,6 +2505,45 @@ async def cmd_meeting_history(message: Message) -> None:
     await _send_long(message, "\n".join(lines))
 
 
+@dp.callback_query(F.data.startswith("meetjoin:"))
+async def handle_meeting_join_callback(callback: CallbackQuery, bot: Bot) -> None:
+    if not callback.data or not callback.message:
+        await callback.answer()
+        return
+    chat_id = callback.message.chat.id
+    if not _is_allowed(chat_id):
+        await callback.answer()
+        return
+    action = callback.data.split(":", 1)[1]
+    url = _pending_meeting_url.pop(chat_id, None)
+    if action != "yes" or not url:
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except TelegramBadRequest:
+            pass
+        await callback.answer("Havola eskirgan, qayta yuboring" if action == "yes" else "Bekor qilindi")
+        return
+    uid = callback.from_user.id if callback.from_user else 0
+    try:
+        await meeting_attendee.start(chat_id, uid, url, bot)
+    except meeting_attendee.MeetingBotUnavailable as exc:
+        await callback.answer()
+        try:
+            await callback.message.edit_text(f"⚠️ {exc}", reply_markup=None)
+        except TelegramBadRequest:
+            pass
+        return
+    await callback.answer("Qo'shilyapman...")
+    try:
+        await callback.message.edit_text(
+            "🔄 Uchrashuvga qo'shilyapman... Qo'shilgach chatda ochiq e'lon qilaman, "
+            "shundan keyingina yozib olishni boshlayman. Tugatish: /uchrashuvtugat",
+            reply_markup=None,
+        )
+    except TelegramBadRequest:
+        pass
+
+
 @dp.callback_query(F.data.startswith("acc:"))
 async def handle_access_callback(callback: CallbackQuery, bot: Bot) -> None:
     if not callback.data or not callback.message:
@@ -3529,6 +3582,35 @@ async def handle_text(message: Message, bot: Bot) -> None:
         ):
             uid = message.from_user.id if message.from_user else 0
             if await expense_handlers.try_log_expense(message, uid, chat_id, user_text):
+                return
+        # Natural-language decision capture ("qaror qildik ..."). Low-stakes
+        # and reversible (/cleardecisions), so — like tasks/expenses above —
+        # it just logs and confirms rather than asking permission first.
+        if message.chat.type == "private" and decisions_store.looks_like_decision(user_text):
+            entry = await decisions_store.extract_decision(user_text)
+            if entry is not None and await decisions_store.add_decision(chat_id, entry):
+                await message.answer(f"📖 Qarorlar jurnaliga yozildi:\n{entry}")
+                return
+        # Natural-language meeting-join: a pasted Meet/Zoom/Teams link gets a
+        # confirm button rather than auto-joining — see _pending_meeting_url's
+        # comment for why this one isn't a silent auto-capture like the above.
+        if (
+            message.chat.type == "private"
+            and settings.meeting_bot_enabled
+            and meeting_attendee.get_active(chat_id) is None
+        ):
+            found_url = meeting_attendee.extract_meeting_url(user_text)
+            if found_url:
+                _pending_meeting_url[chat_id] = found_url
+                platform = meeting_attendee.detect_platform(found_url)
+                await message.answer(
+                    f"👀 {platform.value.replace('_', ' ').title()} havolasini ko'rdim. "
+                    "Shu uchrashuvga qo'shilib, ochiq e'lon bilan yozib olishni boshlaymi?",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                        InlineKeyboardButton(text="✅ Ha, qo'shil", callback_data="meetjoin:yes"),
+                        InlineKeyboardButton(text="❌ Yo'q", callback_data="meetjoin:no"),
+                    ]]),
+                )
                 return
         # @mention, reply-to-bot, or private chat → respond normally
         await _process(message, bot, user_text, forced_type=None)
