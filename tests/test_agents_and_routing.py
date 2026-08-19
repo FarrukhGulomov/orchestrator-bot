@@ -6,6 +6,8 @@ personas — see the audit) and is edited by hand often; a duplicate name or
 a persona-less agent is an easy, silent mistake with no other safety net.
 """
 
+import json
+
 import agents
 import request_types
 import router
@@ -112,3 +114,63 @@ def test_model_for_openrouter_only_uses_or_models_for_both_tiers(monkeypatch):
     high_model, _label2 = router.model_for(agent, "high")
     assert low_model == settings.or_fast_model
     assert high_model == settings.or_main_model
+
+
+def _fake_classifier_response(monkeypatch, payload: dict):
+    async def _fake(*a, **kw):
+        return json.dumps(payload)
+
+    monkeypatch.setattr(router, "claude_generate_json", _fake)
+
+
+async def test_classify_parses_a_recognised_utility_intent(monkeypatch):
+    _fake_classifier_response(monkeypatch, {
+        "agent": "ba", "request_type": "question", "complexity": "low",
+        "utility_intent": "view_tasks",
+    })
+    route = await router.classify("nima vazifalarim bor?")
+    assert route.utility_intent == "view_tasks"
+
+
+async def test_classify_extracts_task_reference_and_search_query(monkeypatch):
+    _fake_classifier_response(monkeypatch, {
+        "agent": "ba", "request_type": "question",
+        "utility_intent": "mark_task_done", "task_reference": "hisobotni tugatdim",
+    })
+    route = await router.classify("hisobotni tugatdim")
+    assert route.utility_intent == "mark_task_done"
+    assert route.task_reference == "hisobotni tugatdim"
+
+    _fake_classifier_response(monkeypatch, {
+        "agent": "ba", "request_type": "question",
+        "utility_intent": "search_own_data", "search_query": "ijara",
+    })
+    route2 = await router.classify("ijara haqida nima yozgan edim?")
+    assert route2.utility_intent == "search_own_data"
+    assert route2.search_query == "ijara"
+
+
+async def test_classify_defaults_utility_intent_to_none(monkeypatch):
+    # Ordinary question — no utility_intent field at all in the response.
+    _fake_classifier_response(monkeypatch, {"agent": "ba", "request_type": "question"})
+    route = await router.classify("mijozlar oqimi kamaydi, nima qilay?")
+    assert route.utility_intent == "none"
+
+
+async def test_classify_rejects_unknown_utility_intent_value(monkeypatch):
+    # A hallucinated/invalid enum value must not leak through as truthy.
+    _fake_classifier_response(monkeypatch, {
+        "agent": "ba", "request_type": "question", "utility_intent": "delete_everything",
+    })
+    route = await router.classify("random message")
+    assert route.utility_intent == "none"
+
+
+async def test_classify_falls_back_gracefully_on_llm_failure(monkeypatch):
+    async def _raise(*a, **kw):
+        raise RuntimeError("provider down")
+
+    monkeypatch.setattr(router, "claude_generate_json", _raise)
+    route = await router.classify("anything")
+    assert route.utility_intent == "none"
+    assert route.agent is not None

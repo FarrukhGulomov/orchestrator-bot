@@ -287,7 +287,9 @@ WELCOME_TOUR_TEXT = (
     "7️⃣ Uchrashuvga qo'shilish — Meet/Zoom/Teams havolasini shunchaki yuboring "
     "→ qo'shilib, ochiq e'lon bilan yozib olishni so'rayman (ruxsatingizdan keyin)\n\n"
     "Buyruq (\"/\") yozish shart emas — yuqoridagilarning barchasi oddiy "
-    "yozuvdan avtomatik aniqlanadi.\n\n"
+    "yozuvdan avtomatik aniqlanadi. Ko'rishni ham shunday so'rang: \"nima "
+    "vazifalarim bor\", \"bu oy qancha sarfladim\", \"bugun rejam qanday\", "
+    "\"hisobotni tugatdim\" — barchasi ishlaydi.\n\n"
     "☀️ Har kuni ertalab kunlik reja (vazifalaringiz, muddatlar, eslatmalar) "
     "olib turishni xohlaysizmi?"
 )
@@ -1114,6 +1116,128 @@ async def _send_capability_overview(message: Message, bot: Bot, route: Route, us
 
 
 # --------------------------------------------------------------------------
+# Utility-intent dispatch — natural-language equivalents of the read-only
+# "show me X" commands (see router._ROUTER_SYSTEM's utility_intent field).
+# Deliberately excludes: destructive/bulk-clear actions (/forget,
+# /cleardecisions, /reset) and anything admin/external-facing (/approve,
+# /deny, /broadcast, /users, /whois, /stats, /xarajatai, /logs,
+# /buildlogs) — those stay explicit commands. A misfire here is a wrong
+# read; a misfire there is data loss or a message to real people, which
+# needs a deliberate command, not a probabilistic classifier's guess.
+# --------------------------------------------------------------------------
+async def _dispatch_utility_intent(message: Message, bot: Bot, route) -> bool:
+    """Returns True if the intent was fully handled (caller returns without
+    falling through to the normal agent reply). False means "didn't
+    actually apply" — most commonly mark_task_done finding no confident
+    match — and the caller should treat this message as ordinary chat."""
+    chat_id = message.chat.id
+    intent = route.utility_intent
+
+    if intent == "view_tasks":
+        await cmd_tasks(message)
+        return True
+    if intent == "view_decisions":
+        await cmd_decisions(message)
+        return True
+    if intent == "view_status":
+        await cmd_status(message)
+        return True
+    if intent == "view_memory":
+        await cmd_memory(message)
+        return True
+    if intent == "view_agents":
+        await cmd_agents(message)
+        return True
+    if intent == "view_meeting_history":
+        await cmd_meeting_history(message)
+        return True
+    if intent == "monthly_report_doc":
+        await cmd_report(message)
+        return True
+    if intent == "daily_digest_now":
+        await _send_long(message, await digest.build_digest(chat_id))
+        return True
+    if intent == "standup_draft":
+        await cmd_standup(message)
+        return True
+    if intent == "weekly_report":
+        await cmd_week(message)
+        return True
+
+    if intent == "expense_report":
+        if not expenses.available():
+            return False  # let the normal agent explain rather than a dead-end error
+        since, until, label = expenses.period_bounds("oy")
+        uid = message.from_user.id if message.from_user else 0
+        data = await expenses.summary(uid, since, until)
+        if data is None:
+            return False
+        await _send_long(message, expenses.render_summary(data, label))
+        return True
+
+    if intent == "search_own_data":
+        query = route.search_query.strip()
+        if not query:
+            return False
+        return await _run_qidir(message, chat_id, query)
+
+    if intent == "mark_task_done":
+        pending = await tasks.list_tasks(chat_id, {"pending"})
+        if not pending or not route.task_reference:
+            return False
+        match = task_assistant.match_task_by_reference(pending, route.task_reference)
+        if match is None:
+            return False  # ambiguous/no match — don't guess which reminder to close
+        task = await tasks.set_status(match.id, "done")
+        if task is None:
+            return False
+        await message.answer(f"✅ Bajarildi deb belgilandi: {task.title}")
+        return True
+
+    return False
+
+
+async def _run_qidir(message: Message, chat_id: int, query: str) -> bool:
+    """Shared by /qidir and the search_own_data natural-language intent."""
+    low = query.lower()
+    uid = message.from_user.id if message.from_user else 0
+    sections: list[str] = []
+
+    all_tasks = await tasks.list_tasks(chat_id, {"pending", "done", "cancelled"})
+    task_hits = [
+        t for t in all_tasks
+        if low in t.title.lower() or low in t.description.lower()
+    ][:8]
+    if task_hits:
+        sections.append("📋 Vazifalar:\n" + "\n".join(task_assistant.format_task_line(t) for t in task_hits))
+
+    dec_hits = [d for d in await decisions_store.get_decisions(chat_id) if low in d.lower()][:8]
+    if dec_hits:
+        sections.append("📖 Qarorlar:\n" + "\n".join(f"• {d}" for d in dec_hits))
+
+    mem_hits = [m for m in await memory.get_memory(chat_id) if low in m.lower()][:8]
+    if mem_hits:
+        sections.append("🧠 Xotira:\n" + "\n".join(f"• {m}" for m in mem_hits))
+
+    if expenses.available():
+        exp_hits = await expenses.search_notes(uid, query)
+        if exp_hits:
+            exp_lines = [
+                f"`{r['id']}` {r['spent_at'].astimezone(tasks.TZ).strftime('%d-%m')} · "
+                f"{expenses.fmt_amount(r['amount'], r['currency'])} · {r['category']}"
+                + (f" ({r['note']})" if r["note"] else "")
+                for r in exp_hits
+            ]
+            sections.append("💸 Xarajatlar:\n" + "\n".join(exp_lines))
+
+    if not sections:
+        await message.answer(f"🔎 \"{query}\" bo'yicha hech narsa topilmadi.")
+        return True
+    await _send_long(message, f"🔎 \"{query}\" bo'yicha natijalar:\n\n" + "\n\n".join(sections))
+    return True
+
+
+# --------------------------------------------------------------------------
 # Core pipeline
 # --------------------------------------------------------------------------
 async def _process(
@@ -1214,6 +1338,24 @@ async def _process_inner(
         logger.info("chat=%s -> capability overview", chat_id)
         await _send_capability_overview(message, bot, route, user_text)
         return
+
+    # Natural-language equivalents of the read-only "show me X" commands —
+    # private chats only (same reasoning as the task/expense/decision/
+    # meeting-URL auto-capture above), and only when nothing else already
+    # claimed this message (an explicit forced type/document or an
+    # explicitly @named specialist means the user wants THAT, not a data
+    # dump). See _dispatch_utility_intent's own comment for what's
+    # deliberately excluded from this path.
+    if (
+        route.utility_intent != "none"
+        and not forced_type
+        and not forced_document
+        and not named_key
+        and message.chat.type == "private"
+    ):
+        logger.info("chat=%s -> utility_intent=%s", chat_id, route.utility_intent)
+        if await _dispatch_utility_intent(message, bot, route):
+            return
 
     # Live web grounding: the classifier flagged this as depending on
     # current facts (rates, weather, news, "latest") — fetch real results
@@ -3247,41 +3389,7 @@ async def cmd_find(message: Message, command: CommandObject) -> None:
     if not query:
         await message.answer("Nimani qidirayotganingizni yozing:\n/qidir ijara")
         return
-    low = query.lower()
-    uid = message.from_user.id if message.from_user else 0
-    sections: list[str] = []
-
-    all_tasks = await tasks.list_tasks(chat_id, {"pending", "done", "cancelled"})
-    task_hits = [
-        t for t in all_tasks
-        if low in t.title.lower() or low in t.description.lower()
-    ][:8]
-    if task_hits:
-        sections.append("📋 Vazifalar:\n" + "\n".join(task_assistant.format_task_line(t) for t in task_hits))
-
-    dec_hits = [d for d in await decisions_store.get_decisions(chat_id) if low in d.lower()][:8]
-    if dec_hits:
-        sections.append("📖 Qarorlar:\n" + "\n".join(f"• {d}" for d in dec_hits))
-
-    mem_hits = [m for m in await memory.get_memory(chat_id) if low in m.lower()][:8]
-    if mem_hits:
-        sections.append("🧠 Xotira:\n" + "\n".join(f"• {m}" for m in mem_hits))
-
-    if expenses.available():
-        exp_hits = await expenses.search_notes(uid, query)
-        if exp_hits:
-            exp_lines = [
-                f"`{r['id']}` {r['spent_at'].astimezone(tasks.TZ).strftime('%d-%m')} · "
-                f"{expenses.fmt_amount(r['amount'], r['currency'])} · {r['category']}"
-                + (f" ({r['note']})" if r["note"] else "")
-                for r in exp_hits
-            ]
-            sections.append("💸 Xarajatlar:\n" + "\n".join(exp_lines))
-
-    if not sections:
-        await message.answer(f"🔎 \"{query}\" bo'yicha hech narsa topilmadi.")
-        return
-    await _send_long(message, f"🔎 \"{query}\" bo'yicha natijalar:\n\n" + "\n\n".join(sections))
+    await _run_qidir(message, chat_id, query)
 
 
 @dp.message(Command("search", "izla"))
