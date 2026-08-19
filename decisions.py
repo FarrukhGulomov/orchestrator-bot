@@ -18,10 +18,70 @@ import logging
 import db
 import redis_client
 import tasks
+from llm_clients import claude_generate_fast
 
 logger = logging.getLogger(__name__)
 
 MAX_DECISIONS = 200
+
+# Cheap pre-filter, same shape as task_assistant.looks_like_task /
+# expenses.looks_like_expense — a settled, past-tense decision has a
+# fairly distinctive vocabulary (unlike a plain statement of fact or a
+# request), so this rarely collides with the task/expense/memory triggers
+# that run in the same message pipeline.
+_TRIGGER_WORDS = (
+    # Uzbek
+    "qaror qildik", "qaror qildim", "qaror bo'ldi", "kelishildik",
+    "kelishib oldik", "shunday deb kelishdik", "qaror qabul qil",
+    # Russian
+    "решили", "договорились", "приняли решение", "решение принято",
+    # English
+    "we decided", "we've decided", "decided to", "agreed to",
+    "it's settled", "final decision",
+)
+
+
+def looks_like_decision(text: str) -> bool:
+    low = (text or "").lower()
+    if len(low) > 500:  # a long paragraph isn't a one-line decision statement
+        return False
+    return any(w in low for w in _TRIGGER_WORDS)
+
+
+_EXTRACT_SYSTEM = """
+The user's message states a decision that was made (about their project,
+team, or work) — not a question, not a task to do later, not money spent.
+Extract it as ONE dated-log entry.
+
+Respond with ONLY the entry text (imperative/past statement, same language
+as the user, max 200 chars, no prefix/quotes) — e.g. "Reliz dushanba kuniga
+ko'chirildi" or "Решили использовать PostgreSQL вместо MongoDB".
+
+If the message does NOT actually state a settled decision (it's a question,
+a plan still being discussed, a task assignment, or anything else), respond
+with exactly NONE.
+"""
+
+
+async def extract_decision(text: str) -> str | None:
+    """LLM extraction behind the looks_like_decision() pre-filter — mirrors
+    task_assistant/memory's "NONE or the extracted text" pattern. Never
+    raises; a failure here should just fall through to the normal chat
+    reply, not surface an error for what was maybe just a stray keyword
+    match."""
+    try:
+        raw = await claude_generate_fast(
+            _EXTRACT_SYSTEM,
+            [{"role": "user", "content": text[:2000]}],
+            temperature=0.0,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("Decision extraction failed (non-fatal)")
+        return None
+    entry = (raw or "").strip()
+    if not entry or entry.upper() == "NONE" or len(entry) > 300:
+        return None
+    return entry
 
 # --- In-memory fallback --------------------------------------------------
 _store: dict[int, list[str]] = {}

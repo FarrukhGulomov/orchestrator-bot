@@ -37,10 +37,14 @@ _TRIGGER_WORDS = (
     "eslat", "vazifa", "topshiriq", "reja qil", "kunlik reja",
     # Uzbek — Cyrillic
     "эслат", "вазифа", "топшир", "режа қил", "кундалик реж",
-    # Russian
-    "напомни", "напоминание", "задача", "напоминай",
+    # Russian — "напомни" also covers "напомнил"/"напомните" etc. as a
+    # substring match. "вспомни(ть)" is included too: colloquially people
+    # conflate it with "напомни" (calqued from Uzbek "eslatmoq", which
+    # covers both senses) to mean "remind me", not literally "recall".
+    "напомни", "напоминание", "задача", "напоминай", "вспомни",
+    "не забудь", "не забывай",
     # English
-    "remind", "reminder", "todo", "to-do",
+    "remind", "reminder", "todo", "to-do", "don't forget",
     # Payment / document deadline phrasing — a FUTURE obligation ("ijara
     # puli 5-avgustgacha to'lash kerak", "litsenziya muddati tugaydi") is
     # a reminder just as much as an explicit "eslat", but the user never

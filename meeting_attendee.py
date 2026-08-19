@@ -104,6 +104,24 @@ def normalize_url(url: str) -> str:
     return url
 
 
+_MEETING_URL_RE = re.compile(
+    r"(?:https?://)?"
+    r"(?:meet\.google\.com/[\w-]+"
+    r"|(?:[\w-]+\.)?zoom\.us/(?:j|wc/join)/[\w?=&-]+"
+    r"|teams\.(?:microsoft|live)\.com/l/meetup-join/[^\s]+)",
+    re.IGNORECASE,
+)
+
+
+def extract_meeting_url(text: str) -> str | None:
+    """Finds a Meet/Zoom/Teams link embedded anywhere in a plain sentence
+    (not just a message that IS a bare URL) — used to detect "let's meet at
+    meet.google.com/..." without requiring the /uchrashuv command. Returns
+    a normalized (schemed) URL, or None if no meeting link is present."""
+    match = _MEETING_URL_RE.search(text or "")
+    return normalize_url(match.group(0)) if match else None
+
+
 def disclosure_text(platform: MeetingPlatform) -> str:
     """The message posted in the meeting's chat on join. Kept short so it
     fits every platform's chat box, and deliberately not fully
