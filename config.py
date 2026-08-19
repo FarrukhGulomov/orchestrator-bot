@@ -167,6 +167,16 @@ class Settings:
     gemini_model_label: str = field(
         default_factory=lambda: os.getenv("GEMINI_MODEL_LABEL", "Gemini 2.5 Pro")
     )
+    # Distinct from gemini_model on purpose (Claude/OpenRouter already get
+    # this main/fast split — the other "extra" providers share one model
+    # for both tiers since they're normally only a rare fallback). Gemini
+    # is different: llm_clients._looks_uzbek makes it the FIRST attempt for
+    # every Uzbek message, including the router's classification call that
+    # fires on every single message — without a cheap fast-tier model that
+    # would mean gemini-2.5-pro pricing on routing calls too.
+    gemini_fast_model: str = field(
+        default_factory=lambda: os.getenv("GEMINI_FAST_MODEL", "gemini-2.5-flash")
+    )
 
     xai_api_key: str = field(default_factory=lambda: os.getenv("XAI_API_KEY", ""))
     grok_model: str = field(default_factory=lambda: os.getenv("GROK_MODEL", "grok-4"))
