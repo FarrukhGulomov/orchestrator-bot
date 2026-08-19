@@ -33,3 +33,37 @@ def test_ordinary_messages_not_flagged():
     assert ta.looks_like_task("qanday kunlar edi bugun?") is False
     assert ta.looks_like_task("rahmat, tushunarli") is False
     assert ta.looks_like_task("") is False
+
+
+def _task(id_, title, description=""):
+    return ta.tasks.Task(
+        id=id_, chat_id=1, user_id=1, title=title, description=description,
+        due_at="", remind_at="", final_remind_at=None, complexity="low",
+        priority="medium", recurrence="none", agent_key=None,
+    )
+
+
+def test_match_task_by_reference_picks_unique_match():
+    pending = [
+        _task("1", "Mijoz uchun hisobot tayyorlash"),
+        _task("2", "Server konfiguratsiyasini yangilash"),
+    ]
+    match = ta.match_task_by_reference(pending, "hisobotni tugatdim")
+    assert match is not None and match.id == "1"
+
+
+def test_match_task_by_reference_none_on_no_match():
+    pending = [_task("1", "Mijoz uchun hisobot tayyorlash")]
+    assert ta.match_task_by_reference(pending, "tamomila boshqa narsa haqida") is None
+    assert ta.match_task_by_reference(pending, "") is None
+    assert ta.match_task_by_reference([], "hisobot") is None
+
+
+def test_match_task_by_reference_none_on_ambiguous_tie():
+    """Two equally-good candidates must NOT guess — marking the wrong
+    reminder done is worse than doing nothing."""
+    pending = [
+        _task("1", "Mijoz uchun hisobot tayyorlash"),
+        _task("2", "Boshqa mijoz uchun hisobot yozish"),
+    ]
+    assert ta.match_task_by_reference(pending, "mijoz hisobot") is None

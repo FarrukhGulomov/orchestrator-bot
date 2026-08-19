@@ -32,6 +32,12 @@ logger = logging.getLogger(__name__)
 
 _AGENT_KEYS = list(AGENTS.keys())
 _TYPE_KEYS = list(REQUEST_TYPES.keys())
+_UTILITY_INTENTS = {
+    "none", "view_tasks", "view_decisions", "view_status", "view_memory",
+    "view_agents", "view_meeting_history", "expense_report",
+    "monthly_report_doc", "daily_digest_now", "standup_draft",
+    "weekly_report", "mark_task_done", "search_own_data",
+}
 
 _ROUTER_SYSTEM = f"""
 You are a routing classifier for a Senior Business Analyst's AI team. Read
@@ -128,7 +134,34 @@ a process, explaining a concept, generating SQL/code, translating,
 formatting a Jira ticket. Most requests are FALSE — only set true when
 stale information would make the answer wrong.
 
-Also write a short TITLE (max 70 chars) in the SAME language as the user's message.
+9) IS THIS ASKING TO SEE/DO SOMETHING THE BOT ALREADY TRACKS, RATHER THAN
+ASKING A QUESTION OR REQUESTING NEW WORK? Set utility_intent to the ONE
+matching action, or "none" for everything else (including any of 1-8
+above — a normal question/task/idea is ALWAYS "none" here, even a
+business one). Only set a non-"none" value when the user is clearly
+asking to interact with their OWN tracked data/settings, in Uzbek,
+Russian, or English, informally — not necessarily an exact phrase:
+  - view_tasks           : see their active tasks/reminders ("vazifalarim
+    qanday", "nima ishlarim bor", "что у меня в списке дел")
+  - view_decisions        : see the decision log ("qarorlar tarixi",
+    "что мы решали")
+  - view_status            : bot/system health ("bot ishlayaptimi", "hammasi joyidami")
+  - view_memory             : see remembered project facts
+  - view_agents              : who's on the team / what specialists exist
+  - view_meeting_history       : past /uchrashuv recording sessions
+  - expense_report               : spending summary/report (NOT logging a
+    new expense — "taksiga 30 ming" is a NEW expense, request_type/agent
+    only, utility_intent stays none; "bu oy qancha sarfladim" IS a report request)
+  - monthly_report_doc             : wants a downloadable Word/PDF monthly report
+  - daily_digest_now                 : wants today's plan right now
+  - standup_draft                      : wants a standup draft (yesterday/today/blockers)
+  - weekly_report                        : wants a weekly review draft
+  - mark_task_done                         : says a specific task/reminder is
+    now finished/done ("hisobotni tugatdim", "buni bajardim") — set
+    task_reference to a short description of WHICH task, in their words
+  - search_own_data                          : wants to search across their
+    OWN tasks/decisions/memory/expenses for a keyword — set search_query
+    to that keyword/phrase
 
 Respond with ONLY a JSON object, no prose:
 {{"agent": "<one of: {", ".join(_AGENT_KEYS)}>",
@@ -141,7 +174,13 @@ Respond with ONLY a JSON object, no prose:
   "execution_chain": ["<0-4 agent keys in sequence>"],
   "title": "<short title>",
   "web_query": "<if needs_web: a short, self-contained search query in the
-    language most likely to have good sources — otherwise empty string>"}}
+    language most likely to have good sources — otherwise empty string>",
+  "utility_intent": "<one of: none, view_tasks, view_decisions, view_status,
+    view_memory, view_agents, view_meeting_history, expense_report,
+    monthly_report_doc, daily_digest_now, standup_draft, weekly_report,
+    mark_task_done, search_own_data>",
+  "task_reference": "<if mark_task_done: which task, in the user's words — otherwise empty string>",
+  "search_query": "<if search_own_data: the keyword/phrase — otherwise empty string>"}}
 """
 
 
@@ -162,6 +201,13 @@ class Route:
     # so this module stays a pure classifier with no network side effects
     # beyond its own LLM call). Appended to the agent's system prompt.
     web_context: str = ""
+    # "none" or one of the utility-command intents (see _ROUTER_SYSTEM) —
+    # bot.py dispatches these to the matching command handler directly
+    # instead of generating a specialist-agent reply, so a plain "nima
+    # vazifalarim bor?" doesn't need /tasks.
+    utility_intent: str = "none"
+    task_reference: str = ""
+    search_query: str = ""
 
 
 def model_for(agent: Agent, complexity: str) -> tuple[str, str]:
@@ -203,6 +249,9 @@ async def classify(
     collaborators: list[str] = []
     execution_chain: list[str] = []
     title = (user_text.strip()[:70] or "Untitled")
+    utility_intent = "none"
+    task_reference = ""
+    search_query = ""
 
     context_hint = ""
     if last_agent in AGENTS:
@@ -267,6 +316,12 @@ async def classify(
         if raw_title:
             title = raw_title[:120]
 
+        intent_candidate = str(data.get("utility_intent", "")).strip().lower()
+        if intent_candidate in _UTILITY_INTENTS:
+            utility_intent = intent_candidate
+            task_reference = str(data.get("task_reference", "") or "").strip()[:200]
+            search_query = str(data.get("search_query", "") or "").strip()[:200]
+
     except Exception as exc:
         logger.warning(
             "Router classification failed, using fallback agent=%s type=%s. %s",
@@ -296,4 +351,7 @@ async def classify(
         web_query=web_query,
         collaborators=collaborators,
         execution_chain=execution_chain,
+        utility_intent=utility_intent,
+        task_reference=task_reference,
+        search_query=search_query,
     )

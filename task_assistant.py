@@ -89,6 +89,34 @@ def looks_like_task(text: str) -> bool:
     return has_time_signal
 
 
+def match_task_by_reference(pending: list["tasks.Task"], reference: str) -> "tasks.Task | None":
+    """Resolves a free-text task reference ("hisobotni tugatdim") to one of
+    the chat's pending tasks — used by the natural-language "mark_task_done"
+    intent, which has no task ID to work with (unlike /done <id>). Mutual-
+    substring word matching, not exact equality: Uzbek/Russian are heavily
+    inflected ("hisobotni" vs a task titled "...hisobot...") so a plain
+    word-set intersection misses the common case where the reference just
+    has a different suffix. A reference word counts as matching a task word
+    if either contains the other. Returns None on no match OR a tie between
+    the top two — silence beats guessing wrong and marking the wrong
+    reminder done."""
+    ref_words = [w for w in reference.lower().split() if len(w) >= 4]
+    if not ref_words:
+        return None
+    scored = []
+    for t in pending:
+        hay_words = [w for w in f"{t.title} {t.description}".lower().split() if len(w) >= 4]
+        score = sum(1 for rw in ref_words if any(rw in hw or hw in rw for hw in hay_words))
+        if score > 0:
+            scored.append((score, t))
+    if not scored:
+        return None
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    if len(scored) > 1 and scored[0][0] == scored[1][0]:
+        return None
+    return scored[0][1]
+
+
 PRIORITY_EMOJI = {"low": "🟢", "medium": "🟡", "high": "🟠", "urgent": "🔴"}
 _RECURRENCE_LABEL = {
     "none": "", "daily": " (har kuni)", "weekdays": " (ish kunlari)",
